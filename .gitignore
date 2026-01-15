@@ -19,3 +19,7 @@ Thumbs.db
 # 临时文件
 *.log
 *.tmp
+
+# Chrome扩展私钥和打包文件
+*.pem
+*.crx
