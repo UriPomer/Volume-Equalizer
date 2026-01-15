@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Bili Volume Equalizer",
+  "description": "为哔哩哔哩网页播放器添加实时音量均衡 (Web Audio Compressor + 自适应增益)",
+  "version": "0.1.0",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://www.bilibili.com/*",
+    "https://*.bilibili.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.bilibili.com/*",
+        "https://*.bilibili.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
