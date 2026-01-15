@@ -332,15 +332,19 @@ let audioCtx = null;
    * @param {Object} newSettings - 新的设置对象
    */
   updateSettings(newSettings) {
-    const targetChanged = this.settings.targetRms !== newSettings.targetRms;
-
+    // 检查是否是目标响度变化（通过标记字段判断）
+    const targetChanged = newSettings._changedField === 'targetLufs';
+    
+    // 清除临时标记并更新设置
+    delete newSettings._changedField;
     this.settings = newSettings;
+    
     this.applyCompressor();
     this.bassFilter.gain.value = newSettings.bassBoost;
 
-    // 如果目标响度改变,重置积分历史和PID状态
+    // 只有目标响度改变时才重置输出响度积分
     if (targetChanged) {
-      this.resetIntegration();
+      this.resetOutputIntegration();
     }
   }
 
@@ -354,7 +358,7 @@ let audioCtx = null;
 
   /**
    * 重置积分历史和PID状态
-   * 触发场景: 1)用户跳转视频 2)目标响度改变
+   * 触发场景: 用户跳转视频
    */
   resetIntegration() {
     this.rmsHistory = [];
@@ -362,6 +366,21 @@ let audioCtx = null;
     this.integratedRms = null;
     this.originalIntegratedRms = null;
     this.pidController.reset();
+  }
+
+  /**
+   * 只重置输出响度的积分历史（保留原始响度）
+   * 触发场景: 目标响度改变
+   */
+  resetOutputIntegration() {
+    this.rmsHistory = [];
+    this.integratedRms = null;
+    this.pidController.reset();
+
+    // 立即更新 meter 状态，触发 UI 刷新
+    const currentRms = this.measureRms();
+    const originalRms = this.measureOriginalRms();
+    this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
   }
 
   /**
@@ -444,17 +463,43 @@ let audioCtx = null;
     if (this.settings.enabled && !this.media.muted && !this.media.paused && !this.media.ended) {
       // 等待足够样本后再启用 PID 控制
       if (this.originalRmsHistory.length >= INTEGRATION_PARAMS.minSamples && 
-          this.originalIntegratedRms > INTEGRATION_PARAMS.silenceThreshold) {
+          this.originalIntegratedRms > INTEGRATION_PARAMS.silenceThreshold &&
+          this.rmsHistory.length >= INTEGRATION_PARAMS.minSamples &&
+          this.integratedRms > INTEGRATION_PARAMS.silenceThreshold) {
         
-        // 基于原始积分响度计算所需增益
+        // 前馈控制：基于原始积分响度计算基准增益
         const targetRms = this.settings.targetRms;
         const currentOriginalRms = this.originalIntegratedRms;
+        const feedforwardGain = targetRms / currentOriginalRms;
 
-        // 计算理想增益 (不考虑限制)
-        const idealGain = targetRms / currentOriginalRms;
-
-        // 当前增益
+        // 反馈修正：基于实际输出响度计算误差
+        const currentOutputRms = this.integratedRms;
+        const outputError = targetRms - currentOutputRms;  // RMS域的误差
+        
+        // 将误差转换为增益修正（小幅调整）
         const currentGain = this.gainNode.gain.value;
+        const gainError = (outputError / currentOutputRms) * currentGain;  // 相对误差转增益修正
+
+        // 理想增益 = 前馈基准 + 反馈修正
+        const idealGain = feedforwardGain + gainError * 0.5;  // 反馈修正权重0.5，避免过度响应
+
+        // 调试输出
+        if (Math.random() < 0.01) {  // 1% 概率输出，避免刷屏
+          const outputLufs = 20 * Math.log10(currentOutputRms) - 0.691;
+          const originalLufs = 20 * Math.log10(currentOriginalRms) - 0.691;
+          const targetLufs = 20 * Math.log10(targetRms) - 0.691;
+          
+          console.log(`${BRAND} 调试信息:`, {
+            targetLufs: targetLufs.toFixed(1),
+            originalLufs: originalLufs.toFixed(1),
+            outputLufs: outputLufs.toFixed(1),
+            feedforwardGain: feedforwardGain.toFixed(3),
+            gainError: gainError.toFixed(3),
+            idealGain: idealGain.toFixed(3),
+            currentGain: currentGain.toFixed(3),
+            error: (idealGain - currentGain).toFixed(3)
+          });
+        }
 
         // 误差 = 理想增益 - 当前增益
         const error = idealGain - currentGain;
@@ -801,17 +846,20 @@ function getPanelHTML(settings) {
 /**
  * 绑定面板事件
  * @param {ShadowRoot} shadow - Shadow DOM 根节点
- * @param {Object} settings - 当前设置
- * @param {Function} onSettingsChange - 设置改变回调
+ * @param {Object} initialSettings - 初始设置（会被更新）
+ * @param {Function} onSettingsChange - 设置改变回调，返回更新后的设置
  */
-function bindPanelEvents(shadow, settings, onSettingsChange) {
+function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
   const toggleBtn = shadow.querySelector('button.toggle');
   const sliders = shadow.querySelectorAll('input[type="range"]');
   const fieldNodes = getFieldNodes(shadow);
+  
+  // 使用可变引用来跟踪当前设置状态
+  let currentSettings = initialSettings;
 
   // 渲染开关状态
   const renderToggle = () => {
-    if (settings.enabled) {
+    if (currentSettings.enabled) {
       toggleBtn.textContent = '已开启';
       toggleBtn.className = 'toggle on';
     } else {
@@ -823,8 +871,8 @@ function bindPanelEvents(shadow, settings, onSettingsChange) {
 
   // 开关按钮
   toggleBtn.addEventListener('click', () => {
-    settings.enabled = !settings.enabled;
-    onSettingsChange(settings);
+    const newSettings = { ...currentSettings, enabled: !currentSettings.enabled };
+    currentSettings = onSettingsChange(newSettings) || newSettings;
     renderToggle();
   });
 
@@ -835,14 +883,18 @@ function bindPanelEvents(shadow, settings, onSettingsChange) {
       const value = parseFloat(event.target.value);
       if (Number.isNaN(value)) return;
 
+      // 基于当前最新设置创建新对象
+      const newSettings = { ...currentSettings };
+      newSettings._changedField = role;  // 标记是哪个字段改变了
+      
       // 如果是 LUFS 滑块，转换为 RMS 存储
       if (role === 'targetLufs') {
-        settings.targetRms = lufsToRms(value);
+        newSettings.targetRms = lufsToRms(value);
       } else {
-        settings[role] = value;
+        newSettings[role] = value;
       }
 
-      onSettingsChange(settings);
+      currentSettings = onSettingsChange(newSettings) || newSettings;
       updateFieldText(fieldNodes, role, value);
     });
   });
@@ -994,6 +1046,7 @@ function cleanupControllers() {
 /**
  * 设置改变处理
  * @param {Object} newSettings - 新的设置
+ * @returns {Object} 更新后的设置
  */
 function handleSettingsChange(newSettings) {
   settings = newSettings;
@@ -1017,6 +1070,8 @@ function handleSettingsChange(newSettings) {
       sampleCount: 0
     };
   }
+  
+  return settings;
 }
 
 /**

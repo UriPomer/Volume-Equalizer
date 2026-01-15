@@ -208,17 +208,20 @@ function getPanelHTML(settings) {
 /**
  * 绑定面板事件
  * @param {ShadowRoot} shadow - Shadow DOM 根节点
- * @param {Object} settings - 当前设置
- * @param {Function} onSettingsChange - 设置改变回调
+ * @param {Object} initialSettings - 初始设置（会被更新）
+ * @param {Function} onSettingsChange - 设置改变回调，返回更新后的设置
  */
-function bindPanelEvents(shadow, settings, onSettingsChange) {
+function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
   const toggleBtn = shadow.querySelector('button.toggle');
   const sliders = shadow.querySelectorAll('input[type="range"]');
   const fieldNodes = getFieldNodes(shadow);
+  
+  // 使用可变引用来跟踪当前设置状态
+  let currentSettings = initialSettings;
 
   // 渲染开关状态
   const renderToggle = () => {
-    if (settings.enabled) {
+    if (currentSettings.enabled) {
       toggleBtn.textContent = '已开启';
       toggleBtn.className = 'toggle on';
     } else {
@@ -230,8 +233,8 @@ function bindPanelEvents(shadow, settings, onSettingsChange) {
 
   // 开关按钮
   toggleBtn.addEventListener('click', () => {
-    settings.enabled = !settings.enabled;
-    onSettingsChange(settings);
+    const newSettings = { ...currentSettings, enabled: !currentSettings.enabled };
+    currentSettings = onSettingsChange(newSettings) || newSettings;
     renderToggle();
   });
 
@@ -242,14 +245,18 @@ function bindPanelEvents(shadow, settings, onSettingsChange) {
       const value = parseFloat(event.target.value);
       if (Number.isNaN(value)) return;
 
+      // 基于当前最新设置创建新对象
+      const newSettings = { ...currentSettings };
+      newSettings._changedField = role;  // 标记是哪个字段改变了
+      
       // 如果是 LUFS 滑块，转换为 RMS 存储
       if (role === 'targetLufs') {
-        settings.targetRms = lufsToRms(value);
+        newSettings.targetRms = lufsToRms(value);
       } else {
-        settings[role] = value;
+        newSettings[role] = value;
       }
 
-      onSettingsChange(settings);
+      currentSettings = onSettingsChange(newSettings) || newSettings;
       updateFieldText(fieldNodes, role, value);
     });
   });

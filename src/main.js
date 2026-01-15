@@ -82,6 +82,7 @@ function cleanupControllers() {
 /**
  * 设置改变处理
  * @param {Object} newSettings - 新的设置
+ * @returns {Object} 更新后的设置
  */
 function handleSettingsChange(newSettings) {
   settings = newSettings;
@@ -105,6 +106,8 @@ function handleSettingsChange(newSettings) {
       sampleCount: 0
     };
   }
+  
+  return settings;
 }
 
 /**
