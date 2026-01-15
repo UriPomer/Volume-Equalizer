@@ -1,0 +1,21 @@
+{
+  "name": "bili-volume-equalizer",
+  "version": "1.0.0",
+  "description": "B站视频音量均衡器 - 将所有视频标准化到 -15 LUFS",
+  "scripts": {
+    "build": "node build.js",
+    "watch": "nodemon --watch src --exec \"npm run build\""
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "keywords": [
+    "chrome-extension",
+    "audio",
+    "loudness",
+    "LUFS",
+    "volume-equalizer"
+  ],
+  "author": "",
+  "license": "MIT"
+}
