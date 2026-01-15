@@ -12,16 +12,15 @@
 
   const DEFAULT_SETTINGS = {
     enabled: true,
-    targetRms: 0.178,  // 对应 -15 LUFS
-    minGain: 0.5,
-    maxGain: 2.0,
-    adaptationRate: 0.25,
-    compressorThreshold: -20,
-    compressorKnee: 20,
-    compressorRatio: 3,
-    compressorAttack: 0.003,
-    compressorRelease: 0.3,
-    bassBoost: 0 // 低频增益 dB: -6 ~ +6
+    targetRms: 0.1924,  // 对应 -15 LUFS (YouTube标准, 实际计算: 10^((-15+0.691)/20))
+    minGain: 0.5,      // 最小增益 (避免过度压缩)
+    maxGain: 2.0,      // 最大增益 (避免失真)
+    compressorThreshold: -20,  // 压缩器阈值 (dB)
+    compressorKnee: 20,        // 压缩器拐点柔和度
+    compressorRatio: 3,        // 压缩比 (3:1)
+    compressorAttack: 0.003,   // 压缩器启动时间 (秒)
+    compressorRelease: 0.3,    // 压缩器释放时间 (秒)
+    bassBoost: 0               // 低频增益 (dB: -6 ~ +6)
   };
 
   let settings = { ...DEFAULT_SETTINGS };
@@ -76,8 +75,14 @@
 
   function installGlobalResumeHandlers() {
     const resume = () => {
-      if (audioCtx && audioCtx.state === 'suspended') {
-        audioCtx.resume().catch(() => {});
+      try {
+        if (audioCtx && audioCtx.state === 'suspended') {
+          audioCtx.resume().catch((err) => {
+            console.debug('[BiliVolume] AudioContext resume failed:', err);
+          });
+        }
+      } catch (err) {
+        console.debug('[BiliVolume] Resume handler error:', err);
       }
     };
     ['pointerdown', 'keydown', 'click', 'touchstart'].forEach((evt) => {
@@ -87,7 +92,7 @@
       if (document.visibilityState === 'visible') resume();
     });
   }
-
+ 
   function observeMutations() {
     const observer = new MutationObserver(scheduleScan);
     observer.observe(document.documentElement, {
@@ -162,14 +167,27 @@
       this.settings = settings;
 
       // 积分响度计算
-      this.rmsHistory = [];  // 存储所有RMS样本
+      this.rmsHistory = [];  // 存储输出RMS样本
+      this.originalRmsHistory = [];  // 存储原始RMS样本
       this.maxHistorySize = 600;  // 最多保留600个样本 (约10秒@60fps)
-      this.integratedRms = null;  // 积分平均RMS
+      this.integratedRms = null;  // 输出积分平均RMS
+      this.originalIntegratedRms = null;  // 原始积分平均RMS
+      
+      // PID控制器状态
+      this.pidIntegral = 0;
+      this.pidLastError = 0;
 
       const ctx = ensureAudioContext();
       this.sourceNode = ctx.createMediaElementSource(media);
       this.compressor = ctx.createDynamicsCompressor();
       this.gainNode = ctx.createGain();
+      
+      // 原始音频分析器 (测量输入)
+      this.originalAnalyser = ctx.createAnalyser();
+      this.originalAnalyser.fftSize = 2048;
+      this.originalBuffer = new Float32Array(this.originalAnalyser.fftSize);
+      
+      // 输出音频分析器 (测量输出)
       this.analyser = ctx.createAnalyser();
       this.analyser.fftSize = 2048;
       this.buffer = new Float32Array(this.analyser.fftSize);
@@ -182,9 +200,11 @@
 
       this.applyCompressor();
 
-      // 信号链: source → compressor → gain → bassFilter → analyser → destination
+      // 信号链: source → compressor → originalAnalyser (测压缩后原始) → gain → bassFilter → analyser (测输出) → destination
+      // 原理: compressor固定处理,gain是我们要调整的,所以测量compressor之后/gain之前的响度作为"原始"
       this.sourceNode.connect(this.compressor);
-      this.compressor.connect(this.gainNode);
+      this.compressor.connect(this.originalAnalyser);
+      this.originalAnalyser.connect(this.gainNode);
       this.gainNode.connect(this.bassFilter);
       this.bassFilter.connect(this.analyser);
       this.analyser.connect(ctx.destination);
@@ -194,8 +214,14 @@
       media.addEventListener('emptied', this.handleEmptied);
       media.addEventListener('seeked', this.handleSeeked);
       media.addEventListener('play', () => {
-        if (ctx.state === 'suspended') {
-          ctx.resume().catch(() => {});
+        try {
+          if (ctx.state === 'suspended') {
+            ctx.resume().catch((err) => {
+              console.debug('[BiliVolume] AudioContext play resume failed:', err);
+            });
+          }
+        } catch (err) {
+          console.debug('[BiliVolume] Play event handler error:', err);
         }
       });
 
@@ -223,9 +249,13 @@
     }
 
     resetIntegration() {
-      // 用户跳转时重置积分历史
+      // 用户跳转时重置积分历史和PID状态
       this.rmsHistory = [];
+      this.originalRmsHistory = [];
       this.integratedRms = null;
+      this.originalIntegratedRms = null;
+      this.pidIntegral = 0;
+      this.pidLastError = 0;
     }
 
     measureRms() {
@@ -238,7 +268,17 @@
       return Math.sqrt(sum / this.buffer.length);
     }
 
-    updateIntegratedRms(currentRms) {
+    measureOriginalRms() {
+      this.originalAnalyser.getFloatTimeDomainData(this.originalBuffer);
+      let sum = 0;
+      for (let i = 0; i < this.originalBuffer.length; i += 1) {
+        const sample = this.originalBuffer[i];
+        sum += sample * sample;
+      }
+      return Math.sqrt(sum / this.originalBuffer.length);
+    }
+
+    updateIntegratedRms(currentRms, originalRms) {
       // 过滤静音片段 (低于-60dB)
       if (currentRms > 0.001) {
         this.rmsHistory.push(currentRms);
@@ -249,10 +289,23 @@
         }
       }
 
+      if (originalRms > 0.001) {
+        this.originalRmsHistory.push(originalRms);
+        
+        if (this.originalRmsHistory.length > this.maxHistorySize) {
+          this.originalRmsHistory.shift();
+        }
+      }
+
       // 计算积分RMS (能量平均后开方)
       if (this.rmsHistory.length > 0) {
         const sumSquares = this.rmsHistory.reduce((acc, rms) => acc + rms * rms, 0);
         this.integratedRms = Math.sqrt(sumSquares / this.rmsHistory.length);
+      }
+
+      if (this.originalRmsHistory.length > 0) {
+        const sumSquares = this.originalRmsHistory.reduce((acc, rms) => acc + rms * rms, 0);
+        this.originalIntegratedRms = Math.sqrt(sumSquares / this.originalRmsHistory.length);
       }
     }
 
@@ -262,32 +315,81 @@
         return;
       }
 
+      // 始终测量原始和输出响度
+      const currentRms = this.measureRms();
+      const originalRms = this.measureOriginalRms();
+      
+      // 更新积分RMS
+      this.updateIntegratedRms(currentRms, originalRms);
+
       if (settings.enabled && !this.media.muted && !this.media.paused && !this.media.ended) {
-        const currentRms = this.measureRms();
-        
-        // 更新积分RMS
-        this.updateIntegratedRms(currentRms);
-        
-        // 使用积分RMS计算增益 (如果有足够样本)
-        const targetRms = this.integratedRms && this.rmsHistory.length >= 30 
-          ? this.integratedRms 
-          : currentRms;
-        
-        const error = settings.targetRms - targetRms;
-        const delta = error * settings.adaptationRate;
-        const nextGain = clamp(this.gainNode.gain.value + delta, settings.minGain, settings.maxGain);
-        this.gainNode.gain.value = nextGain;
-        
-        // 显示积分响度和当前瞬时响度
-        meterState = { 
-          rms: currentRms, 
-          integratedRms: this.integratedRms || currentRms,
-          gain: nextGain,
-          sampleCount: this.rmsHistory.length
-        };
+        // 等待足够样本后再启用PID控制
+        if (this.originalRmsHistory.length >= 30 && this.originalIntegratedRms > 0.001) {
+          // ===== PID控制器 =====
+          // 基于原始积分响度计算所需增益
+          const targetRms = settings.targetRms;
+          const currentOriginalRms = this.originalIntegratedRms;
+          
+          // 计算理想增益 (不考虑限制)
+          const idealGain = targetRms / currentOriginalRms;
+          
+          // 当前增益
+          const currentGain = this.gainNode.gain.value;
+          
+          // 误差 = 理想增益 - 当前增益
+          const error = idealGain - currentGain;
+          
+          // PID参数 (保守调参，避免震荡)
+          const Kp = 0.15;  // 比例系数：响应速度
+          const Ki = 0.005; // 积分系数：消除稳态误差
+          const Kd = 0.08;  // 微分系数：抑制震荡
+          
+          // 积分项累积 (带抗饱和)
+          this.pidIntegral += error;
+          this.pidIntegral = clamp(this.pidIntegral, -5, 5); // 限制积分累积
+          
+          // 微分项 (误差变化率)
+          const derivative = error - this.pidLastError;
+          this.pidLastError = error;
+          
+          // PID输出
+          const correction = Kp * error + Ki * this.pidIntegral + Kd * derivative;
+          
+          // 应用增益调整
+          const nextGain = clamp(currentGain + correction, settings.minGain, settings.maxGain);
+          this.gainNode.gain.value = nextGain;
+          
+          // 显示所有响度信息
+          meterState = { 
+            rms: currentRms, 
+            integratedRms: this.integratedRms || currentRms,
+            originalRms: originalRms,
+            originalIntegratedRms: this.originalIntegratedRms || originalRms,
+            gain: nextGain,
+            sampleCount: this.rmsHistory.length
+          };
+        } else {
+          // 样本不足，暂时不调整增益
+          meterState = { 
+            rms: currentRms, 
+            integratedRms: this.integratedRms || currentRms,
+            originalRms: originalRms,
+            originalIntegratedRms: this.originalIntegratedRms || originalRms,
+            gain: this.gainNode.gain.value,
+            sampleCount: this.rmsHistory.length
+          };
+        }
       } else if (!settings.enabled) {
         this.gainNode.gain.value = 1.0;
-        meterState = { rms: 0, integratedRms: 0, gain: 1, sampleCount: 0 };
+        // 关闭时仍显示原始响度
+        meterState = { 
+          rms: originalRms,  // 关闭时输出=原始
+          integratedRms: this.originalIntegratedRms || originalRms,
+          originalRms: originalRms,
+          originalIntegratedRms: this.originalIntegratedRms || originalRms,
+          gain: 1,
+          sampleCount: this.originalRmsHistory.length
+        };
       }
 
       this.rafId = requestAnimationFrame(this.tick);
@@ -298,6 +400,7 @@
       this.media.removeEventListener('emptied', this.handleEmptied);
       this.media.removeEventListener('seeked', this.handleSeeked);
       this.sourceNode.disconnect();
+      this.originalAnalyser.disconnect();
       this.compressor.disconnect();
       this.gainNode.disconnect();
       this.bassFilter.disconnect();
@@ -393,6 +496,16 @@
         font-size: 12px;
         color: #c8c8c8;
       }
+      .meter-section {
+        margin-top: 8px;
+        padding-top: 8px;
+        border-top: 1px solid rgba(255,255,255,0.1);
+      }
+      .meter-title {
+        font-weight: 600;
+        color: #fff;
+        margin-bottom: 4px;
+      }
     `;
 
     const wrapper = document.createElement('div');
@@ -418,19 +531,21 @@
       </label>
       <input type="range" min="0.2" max="1" step="0.05" data-role="minGain" value="${settings.minGain}">
       <label>
-        <span>响应速度</span>
-        <span data-field="adaptationRate">${settings.adaptationRate.toFixed(2)}</span>
-      </label>
-      <input type="range" min="0.05" max="0.6" step="0.01" data-role="adaptationRate" value="${settings.adaptationRate}">
-      <label>
         <span>低频增益</span>
         <span data-field="bassBoost">${settings.bassBoost > 0 ? '+' : ''}${settings.bassBoost.toFixed(1)} dB</span>
       </label>
       <input type="range" min="-6" max="6" step="0.5" data-role="bassBoost" value="${settings.bassBoost}">
       <div class="meter">
-        <div>积分响度: <span data-field="meterIntegratedLufs">-∞</span> LUFS <span style="color:#888;" data-field="sampleCount">(0样本)</span></div>
-        <div>瞬时响度: <span data-field="meterLufs">-∞</span> LUFS</div>
-        <div>增益: <span data-field="meterGain">1.00x</span></div>
+        <div class="meter-title">原始响度 (压缩后)</div>
+        <div>积分: <span data-field="meterOriginalIntegratedLufs">-∞</span> LUFS <span style="color:#888;" data-field="sampleCount">(0样本)</span></div>
+        <div>瞬时: <span data-field="meterOriginalLufs">-∞</span> LUFS</div>
+        
+        <div class="meter-section">
+          <div class="meter-title">输出响度</div>
+          <div>积分: <span data-field="meterIntegratedLufs">-∞</span> LUFS</div>
+          <div>瞬时: <span data-field="meterLufs">-∞</span> LUFS</div>
+          <div>增益: <span data-field="meterGain">1.00x</span></div>
+        </div>
       </div>
     `;
 
@@ -443,8 +558,9 @@
       targetLufs: shadow.querySelector('[data-field="targetLufs"]'),
       maxGain: shadow.querySelector('[data-field="maxGain"]'),
       minGain: shadow.querySelector('[data-field="minGain"]'),
-      adaptationRate: shadow.querySelector('[data-field="adaptationRate"]'),
       bassBoost: shadow.querySelector('[data-field="bassBoost"]'),
+      meterOriginalIntegratedLufs: shadow.querySelector('[data-field="meterOriginalIntegratedLufs"]'),
+      meterOriginalLufs: shadow.querySelector('[data-field="meterOriginalLufs"]'),
       meterIntegratedLufs: shadow.querySelector('[data-field="meterIntegratedLufs"]'),
       meterLufs: shadow.querySelector('[data-field="meterLufs"]'),
       meterGain: shadow.querySelector('[data-field="meterGain"]'),
@@ -471,7 +587,14 @@
         controllers.forEach((controller) => {
           controller.gainNode.gain.value = 1.0;
         });
-        meterState = { rms: 0, integratedRms: 0, gain: 1, sampleCount: 0 };
+        meterState = { 
+          rms: 0, 
+          integratedRms: 0, 
+          originalRms: 0,
+          originalIntegratedRms: 0,
+          gain: 1, 
+          sampleCount: 0 
+        };
       }
     });
 
@@ -498,7 +621,6 @@
       if (role === 'targetLufs') fieldNodes.targetLufs.textContent = value.toFixed(1);
       if (role === 'maxGain') fieldNodes.maxGain.textContent = `${value.toFixed(1)}x`;
       if (role === 'minGain') fieldNodes.minGain.textContent = `${value.toFixed(1)}x`;
-      if (role === 'adaptationRate') fieldNodes.adaptationRate.textContent = value.toFixed(2);
       if (role === 'bassBoost') fieldNodes.bassBoost.textContent = `${value > 0 ? '+' : ''}${value.toFixed(1)} dB`;
     }
 
@@ -506,11 +628,15 @@
 
     setInterval(() => {
       if (!document.contains(host)) return;
-      const { rms, integratedRms, gain, sampleCount } = meterState;
+      const { rms, integratedRms, originalRms, originalIntegratedRms, gain, sampleCount } = meterState;
       
       const instantLufs = rmsToLufs(rms);
       const integratedLufs = rmsToLufs(integratedRms || rms);
+      const originalInstantLufs = rmsToLufs(originalRms);
+      const originalIntegratedLufs = rmsToLufs(originalIntegratedRms || originalRms);
       
+      fieldNodes.meterOriginalLufs.textContent = originalInstantLufs > -70 ? originalInstantLufs.toFixed(1) : '-∞';
+      fieldNodes.meterOriginalIntegratedLufs.textContent = originalIntegratedLufs > -70 ? originalIntegratedLufs.toFixed(1) : '-∞';
       fieldNodes.meterLufs.textContent = instantLufs > -70 ? instantLufs.toFixed(1) : '-∞';
       fieldNodes.meterIntegratedLufs.textContent = integratedLufs > -70 ? integratedLufs.toFixed(1) : '-∞';
       fieldNodes.meterGain.textContent = `${gain.toFixed(2)}x`;
