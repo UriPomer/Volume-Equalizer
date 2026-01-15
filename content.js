@@ -12,7 +12,7 @@
 
   const DEFAULT_SETTINGS = {
     enabled: true,
-    targetRms: 0.18,
+    targetRms: 0.178,  // 对应 -15 LUFS
     minGain: 0.5,
     maxGain: 2.0,
     adaptationRate: 0.25,
@@ -161,6 +161,11 @@
       this.rafId = 0;
       this.settings = settings;
 
+      // 积分响度计算
+      this.rmsHistory = [];  // 存储所有RMS样本
+      this.maxHistorySize = 600;  // 最多保留600个样本 (约10秒@60fps)
+      this.integratedRms = null;  // 积分平均RMS
+
       const ctx = ensureAudioContext();
       this.sourceNode = ctx.createMediaElementSource(media);
       this.compressor = ctx.createDynamicsCompressor();
@@ -185,7 +190,9 @@
       this.analyser.connect(ctx.destination);
 
       this.handleEmptied = () => this.resetGain();
+      this.handleSeeked = () => this.resetIntegration();
       media.addEventListener('emptied', this.handleEmptied);
+      media.addEventListener('seeked', this.handleSeeked);
       media.addEventListener('play', () => {
         if (ctx.state === 'suspended') {
           ctx.resume().catch(() => {});
@@ -212,6 +219,13 @@
 
     resetGain() {
       this.gainNode.gain.value = 1;
+      this.resetIntegration();
+    }
+
+    resetIntegration() {
+      // 用户跳转时重置积分历史
+      this.rmsHistory = [];
+      this.integratedRms = null;
     }
 
     measureRms() {
@@ -224,6 +238,24 @@
       return Math.sqrt(sum / this.buffer.length);
     }
 
+    updateIntegratedRms(currentRms) {
+      // 过滤静音片段 (低于-60dB)
+      if (currentRms > 0.001) {
+        this.rmsHistory.push(currentRms);
+        
+        // 限制历史记录大小(滑动窗口)
+        if (this.rmsHistory.length > this.maxHistorySize) {
+          this.rmsHistory.shift();
+        }
+      }
+
+      // 计算积分RMS (能量平均后开方)
+      if (this.rmsHistory.length > 0) {
+        const sumSquares = this.rmsHistory.reduce((acc, rms) => acc + rms * rms, 0);
+        this.integratedRms = Math.sqrt(sumSquares / this.rmsHistory.length);
+      }
+    }
+
     tick() {
       if (!document.contains(this.media)) {
         this.destroy();
@@ -231,15 +263,31 @@
       }
 
       if (settings.enabled && !this.media.muted && !this.media.paused && !this.media.ended) {
-        const rms = this.measureRms();
-        const error = settings.targetRms - rms;
+        const currentRms = this.measureRms();
+        
+        // 更新积分RMS
+        this.updateIntegratedRms(currentRms);
+        
+        // 使用积分RMS计算增益 (如果有足够样本)
+        const targetRms = this.integratedRms && this.rmsHistory.length >= 30 
+          ? this.integratedRms 
+          : currentRms;
+        
+        const error = settings.targetRms - targetRms;
         const delta = error * settings.adaptationRate;
         const nextGain = clamp(this.gainNode.gain.value + delta, settings.minGain, settings.maxGain);
         this.gainNode.gain.value = nextGain;
-        meterState = { rms, gain: nextGain };
+        
+        // 显示积分响度和当前瞬时响度
+        meterState = { 
+          rms: currentRms, 
+          integratedRms: this.integratedRms || currentRms,
+          gain: nextGain,
+          sampleCount: this.rmsHistory.length
+        };
       } else if (!settings.enabled) {
         this.gainNode.gain.value = 1.0;
-        meterState = { rms: 0, gain: 1 };
+        meterState = { rms: 0, integratedRms: 0, gain: 1, sampleCount: 0 };
       }
 
       this.rafId = requestAnimationFrame(this.tick);
@@ -248,6 +296,7 @@
     destroy() {
       cancelAnimationFrame(this.rafId);
       this.media.removeEventListener('emptied', this.handleEmptied);
+      this.media.removeEventListener('seeked', this.handleSeeked);
       this.sourceNode.disconnect();
       this.compressor.disconnect();
       this.gainNode.disconnect();
@@ -259,6 +308,17 @@
 
   function clamp(value, min, max) {
     return Math.min(Math.max(value, min), max);
+  }
+
+  // RMS 转 LUFS 近似计算 (用于显示)
+  function rmsToLufs(rms) {
+    if (rms <= 0.00001) return -70;
+    return 20 * Math.log10(rms) - 0.691;
+  }
+
+  // LUFS 转 RMS (用于设置目标值)
+  function lufsToRms(lufs) {
+    return Math.pow(10, (lufs + 0.691) / 20);
   }
 
   function createPanel() {
@@ -343,10 +403,10 @@
         <button class="toggle">···</button>
       </div>
       <label>
-        <span>目标响度</span>
-        <span data-field="targetRms">${settings.targetRms.toFixed(2)}</span>
+        <span>目标响度 (LUFS)</span>
+        <span data-field="targetLufs">${rmsToLufs(settings.targetRms).toFixed(1)}</span>
       </label>
-      <input type="range" min="0.05" max="0.35" step="0.01" data-role="targetRms" value="${settings.targetRms}">
+      <input type="range" min="-23" max="-10" step="0.5" data-role="targetLufs" value="${rmsToLufs(settings.targetRms).toFixed(1)}">
       <label>
         <span>增益上限</span>
         <span data-field="maxGain">${settings.maxGain.toFixed(1)}x</span>
@@ -368,8 +428,9 @@
       </label>
       <input type="range" min="-6" max="6" step="0.5" data-role="bassBoost" value="${settings.bassBoost}">
       <div class="meter">
-        <div>RMS: <span data-field="meterRms">0.00</span></div>
-        <div>Gain: <span data-field="meterGain">1.00x</span></div>
+        <div>积分响度: <span data-field="meterIntegratedLufs">-∞</span> LUFS <span style="color:#888;" data-field="sampleCount">(0样本)</span></div>
+        <div>瞬时响度: <span data-field="meterLufs">-∞</span> LUFS</div>
+        <div>增益: <span data-field="meterGain">1.00x</span></div>
       </div>
     `;
 
@@ -379,13 +440,15 @@
     const toggleBtn = shadow.querySelector('button.toggle');
     const sliders = shadow.querySelectorAll('input[type="range"]');
     const fieldNodes = {
-      targetRms: shadow.querySelector('[data-field="targetRms"]'),
+      targetLufs: shadow.querySelector('[data-field="targetLufs"]'),
       maxGain: shadow.querySelector('[data-field="maxGain"]'),
       minGain: shadow.querySelector('[data-field="minGain"]'),
       adaptationRate: shadow.querySelector('[data-field="adaptationRate"]'),
       bassBoost: shadow.querySelector('[data-field="bassBoost"]'),
-      meterRms: shadow.querySelector('[data-field="meterRms"]'),
-      meterGain: shadow.querySelector('[data-field="meterGain"]')
+      meterIntegratedLufs: shadow.querySelector('[data-field="meterIntegratedLufs"]'),
+      meterLufs: shadow.querySelector('[data-field="meterLufs"]'),
+      meterGain: shadow.querySelector('[data-field="meterGain"]'),
+      sampleCount: shadow.querySelector('[data-field="sampleCount"]')
     };
 
     const renderToggle = () => {
@@ -408,7 +471,7 @@
         controllers.forEach((controller) => {
           controller.gainNode.gain.value = 1.0;
         });
-        meterState = { rms: 0, gain: 1 };
+        meterState = { rms: 0, integratedRms: 0, gain: 1, sampleCount: 0 };
       }
     });
 
@@ -417,7 +480,14 @@
         const { role } = event.target.dataset;
         const value = parseFloat(event.target.value);
         if (Number.isNaN(value)) return;
-        settings[role] = value;
+        
+        // 如果是LUFS滑块,转换为RMS存储
+        if (role === 'targetLufs') {
+          settings.targetRms = lufsToRms(value);
+        } else {
+          settings[role] = value;
+        }
+        
         persistSettings();
         updateFieldText(role, value);
         controllers.forEach((controller) => controller.updateSettings(settings));
@@ -425,7 +495,7 @@
     });
 
     function updateFieldText(role, value) {
-      if (role === 'targetRms') fieldNodes.targetRms.textContent = value.toFixed(2);
+      if (role === 'targetLufs') fieldNodes.targetLufs.textContent = value.toFixed(1);
       if (role === 'maxGain') fieldNodes.maxGain.textContent = `${value.toFixed(1)}x`;
       if (role === 'minGain') fieldNodes.minGain.textContent = `${value.toFixed(1)}x`;
       if (role === 'adaptationRate') fieldNodes.adaptationRate.textContent = value.toFixed(2);
@@ -436,9 +506,15 @@
 
     setInterval(() => {
       if (!document.contains(host)) return;
-      const { rms, gain } = meterState;
-      fieldNodes.meterRms.textContent = rms.toFixed(2);
+      const { rms, integratedRms, gain, sampleCount } = meterState;
+      
+      const instantLufs = rmsToLufs(rms);
+      const integratedLufs = rmsToLufs(integratedRms || rms);
+      
+      fieldNodes.meterLufs.textContent = instantLufs > -70 ? instantLufs.toFixed(1) : '-∞';
+      fieldNodes.meterIntegratedLufs.textContent = integratedLufs > -70 ? integratedLufs.toFixed(1) : '-∞';
       fieldNodes.meterGain.textContent = `${gain.toFixed(2)}x`;
+      fieldNodes.sampleCount.textContent = `(${sampleCount || 0}样本)`;
     }, 400);
 
     return host;
