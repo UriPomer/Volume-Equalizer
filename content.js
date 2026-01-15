@@ -1,47 +1,62 @@
 (() => {
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  const BRAND = '[Universal Volume EQ]';
+  const PANEL_ID = 'universal-volume-eq-panel';
+  const DATASET_FLAG = 'universalVolumeEqAttached';
+  const TARGET_SELECTOR = 'video, audio';
+
   if (!AudioContextClass) {
-    console.warn('[Bili Volume EQ] 当前浏览器不支持 AudioContext, 扩展已停用');
+    console.warn(`${BRAND} 当前浏览器不支持 AudioContext, 扩展已停用`);
     return;
   }
 
   const DEFAULT_SETTINGS = {
     enabled: true,
     targetRms: 0.18,
-    minGain: 0.4,
-    maxGain: 3.0,
-    adaptationRate: 0.35,
-    compressorThreshold: -28,
-    compressorKnee: 24,
-    compressorRatio: 4,
-    compressorAttack: 0.002,
-    compressorRelease: 0.25
+    minGain: 0.5,
+    maxGain: 2.0,
+    adaptationRate: 0.25,
+    compressorThreshold: -20,
+    compressorKnee: 20,
+    compressorRatio: 3,
+    compressorAttack: 0.003,
+    compressorRelease: 0.3,
+    bassBoost: 0 // 低频增益 dB: -6 ~ +6
   };
 
   let settings = { ...DEFAULT_SETTINGS };
   let meterState = { rms: 0, gain: 1 };
-  const audioCtx = new AudioContextClass();
+  let audioCtx = null;
   const controllers = new Map();
-  let panelElements = null;
   let scanScheduled = false;
-
+  let panelHost = null;
   const storageSupported = typeof chrome !== 'undefined' && chrome?.storage?.local;
+
+  describeGoal();
+  installGlobalResumeHandlers();
 
   loadSettings()
     .then((loaded) => {
       settings = { ...DEFAULT_SETTINGS, ...loaded };
-      createPanel();
-      installGlobalResumeHandlers();
-      scanForVideos();
+      scanForMedia();
       observeMutations();
     })
     .catch((err) => {
-      console.error('[Bili Volume EQ] 设置加载失败', err);
-      createPanel();
-      installGlobalResumeHandlers();
-      scanForVideos();
+      console.error(`${BRAND} 设置加载失败`, err);
+      scanForMedia();
       observeMutations();
     });
+
+  function describeGoal() {
+    console.debug(`${BRAND} 初始化: 在任意媒体元素上执行音量均衡`);
+  }
+
+  function ensureAudioContext() {
+    if (!audioCtx) {
+      audioCtx = new AudioContextClass();
+    }
+    return audioCtx;
+  }
 
   function loadSettings() {
     if (!storageSupported) {
@@ -61,12 +76,12 @@
 
   function installGlobalResumeHandlers() {
     const resume = () => {
-      if (audioCtx.state === 'suspended') {
+      if (audioCtx && audioCtx.state === 'suspended') {
         audioCtx.resume().catch(() => {});
       }
     };
-    ['pointerdown', 'keydown'].forEach((evt) => {
-      document.addEventListener(evt, resume, { capture: true });
+    ['pointerdown', 'keydown', 'click', 'touchstart'].forEach((evt) => {
+      document.addEventListener(evt, resume, { capture: true, once: false, passive: true });
     });
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') resume();
@@ -86,61 +101,96 @@
     scanScheduled = true;
     requestAnimationFrame(() => {
       scanScheduled = false;
-      scanForVideos();
+      scanForMedia();
     });
   }
 
-  function scanForVideos() {
-    const videos = document.querySelectorAll('video');
-    videos.forEach((video) => {
-      if (!controllers.has(video) && video.readyState >= 1) {
-        tryAttachController(video);
-      }
+  function scanForMedia() {
+    document.querySelectorAll(TARGET_SELECTOR).forEach((media) => {
+      tryAttachController(media);
     });
 
-    controllers.forEach((controller, video) => {
-      if (!video.isConnected) {
+    controllers.forEach((controller, media) => {
+      if (!media.isConnected) {
         controller.destroy();
-        controllers.delete(video);
+        controllers.delete(media);
       }
     });
+
+    updatePanelVisibility();
   }
 
-  function tryAttachController(video) {
-    if (video.dataset.biliVolumeEqAttached === '1') return;
+
+  function tryAttachController(media) {
+    if (!(media instanceof HTMLMediaElement)) return;
+    if (media.dataset[DATASET_FLAG] === '1') return;
     try {
-      const controller = new VolumeController(video);
-      controllers.set(video, controller);
-      video.dataset.biliVolumeEqAttached = '1';
+      const controller = new MediaVolumeController(media);
+      controllers.set(media, controller);
+      media.dataset[DATASET_FLAG] = '1';
     } catch (error) {
-      console.warn('[Bili Volume EQ] 无法绑定 video 元素', error);
+      console.warn(`${BRAND} 无法绑定媒体元素`, error);
     }
   }
 
-  class VolumeController {
-    constructor(video) {
-      this.video = video;
+  function ensurePanel() {
+    if (panelHost && document.contains(panelHost)) {
+      return panelHost;
+    }
+    panelHost = null;
+    return createPanel();
+  }
+
+  function updatePanelVisibility() {
+    if (controllers.size === 0) {
+      if (panelHost && document.contains(panelHost)) {
+        panelHost.style.display = 'none';
+      }
+      return;
+    }
+    const host = ensurePanel();
+    if (host) {
+      host.style.display = 'block';
+    }
+  }
+
+  class MediaVolumeController {
+    constructor(media) {
+      this.media = media;
       this.buffer = null;
       this.rafId = 0;
       this.settings = settings;
 
-      this.sourceNode = audioCtx.createMediaElementSource(video);
-      this.compressor = audioCtx.createDynamicsCompressor();
-      this.gainNode = audioCtx.createGain();
-      this.analyser = audioCtx.createAnalyser();
+      const ctx = ensureAudioContext();
+      this.sourceNode = ctx.createMediaElementSource(media);
+      this.compressor = ctx.createDynamicsCompressor();
+      this.gainNode = ctx.createGain();
+      this.analyser = ctx.createAnalyser();
       this.analyser.fftSize = 2048;
       this.buffer = new Float32Array(this.analyser.fftSize);
 
+      // 低频保护滤波器 (Biquad Filter)
+      this.bassFilter = ctx.createBiquadFilter();
+      this.bassFilter.type = 'lowshelf';
+      this.bassFilter.frequency.value = 200; // 200Hz以下为低频
+      this.bassFilter.gain.value = settings.bassBoost;
+
       this.applyCompressor();
 
+      // 信号链: source → compressor → gain → bassFilter → analyser → destination
       this.sourceNode.connect(this.compressor);
       this.compressor.connect(this.gainNode);
-      this.gainNode.connect(this.analyser);
-      this.analyser.connect(audioCtx.destination);
+      this.gainNode.connect(this.bassFilter);
+      this.bassFilter.connect(this.analyser);
+      this.analyser.connect(ctx.destination);
 
       this.handleEmptied = () => this.resetGain();
-      video.addEventListener('emptied', this.handleEmptied);
-      video.addEventListener('play', () => audioCtx.resume());
+      media.addEventListener('emptied', this.handleEmptied);
+      media.addEventListener('play', () => {
+        if (ctx.state === 'suspended') {
+          ctx.resume().catch(() => {});
+        }
+      });
 
       this.tick = this.tick.bind(this);
       this.rafId = requestAnimationFrame(this.tick);
@@ -157,6 +207,7 @@
     updateSettings(newSettings) {
       this.settings = newSettings;
       this.applyCompressor();
+      this.bassFilter.gain.value = newSettings.bassBoost;
     }
 
     resetGain() {
@@ -174,18 +225,21 @@
     }
 
     tick() {
-      if (!document.contains(this.video)) {
+      if (!document.contains(this.media)) {
         this.destroy();
         return;
       }
 
-      if (settings.enabled && !this.video.muted && !this.video.paused && !this.video.ended) {
+      if (settings.enabled && !this.media.muted && !this.media.paused && !this.media.ended) {
         const rms = this.measureRms();
         const error = settings.targetRms - rms;
         const delta = error * settings.adaptationRate;
         const nextGain = clamp(this.gainNode.gain.value + delta, settings.minGain, settings.maxGain);
         this.gainNode.gain.value = nextGain;
         meterState = { rms, gain: nextGain };
+      } else if (!settings.enabled) {
+        this.gainNode.gain.value = 1.0;
+        meterState = { rms: 0, gain: 1 };
       }
 
       this.rafId = requestAnimationFrame(this.tick);
@@ -193,12 +247,13 @@
 
     destroy() {
       cancelAnimationFrame(this.rafId);
-      this.video.removeEventListener('emptied', this.handleEmptied);
+      this.media.removeEventListener('emptied', this.handleEmptied);
       this.sourceNode.disconnect();
       this.compressor.disconnect();
       this.gainNode.disconnect();
+      this.bassFilter.disconnect();
       this.analyser.disconnect();
-      delete this.video.dataset.biliVolumeEqAttached;
+      delete this.media.dataset[DATASET_FLAG];
     }
   }
 
@@ -207,15 +262,24 @@
   }
 
   function createPanel() {
-    if (document.getElementById('bili-volume-eq-panel')) return;
+    if (panelHost && document.contains(panelHost)) return panelHost;
+    const existing = document.getElementById(PANEL_ID);
+    if (existing) {
+      panelHost = existing;
+      return panelHost;
+    }
+
     const host = document.createElement('div');
-    host.id = 'bili-volume-eq-panel';
+    host.id = PANEL_ID;
     host.style.position = 'fixed';
     host.style.right = '16px';
     host.style.bottom = '120px';
     host.style.zIndex = '2147483647';
     host.style.fontFamily = 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    host.style.display = 'none';
     document.documentElement.appendChild(host);
+
+    panelHost = host;
 
     const shadow = host.attachShadow({ mode: 'open' });
     const style = document.createElement('style');
@@ -287,7 +351,7 @@
         <span>增益上限</span>
         <span data-field="maxGain">${settings.maxGain.toFixed(1)}x</span>
       </label>
-      <input type="range" min="1" max="5" step="0.1" data-role="maxGain" value="${settings.maxGain}">
+      <input type="range" min="1" max="3" step="0.1" data-role="maxGain" value="${settings.maxGain}">
       <label>
         <span>增益下限</span>
         <span data-field="minGain">${settings.minGain.toFixed(1)}x</span>
@@ -298,6 +362,11 @@
         <span data-field="adaptationRate">${settings.adaptationRate.toFixed(2)}</span>
       </label>
       <input type="range" min="0.05" max="0.6" step="0.01" data-role="adaptationRate" value="${settings.adaptationRate}">
+      <label>
+        <span>低频增益</span>
+        <span data-field="bassBoost">${settings.bassBoost > 0 ? '+' : ''}${settings.bassBoost.toFixed(1)} dB</span>
+      </label>
+      <input type="range" min="-6" max="6" step="0.5" data-role="bassBoost" value="${settings.bassBoost}">
       <div class="meter">
         <div>RMS: <span data-field="meterRms">0.00</span></div>
         <div>Gain: <span data-field="meterGain">1.00x</span></div>
@@ -314,17 +383,18 @@
       maxGain: shadow.querySelector('[data-field="maxGain"]'),
       minGain: shadow.querySelector('[data-field="minGain"]'),
       adaptationRate: shadow.querySelector('[data-field="adaptationRate"]'),
+      bassBoost: shadow.querySelector('[data-field="bassBoost"]'),
       meterRms: shadow.querySelector('[data-field="meterRms"]'),
       meterGain: shadow.querySelector('[data-field="meterGain"]')
     };
 
     const renderToggle = () => {
       if (settings.enabled) {
-        toggleBtn.textContent = '开启';
+        toggleBtn.textContent = '已开启';
         toggleBtn.classList.add('on');
         toggleBtn.classList.remove('off');
       } else {
-        toggleBtn.textContent = '关闭';
+        toggleBtn.textContent = '已关闭';
         toggleBtn.classList.add('off');
         toggleBtn.classList.remove('on');
       }
@@ -334,6 +404,12 @@
       settings.enabled = !settings.enabled;
       persistSettings();
       renderToggle();
+      if (!settings.enabled) {
+        controllers.forEach((controller) => {
+          controller.gainNode.gain.value = 1.0;
+        });
+        meterState = { rms: 0, gain: 1 };
+      }
     });
 
     sliders.forEach((slider) => {
@@ -353,16 +429,19 @@
       if (role === 'maxGain') fieldNodes.maxGain.textContent = `${value.toFixed(1)}x`;
       if (role === 'minGain') fieldNodes.minGain.textContent = `${value.toFixed(1)}x`;
       if (role === 'adaptationRate') fieldNodes.adaptationRate.textContent = value.toFixed(2);
+      if (role === 'bassBoost') fieldNodes.bassBoost.textContent = `${value > 0 ? '+' : ''}${value.toFixed(1)} dB`;
     }
 
     renderToggle();
 
-    panelElements = { fieldNodes };
-
     setInterval(() => {
+      if (!document.contains(host)) return;
       const { rms, gain } = meterState;
       fieldNodes.meterRms.textContent = rms.toFixed(2);
       fieldNodes.meterGain.textContent = `${gain.toFixed(2)}x`;
     }, 400);
+
+    return host;
   }
 })();
+
