@@ -2,10 +2,15 @@
  * UI 面板 - 创建和管理设置面板
  */
 
-import { PANEL_ID, BRAND } from './config.js';
+import { PANEL_ID } from './config.js';
+
 import { rmsToLufs, lufsToRms } from './lufs-calculator.js';
+import { eventBus, EVENTS } from './events/index.js';
+
 
 let panelHost = null;
+let settingsChangedOff = null;
+
 
 /**
  * 创建设置面板
@@ -215,6 +220,7 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
   const toggleBtn = shadow.querySelector('button.toggle');
   const sliders = shadow.querySelectorAll('input[type="range"]');
   const fieldNodes = getFieldNodes(shadow);
+  const sliderMap = new Map([...sliders].map((slider) => [slider.dataset.role, slider]));
   
   // 使用可变引用来跟踪当前设置状态
   let currentSettings = initialSettings;
@@ -229,7 +235,30 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
       toggleBtn.className = 'toggle off';
     }
   };
-  renderToggle();
+
+  const applySettingsToUI = (settings) => {
+    const targetLufs = rmsToLufs(settings.targetRms);
+    const targetSlider = sliderMap.get('targetLufs');
+    if (targetSlider) targetSlider.value = targetLufs;
+    updateFieldText(fieldNodes, 'targetLufs', targetLufs);
+
+    const maxGainSlider = sliderMap.get('maxGain');
+    if (maxGainSlider) maxGainSlider.value = settings.maxGain;
+    updateFieldText(fieldNodes, 'maxGain', settings.maxGain);
+
+    const minGainSlider = sliderMap.get('minGain');
+    if (minGainSlider) minGainSlider.value = settings.minGain;
+    updateFieldText(fieldNodes, 'minGain', settings.minGain);
+
+    const bassBoostSlider = sliderMap.get('bassBoost');
+    if (bassBoostSlider) bassBoostSlider.value = settings.bassBoost;
+    updateFieldText(fieldNodes, 'bassBoost', settings.bassBoost);
+
+    renderToggle();
+  };
+
+  applySettingsToUI(currentSettings);
+
 
   // 开关按钮
   toggleBtn.addEventListener('click', () => {
@@ -260,7 +289,16 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
       updateFieldText(fieldNodes, role, value);
     });
   });
+
+  if (settingsChangedOff) settingsChangedOff();
+  settingsChangedOff = eventBus.on(EVENTS.SETTINGS_CHANGED, ({ settings: nextSettings }) => {
+    if (!panelHost || !document.contains(panelHost)) return;
+    currentSettings = nextSettings;
+    applySettingsToUI(currentSettings);
+  });
 }
+
+
 
 /**
  * 获取字段节点

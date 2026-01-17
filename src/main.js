@@ -7,7 +7,10 @@ import { isAudioContextSupported, installGlobalResumeHandlers } from './audio-co
 import { loadSettings, persistSettings } from './settings.js';
 import { MediaVolumeController } from './controller.js';
 import { scanForMedia, observeMutations } from './media-scanner.js';
-import { createPanel, ensurePanel, updatePanelVisibility } from './ui-panel.js';
+import { ensurePanel, updatePanelVisibility } from './ui-panel.js';
+
+import { eventBus, EVENTS } from './events/index.js';
+
 
 // 检查浏览器支持
 if (!isAudioContextSupported()) {
@@ -64,7 +67,9 @@ function attachController(media) {
   );
   controllers.set(media, controller);
   updatePanelVisibility(controllers.size);
+  ensurePanel(settings, handleSettingsChange, getMeterState);
 }
+
 
 /**
  * 清理已断开的控制器
@@ -85,11 +90,15 @@ function cleanupControllers() {
  * @returns {Object} 更新后的设置
  */
 function handleSettingsChange(newSettings) {
-  settings = newSettings;
+  const changedField = newSettings._changedField || null;
+  const cleanedSettings = { ...newSettings };
+  delete cleanedSettings._changedField;
+
+  settings = cleanedSettings;
   persistSettings(settings);
   
   controllers.forEach((controller) => {
-    controller.updateSettings(settings);
+    controller.updateSettings({ ...settings, _changedField: changedField });
   });
 
   // 如果关闭功能，重置所有增益
@@ -106,9 +115,12 @@ function handleSettingsChange(newSettings) {
       sampleCount: 0
     };
   }
+
+  eventBus.emit(EVENTS.SETTINGS_CHANGED, { settings, changedField });
   
   return settings;
 }
+
 
 /**
  * 获取当前 meter 状态

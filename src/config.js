@@ -17,8 +17,10 @@ export const DEFAULT_SETTINGS = {
   compressorRatio: 3,        // 压缩比 (3:1)
   compressorAttack: 0.003,   // 压缩器启动时间 (秒)
   compressorRelease: 0.3,    // 压缩器释放时间 (秒)
-  bassBoost: 0               // 低频增益 (dB: -6 ~ +6)
+  bassBoost: 0,              // 低频增益 (dB: -6 ~ +6)
+  gainChangePerSec: 0.2      // 最大增益变化速度 (x/秒)，慢速调整保留动态
 };
+
 
 // PID 控制器参数
 export const PID_PARAMS = {
@@ -28,9 +30,12 @@ export const PID_PARAMS = {
   integralLimit: 5  // 积分抗饱和限制
 };
 
-// 积分响度参数
+// 积分响度参数 (ITU-R BS.1770-4 标准)
 export const INTEGRATION_PARAMS = {
-  maxHistorySize: 600,  // 滑动窗口大小 (约10秒@60fps)
-  minSamples: 30,       // 启动PID前的最少样本数
-  silenceThreshold: 0.001  // 静音阈值 (低于此值不计入积分)
+  // 标准算法使用 400ms 块 + 75% 重叠，由 LoudnessMeter 内部处理
+  minIntegrationSeconds: 3,       // 启动控制前的最小积分时长（3秒 = ~30个块）
+  silenceThreshold: 0.001         // 静音阈值 (低于此值不送入响度测量)
 };
+
+
+

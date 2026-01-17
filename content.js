@@ -21,8 +21,10 @@
   compressorRatio: 3,        // 压缩比 (3:1)
   compressorAttack: 0.003,   // 压缩器启动时间 (秒)
   compressorRelease: 0.3,    // 压缩器释放时间 (秒)
-  bassBoost: 0               // 低频增益 (dB: -6 ~ +6)
+  bassBoost: 0,              // 低频增益 (dB: -6 ~ +6)
+  gainChangePerSec: 0.2      // 最大增益变化速度 (x/秒)，慢速调整保留动态
 };
+
 
 // PID 控制器参数
   const PID_PARAMS = {
@@ -32,11 +34,77 @@
   integralLimit: 5  // 积分抗饱和限制
 };
 
-// 积分响度参数
+// 积分响度参数 (ITU-R BS.1770-4 标准)
   const INTEGRATION_PARAMS = {
-  maxHistorySize: 600,  // 滑动窗口大小 (约10秒@60fps)
-  minSamples: 30,       // 启动PID前的最少样本数
-  silenceThreshold: 0.001  // 静音阈值 (低于此值不计入积分)
+  // 标准算法使用 400ms 块 + 75% 重叠，由 LoudnessMeter 内部处理
+  minIntegrationSeconds: 3,       // 启动控制前的最小积分时长（3秒 = ~30个块）
+  silenceThreshold: 0.001         // 静音阈值 (低于此值不送入响度测量)
+};
+
+
+
+
+
+  // ===== events/event-bus.js =====
+/**
+ * 事件总线 - 统一管理模块间事件
+ */
+
+  class EventBus {
+  constructor() {
+    this.listeners = new Map();
+  }
+
+  on(eventName, handler) {
+    if (!this.listeners.has(eventName)) {
+      this.listeners.set(eventName, new Set());
+    }
+    this.listeners.get(eventName).add(handler);
+    return () => this.off(eventName, handler);
+  }
+
+  once(eventName, handler) {
+    const off = this.on(eventName, (payload) => {
+      off();
+      handler(payload);
+    });
+    return off;
+  }
+
+  off(eventName, handler) {
+    const set = this.listeners.get(eventName);
+    if (!set) return;
+    set.delete(handler);
+    if (set.size === 0) this.listeners.delete(eventName);
+  }
+
+  emit(eventName, payload) {
+    const set = this.listeners.get(eventName);
+    if (!set) return;
+    [...set].forEach((handler) => {
+      try {
+        handler(payload);
+      } catch (err) {
+        // 防止单个监听器影响其它监听
+      }
+    });
+  }
+}
+
+  const eventBus = new EventBus();
+
+
+  // ===== events/events.js =====
+/**
+ * 事件定义 - 集中管理事件名称
+ */
+
+  const EVENTS = {
+  SETTINGS_CHANGED: 'settings:changed',
+  MEDIA_PLAY: 'media:play',
+  MEDIA_PAUSE: 'media:pause',
+  MEDIA_SEEKED: 'media:seeked',
+  MEDIA_EMPTIED: 'media:emptied'
 };
 
 
@@ -73,6 +141,371 @@
  */
   function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
+}
+
+
+  // ===== loudness-meter.js =====
+/**
+ * ITU-R BS.1770-4 响度测量器
+ * 基于 pyloudnorm 实现的 JavaScript 版本
+ * 
+ * 核心特性:
+ * - K-weighting 滤波器 (高架 + 高通)
+ * - 双门限机制 (绝对门限 -70 LUFS + 相对门限 -10 LU)
+ * - 400ms 分块 + 75% 重叠
+ */
+
+/**
+ * Biquad IIR 滤波器
+ * 用于 K-weighting 预加权
+ */
+class IIRFilter {
+  constructor(type, fc, Q, gain, sampleRate) {
+    this.type = type;
+    this.fc = fc;
+    this.Q = Q;
+    this.gain = gain;
+    this.sampleRate = sampleRate;
+    
+    // 滤波器状态 (用于实时处理)
+    this.x1 = 0;
+    this.x2 = 0;
+    this.y1 = 0;
+    this.y2 = 0;
+    
+    // 计算滤波器系数
+    this.calculateCoefficients();
+  }
+
+  /**
+   * 计算 Biquad 滤波器系数
+   * 基于 ITU-R BS.1770-4 标准的 DeMan 精确实现
+   */
+  calculateCoefficients() {
+    const K = Math.tan(Math.PI * this.fc / this.sampleRate);
+    
+    if (this.type === 'high_shelf') {
+      // DeMan 精确高架滤波器 (符合 ITU 规范)
+      // 参数: G=3.999843854 dB, Q=0.7071752369, fc=1681.97 Hz
+      const Vh = Math.pow(10.0, this.gain / 20.0);
+      const Vb = Math.pow(Vh, 0.499666774155);
+      const a0_ = 1.0 + K / this.Q + K * K;
+      
+      this.b0 = (Vh + Vb * K / this.Q + K * K) / a0_;
+      this.b1 = 2.0 * (K * K - Vh) / a0_;
+      this.b2 = (Vh - Vb * K / this.Q + K * K) / a0_;
+      this.a1 = 2.0 * (K * K - 1.0) / a0_;
+      this.a2 = (1.0 - K / this.Q + K * K) / a0_;
+    } else if (this.type === 'high_pass') {
+      // DeMan 精确高通滤波器
+      // 参数: Q=0.5003270373, fc=38.1355 Hz
+      const a0_ = 1.0 + K / this.Q + K * K;
+      
+      this.b0 = 1.0 / a0_;
+      this.b1 = -2.0 / a0_;
+      this.b2 = 1.0 / a0_;
+      this.a1 = 2.0 * (K * K - 1.0) / a0_;
+      this.a2 = (1.0 - K / this.Q + K * K) / a0_;
+    }
+  }
+
+  /**
+   * 处理单个样本 (实时)
+   */
+  processSample(x) {
+    const y = this.b0 * x + this.b1 * this.x1 + this.b2 * this.x2
+              - this.a1 * this.y1 - this.a2 * this.y2;
+    
+    this.x2 = this.x1;
+    this.x1 = x;
+    this.y2 = this.y1;
+    this.y1 = y;
+    
+    return y;
+  }
+
+  /**
+   * 处理音频块
+   */
+  processBlock(data) {
+    const output = new Float32Array(data.length);
+    for (let i = 0; i < data.length; i++) {
+      output[i] = this.processSample(data[i]);
+    }
+    return output;
+  }
+
+  /**
+   * 重置滤波器状态
+   */
+  reset() {
+    this.x1 = this.x2 = this.y1 = this.y2 = 0;
+  }
+}
+
+/**
+ * ITU-R BS.1770-4 响度测量器
+ */
+  class LoudnessMeter {
+  constructor(sampleRate = 48000) {
+    this.sampleRate = sampleRate;
+    
+    // ITU-R BS.1770-4 标准参数
+    this.blockSize = 0.4;  // 400ms 门限块
+    this.overlap = 0.75;   // 75% 重叠
+    this.absoluteThreshold = -70;  // 绝对门限 LUFS
+    this.relativeThreshold = -10;  // 相对门限 LU (低于平均 10 LU)
+    
+    // K-weighting 滤波器 (DeMan 精确参数)
+    this.highShelfFilter = new IIRFilter(
+      'high_shelf',
+      1681.9744509555319,  // fc
+      0.7071752369554193,  // Q
+      3.99984385397,       // gain dB
+      sampleRate
+    );
+    this.highPassFilter = new IIRFilter(
+      'high_pass',
+      38.13547087613982,   // fc
+      0.5003270373253953,  // Q
+      0,                   // gain (高通无增益)
+      sampleRate
+    );
+    
+    // 实时积分状态
+    this.blocks = [];  // 存储每个块的均方能量
+    this.blockBuffer = new Float32Array(Math.ceil(this.blockSize * sampleRate));
+    this.blockBufferIndex = 0;
+    this.samplesPerBlock = Math.ceil(this.blockSize * sampleRate);
+    this.stepSamples = Math.ceil(this.samplesPerBlock * (1 - this.overlap));
+    this.samplesSinceLastBlock = 0;
+    
+    // 门限块响度 (用于相对门限计算)
+    this.blockLoudness = [];
+    
+    // 最大保留的块数 (防止内存无限增长)
+    // 保留约 60 秒的块数据
+    this.maxBlocks = Math.ceil(60 / (this.blockSize * (1 - this.overlap)));
+  }
+
+  /**
+   * 应用 K-weighting 滤波
+   */
+  applyKWeighting(sample) {
+    // 先高架，再高通
+    let filtered = this.highShelfFilter.processSample(sample);
+    filtered = this.highPassFilter.processSample(filtered);
+    return filtered;
+  }
+
+  /**
+   * 实时处理音频块
+   * @param {Float32Array} data - 原始音频数据
+   */
+  processBlock(data) {
+    for (let i = 0; i < data.length; i++) {
+      // K-weighting 滤波
+      const filtered = this.applyKWeighting(data[i]);
+      
+      // 添加到块缓冲区
+      this.blockBuffer[this.blockBufferIndex] = filtered;
+      this.blockBufferIndex++;
+      this.samplesSinceLastBlock++;
+      
+      // 检查是否完成一个块
+      if (this.blockBufferIndex >= this.samplesPerBlock) {
+        // 计算块的均方能量
+        const meanSquare = this.calculateMeanSquare(this.blockBuffer);
+        
+        // 计算块响度 (LUFS)
+        const blockLufs = -0.691 + 10 * Math.log10(meanSquare);
+        
+        // 只保留高于绝对门限的块
+        if (blockLufs >= this.absoluteThreshold) {
+          this.blocks.push(meanSquare);
+          this.blockLoudness.push(blockLufs);
+          
+          // 限制块数量
+          if (this.blocks.length > this.maxBlocks) {
+            this.blocks.shift();
+            this.blockLoudness.shift();
+          }
+        }
+        
+        // 滑动窗口：只移动 step 距离
+        if (this.samplesSinceLastBlock >= this.stepSamples) {
+          // 将缓冲区向前移动 stepSamples
+          const overlap = this.samplesPerBlock - this.stepSamples;
+          this.blockBuffer.copyWithin(0, this.stepSamples);
+          this.blockBufferIndex = overlap;
+          this.samplesSinceLastBlock = 0;
+        }
+      }
+    }
+  }
+
+  /**
+   * 计算均方值
+   */
+  calculateMeanSquare(buffer) {
+    let sum = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      sum += buffer[i] * buffer[i];
+    }
+    return sum / buffer.length;
+  }
+
+  /**
+   * 计算积分响度 (ITU-R BS.1770-4 双门限算法)
+   * @returns {number} LUFS 值，如果数据不足返回 NaN
+   */
+  getIntegratedLoudness() {
+    if (this.blocks.length === 0) {
+      return NaN;
+    }
+
+    // 第一步：已经通过绝对门限筛选的块
+    // 计算这些块的平均响度用于相对门限
+    const avgMeanSquare = this.blocks.reduce((a, b) => a + b, 0) / this.blocks.length;
+    const avgLoudness = -0.691 + 10 * Math.log10(avgMeanSquare);
+    
+    // 第二步：计算相对门限 (平均响度 - 10 LU)
+    const relativeThresholdLufs = avgLoudness + this.relativeThreshold;
+    
+    // 第三步：筛选同时高于绝对门限和相对门限的块
+    let gatedSum = 0;
+    let gatedCount = 0;
+    
+    for (let i = 0; i < this.blocks.length; i++) {
+      const blockLufs = this.blockLoudness[i];
+      // 块必须同时高于绝对门限和相对门限
+      if (blockLufs >= this.absoluteThreshold && blockLufs >= relativeThresholdLufs) {
+        gatedSum += this.blocks[i];
+        gatedCount++;
+      }
+    }
+    
+    if (gatedCount === 0) {
+      return NaN;
+    }
+    
+    // 计算最终积分响度
+    const gatedMeanSquare = gatedSum / gatedCount;
+    const integratedLoudness = -0.691 + 10 * Math.log10(gatedMeanSquare);
+    
+    return integratedLoudness;
+  }
+
+  /**
+   * 获取瞬时响度 (400ms 窗口，无门限)
+   * @returns {number} LUFS 值
+   */
+  getMomentaryLoudness() {
+    if (this.blockBufferIndex < this.samplesPerBlock * 0.5) {
+      return NaN;
+    }
+    
+    // 使用当前缓冲区计算瞬时响度
+    let sum = 0;
+    for (let i = 0; i < this.blockBufferIndex; i++) {
+      sum += this.blockBuffer[i] * this.blockBuffer[i];
+    }
+    const meanSquare = sum / this.blockBufferIndex;
+    
+    if (meanSquare <= 0) return -Infinity;
+    return -0.691 + 10 * Math.log10(meanSquare);
+  }
+
+  /**
+   * 获取短时响度 (3秒窗口)
+   * @returns {number} LUFS 值
+   */
+  getShortTermLoudness() {
+    // 3秒需要的块数 (每个块 400ms，75% 重叠 = 100ms 步进)
+    const blocksFor3s = Math.ceil(3 / (this.blockSize * (1 - this.overlap)));
+    
+    if (this.blocks.length < blocksFor3s) {
+      return this.getIntegratedLoudness();  // 数据不足时返回积分响度
+    }
+    
+    // 取最近 3 秒的块
+    const recentBlocks = this.blocks.slice(-blocksFor3s);
+    const avgMeanSquare = recentBlocks.reduce((a, b) => a + b, 0) / recentBlocks.length;
+    
+    if (avgMeanSquare <= 0) return -Infinity;
+    return -0.691 + 10 * Math.log10(avgMeanSquare);
+  }
+
+  /**
+   * 获取积分时长 (秒)
+   */
+  getIntegrationTime() {
+    return this.blocks.length * this.blockSize * (1 - this.overlap);
+  }
+
+  /**
+   * 重置测量器
+   */
+  reset() {
+    this.blocks = [];
+    this.blockLoudness = [];
+    this.blockBuffer.fill(0);
+    this.blockBufferIndex = 0;
+    this.samplesSinceLastBlock = 0;
+    this.highShelfFilter.reset();
+    this.highPassFilter.reset();
+  }
+
+  /**
+   * 更新采样率 (视频切换时调用)
+   */
+  setSampleRate(sampleRate) {
+    if (this.sampleRate !== sampleRate) {
+      this.sampleRate = sampleRate;
+      
+      // 重新创建滤波器
+      this.highShelfFilter = new IIRFilter(
+        'high_shelf', 1681.9744509555319, 0.7071752369554193, 3.99984385397, sampleRate
+      );
+      this.highPassFilter = new IIRFilter(
+        'high_pass', 38.13547087613982, 0.5003270373253953, 0, sampleRate
+      );
+      
+      // 重新计算缓冲区大小
+      this.samplesPerBlock = Math.ceil(this.blockSize * sampleRate);
+      this.stepSamples = Math.ceil(this.samplesPerBlock * (1 - this.overlap));
+      this.blockBuffer = new Float32Array(this.samplesPerBlock);
+      
+      this.reset();
+    }
+  }
+}
+
+/**
+ * 响度归一化工具
+ */
+  function calculateGainForLoudness(currentLufs, targetLufs) {
+  if (!isFinite(currentLufs) || !isFinite(targetLufs)) {
+    return 1.0;
+  }
+  
+  const delta = targetLufs - currentLufs;
+  return Math.pow(10, delta / 20);
+}
+
+/**
+ * RMS 转 LUFS (近似，无 K-weighting)
+ */
+  function rmsToLufs(rms) {
+  if (rms <= 0) return -Infinity;
+  return 20 * Math.log10(rms) - 0.691;
+}
+
+/**
+ * LUFS 转 RMS
+ */
+  function lufsToRms(lufs) {
+  return Math.pow(10, (lufs + 0.691) / 20);
 }
 
 
@@ -222,7 +655,11 @@ let audioCtx = null;
 /**
  * MediaVolumeController - 媒体音量控制器
  * 负责音频信号链管理、响度测量和增益调整
+ * 
+ * 使用 ITU-R BS.1770-4 标准响度测量算法
  */
+
+
 
 
 
@@ -235,12 +672,12 @@ let audioCtx = null;
     this.meterStateCallback = meterStateCallback;
     this.rafId = 0;
 
-    // 积分响度计算
-    this.rmsHistory = [];
-    this.originalRmsHistory = [];
-    this.maxHistorySize = INTEGRATION_PARAMS.maxHistorySize;
-    this.integratedRms = null;
-    this.originalIntegratedRms = null;
+    // ITU-R BS.1770-4 标准响度测量器
+    this.originalMeter = null;  // 原始响度 (增益前)
+    this.outputMeter = null;    // 输出响度 (增益后)
+
+    // tick 计时
+    this.lastTickTime = performance.now();
 
     // PID 控制器
     this.pidController = new PIDController();
@@ -282,6 +719,10 @@ let audioCtx = null;
     this.bassFilter.frequency.value = 200;
     this.bassFilter.gain.value = this.settings.bassBoost;
 
+    // 初始化 ITU-R BS.1770-4 响度测量器
+    this.originalMeter = new LoudnessMeter(ctx.sampleRate);
+    this.outputMeter = new LoudnessMeter(ctx.sampleRate);
+
     this.applyCompressor();
 
     // 信号链: source → compressor → originalAnalyser → gain → bassFilter → analyser → destination
@@ -297,12 +738,18 @@ let audioCtx = null;
    * 绑定媒体事件监听器
    */
   bindEventListeners() {
-    this.handleEmptied = () => this.resetGain();
-    this.handleSeeked = () => this.resetIntegration();
-    
-    this.media.addEventListener('emptied', this.handleEmptied);
-    this.media.addEventListener('seeked', this.handleSeeked);
-    this.media.addEventListener('play', () => {
+    this.handleEmptied = () => {
+      eventBus.emit(EVENTS.MEDIA_EMPTIED, { media: this.media });
+      this.resetGain();
+    };
+
+    this.handleSeeked = () => {
+      eventBus.emit(EVENTS.MEDIA_SEEKED, { media: this.media });
+      this.resetIntegration();
+    };
+
+    this.handlePlay = () => {
+      eventBus.emit(EVENTS.MEDIA_PLAY, { media: this.media });
       try {
         const ctx = ensureAudioContext();
         if (ctx.state === 'suspended') {
@@ -313,8 +760,18 @@ let audioCtx = null;
       } catch (err) {
         console.debug(`${BRAND} Play event handler error:`, err);
       }
-    });
+    };
+
+    this.handlePause = () => {
+      eventBus.emit(EVENTS.MEDIA_PAUSE, { media: this.media });
+    };
+
+    this.media.addEventListener('emptied', this.handleEmptied);
+    this.media.addEventListener('seeked', this.handleSeeked);
+    this.media.addEventListener('play', this.handlePlay);
+    this.media.addEventListener('pause', this.handlePause);
   }
+
 
   /**
    * 应用压缩器设置
@@ -333,20 +790,20 @@ let audioCtx = null;
    */
   updateSettings(newSettings) {
     // 检查是否是目标响度变化（通过标记字段判断）
-    const targetChanged = newSettings._changedField === 'targetLufs';
+    const { _changedField, ...restSettings } = newSettings;
+    const targetChanged = _changedField === 'targetLufs';
     
-    // 清除临时标记并更新设置
-    delete newSettings._changedField;
-    this.settings = newSettings;
+    this.settings = restSettings;
     
     this.applyCompressor();
-    this.bassFilter.gain.value = newSettings.bassBoost;
+    this.bassFilter.gain.value = restSettings.bassBoost;
 
     // 只有目标响度改变时才重置输出响度积分
     if (targetChanged) {
       this.resetOutputIntegration();
     }
   }
+
 
   /**
    * 重置增益到 1.0 并清空积分历史
@@ -361,10 +818,9 @@ let audioCtx = null;
    * 触发场景: 用户跳转视频
    */
   resetIntegration() {
-    this.rmsHistory = [];
-    this.originalRmsHistory = [];
-    this.integratedRms = null;
-    this.originalIntegratedRms = null;
+    this.originalMeter.reset();
+    this.outputMeter.reset();
+    this.lastTickTime = performance.now();
     this.pidController.reset();
   }
 
@@ -373,8 +829,8 @@ let audioCtx = null;
    * 触发场景: 目标响度改变
    */
   resetOutputIntegration() {
-    this.rmsHistory = [];
-    this.integratedRms = null;
+    this.outputMeter.reset();
+    this.lastTickTime = performance.now();
     this.pidController.reset();
 
     // 立即更新 meter 状态，触发 UI 刷新
@@ -382,6 +838,7 @@ let audioCtx = null;
     const originalRms = this.measureOriginalRms();
     this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
   }
+
 
   /**
    * 测量输出 RMS
@@ -412,35 +869,37 @@ let audioCtx = null;
   }
 
   /**
-   * 更新积分 RMS (滑动窗口能量平均)
-   * @param {number} currentRms - 当前输出 RMS
-   * @param {number} originalRms - 当前原始 RMS
+   * 更新 ITU-R BS.1770-4 响度测量
+   * @param {Float32Array} originalBuffer - 原始音频数据
+   * @param {Float32Array} outputBuffer - 输出音频数据
    */
-  updateIntegratedRms(currentRms, originalRms) {
-    // 过滤静音片段 (低于 -60dB)
-    if (currentRms > INTEGRATION_PARAMS.silenceThreshold) {
-      this.rmsHistory.push(currentRms);
-      if (this.rmsHistory.length > this.maxHistorySize) {
-        this.rmsHistory.shift();
+  updateLoudnessMeasurement(originalBuffer, outputBuffer) {
+    // 检查是否有有效音频 (静音检测)
+    const silenceThreshold = INTEGRATION_PARAMS.silenceThreshold;
+    
+    let hasOriginalAudio = false;
+    let hasOutputAudio = false;
+    
+    for (let i = 0; i < originalBuffer.length; i++) {
+      if (Math.abs(originalBuffer[i]) > silenceThreshold) {
+        hasOriginalAudio = true;
+        break;
       }
     }
-
-    if (originalRms > INTEGRATION_PARAMS.silenceThreshold) {
-      this.originalRmsHistory.push(originalRms);
-      if (this.originalRmsHistory.length > this.maxHistorySize) {
-        this.originalRmsHistory.shift();
+    
+    for (let i = 0; i < outputBuffer.length; i++) {
+      if (Math.abs(outputBuffer[i]) > silenceThreshold) {
+        hasOutputAudio = true;
+        break;
       }
     }
-
-    // 计算积分 RMS (能量平均后开方)
-    if (this.rmsHistory.length > 0) {
-      const sumSquares = this.rmsHistory.reduce((acc, rms) => acc + rms * rms, 0);
-      this.integratedRms = Math.sqrt(sumSquares / this.rmsHistory.length);
+    
+    // 只在有声音时更新响度测量
+    if (hasOriginalAudio) {
+      this.originalMeter.processBlock(originalBuffer);
     }
-
-    if (this.originalRmsHistory.length > 0) {
-      const sumSquares = this.originalRmsHistory.reduce((acc, rms) => acc + rms * rms, 0);
-      this.originalIntegratedRms = Math.sqrt(sumSquares / this.originalRmsHistory.length);
+    if (hasOutputAudio) {
+      this.outputMeter.processBlock(outputBuffer);
     }
   }
 
@@ -453,70 +912,76 @@ let audioCtx = null;
       return;
     }
 
-    // 始终测量原始和输出响度
+    const now = performance.now();
+    const deltaSec = Math.max(0.001, (now - this.lastTickTime) / 1000);
+    this.lastTickTime = now;
+
+    // 获取原始和输出音频数据
+    this.originalAnalyser.getFloatTimeDomainData(this.originalBuffer);
+    this.analyser.getFloatTimeDomainData(this.buffer);
+
+    // 计算瞬时 RMS (用于 UI 显示)
     const currentRms = this.measureRms();
     const originalRms = this.measureOriginalRms();
 
-    // 更新积分 RMS
-    this.updateIntegratedRms(currentRms, originalRms);
+    // 更新 ITU-R BS.1770-4 响度测量
+    this.updateLoudnessMeasurement(this.originalBuffer, this.buffer);
 
     if (this.settings.enabled && !this.media.muted && !this.media.paused && !this.media.ended) {
-      // 等待足够样本后再启用 PID 控制
-      if (this.originalRmsHistory.length >= INTEGRATION_PARAMS.minSamples && 
-          this.originalIntegratedRms > INTEGRATION_PARAMS.silenceThreshold &&
-          this.rmsHistory.length >= INTEGRATION_PARAMS.minSamples &&
-          this.integratedRms > INTEGRATION_PARAMS.silenceThreshold) {
-        
-        // 前馈控制：基于原始积分响度计算基准增益
-        const targetRms = this.settings.targetRms;
-        const currentOriginalRms = this.originalIntegratedRms;
-        const feedforwardGain = targetRms / currentOriginalRms;
+      // 获取积分响度 (LUFS)
+      const originalLufs = this.originalMeter.getIntegratedLoudness();
+      const outputLufs = this.outputMeter.getIntegratedLoudness();
+      const integrationTime = this.originalMeter.getIntegrationTime();
 
-        // 反馈修正：基于实际输出响度计算误差
-        const currentOutputRms = this.integratedRms;
-        const outputError = targetRms - currentOutputRms;  // RMS域的误差
+      // 等待足够积分时长后再启用控制
+      if (integrationTime >= INTEGRATION_PARAMS.minIntegrationSeconds && isFinite(originalLufs)) {
         
-        // 将误差转换为增益修正（小幅调整）
-        const currentGain = this.gainNode.gain.value;
-        const gainError = (outputError / currentOutputRms) * currentGain;  // 相对误差转增益修正
-
-        // 理想增益 = 前馈基准 + 反馈修正
-        const idealGain = feedforwardGain + gainError * 0.5;  // 反馈修正权重0.5，避免过度响应
+        // 目标响度 (从 RMS 转换为 LUFS)
+        const targetLufs = rmsToLufs(this.settings.targetRms);
+        
+        // 计算理想增益 (基于 ITU-R BS.1770-4 积分响度)
+        const idealGain = calculateGainForLoudness(originalLufs, targetLufs);
 
         // 调试输出
         if (Math.random() < 0.01) {  // 1% 概率输出，避免刷屏
-          const outputLufs = 20 * Math.log10(currentOutputRms) - 0.691;
-          const originalLufs = 20 * Math.log10(currentOriginalRms) - 0.691;
-          const targetLufs = 20 * Math.log10(targetRms) - 0.691;
-          
-          console.log(`${BRAND} 调试信息:`, {
+          console.log(`${BRAND} ITU-R BS.1770-4 测量:`, {
             targetLufs: targetLufs.toFixed(1),
             originalLufs: originalLufs.toFixed(1),
-            outputLufs: outputLufs.toFixed(1),
-            feedforwardGain: feedforwardGain.toFixed(3),
-            gainError: gainError.toFixed(3),
+            outputLufs: isFinite(outputLufs) ? outputLufs.toFixed(1) : 'N/A',
             idealGain: idealGain.toFixed(3),
-            currentGain: currentGain.toFixed(3),
-            error: (idealGain - currentGain).toFixed(3)
+            currentGain: this.gainNode.gain.value.toFixed(3),
+            integrationTime: integrationTime.toFixed(1) + 's'
           });
         }
 
         // 误差 = 理想增益 - 当前增益
+        const currentGain = this.gainNode.gain.value;
         const error = idealGain - currentGain;
 
         // PID 输出
         const correction = this.pidController.compute(error);
 
-        // 应用增益调整
+        // 应用增益调整（非对称限速：降快升慢，避免过冲）
+        const rawNextGain = currentGain + correction;
+        const baseRate = this.settings.gainChangePerSec * deltaSec;
+        // 需要降低增益时速度快 3 倍，需要升高时正常速度
+        const maxUp = baseRate;
+        const maxDown = baseRate * 3;
+        let slewLimitedGain;
+        if (rawNextGain > currentGain) {
+          slewLimitedGain = Math.min(rawNextGain, currentGain + maxUp);
+        } else {
+          slewLimitedGain = Math.max(rawNextGain, currentGain - maxDown);
+        }
         const nextGain = clamp(
-          currentGain + correction,
+          slewLimitedGain,
           this.settings.minGain,
           this.settings.maxGain
         );
         this.gainNode.gain.value = nextGain;
 
         // 更新 meter 状态
-        this.updateMeterState(currentRms, originalRms, nextGain);
+        this.updateMeterState(currentRms, originalRms, nextGain, originalLufs, outputLufs);
       } else {
         // 样本不足，暂时不调整增益
         this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
@@ -524,7 +989,7 @@ let audioCtx = null;
     } else if (!this.settings.enabled) {
       this.gainNode.gain.value = 1.0;
       // 关闭时仍显示原始响度
-      this.updateMeterState(originalRms, originalRms, 1, true);
+      this.updateMeterState(originalRms, originalRms, 1, null, null, true);
     }
 
     this.rafId = requestAnimationFrame(this.tick);
@@ -535,19 +1000,39 @@ let audioCtx = null;
    * @param {number} currentRms - 当前 RMS
    * @param {number} originalRms - 原始 RMS
    * @param {number} gain - 当前增益
+   * @param {number} originalLufs - 原始积分响度 (LUFS)
+   * @param {number} outputLufs - 输出积分响度 (LUFS)
    * @param {boolean} disabled - 是否禁用状态
    */
-  updateMeterState(currentRms, originalRms, gain, disabled = false) {
+  updateMeterState(currentRms, originalRms, gain, originalLufs = null, outputLufs = null, disabled = false) {
     if (this.meterStateCallback) {
+      // 如果没有提供 LUFS 值，从 meter 获取
+      if (originalLufs === null) {
+        originalLufs = this.originalMeter.getIntegratedLoudness();
+      }
+      if (outputLufs === null) {
+        outputLufs = this.outputMeter.getIntegratedLoudness();
+      }
+      
+      // 转换 LUFS 到 RMS 用于 UI 兼容
+      const integratedRms = isFinite(outputLufs) 
+        ? Math.pow(10, (outputLufs + 0.691) / 20) 
+        : currentRms;
+      const originalIntegratedRms = isFinite(originalLufs)
+        ? Math.pow(10, (originalLufs + 0.691) / 20)
+        : originalRms;
+
       this.meterStateCallback({
         rms: disabled ? originalRms : currentRms,
-        integratedRms: disabled 
-          ? (this.originalIntegratedRms || originalRms)
-          : (this.integratedRms || currentRms),
+        integratedRms: disabled ? originalIntegratedRms : integratedRms,
         originalRms: originalRms,
-        originalIntegratedRms: this.originalIntegratedRms || originalRms,
+        originalIntegratedRms: originalIntegratedRms,
         gain: gain,
-        sampleCount: disabled ? this.originalRmsHistory.length : this.rmsHistory.length
+        sampleCount: Math.floor(this.originalMeter.getIntegrationTime() * 10),  // 近似块数
+        // 新增: 直接传递 LUFS 值
+        originalLufs: originalLufs,
+        outputLufs: outputLufs,
+        integrationTime: this.originalMeter.getIntegrationTime()
       });
     }
   }
@@ -559,6 +1044,8 @@ let audioCtx = null;
     cancelAnimationFrame(this.rafId);
     this.media.removeEventListener('emptied', this.handleEmptied);
     this.media.removeEventListener('seeked', this.handleSeeked);
+    this.media.removeEventListener('play', this.handlePlay);
+    this.media.removeEventListener('pause', this.handlePause);
     this.sourceNode.disconnect();
     this.originalAnalyser.disconnect();
     this.compressor.disconnect();
@@ -643,7 +1130,10 @@ function tryAttachController(media, attachCallback) {
 
 
 
+
 let panelHost = null;
+let settingsChangedOff = null;
+
 
 /**
  * 创建设置面板
@@ -853,6 +1343,7 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
   const toggleBtn = shadow.querySelector('button.toggle');
   const sliders = shadow.querySelectorAll('input[type="range"]');
   const fieldNodes = getFieldNodes(shadow);
+  const sliderMap = new Map([...sliders].map((slider) => [slider.dataset.role, slider]));
   
   // 使用可变引用来跟踪当前设置状态
   let currentSettings = initialSettings;
@@ -867,7 +1358,30 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
       toggleBtn.className = 'toggle off';
     }
   };
-  renderToggle();
+
+  const applySettingsToUI = (settings) => {
+    const targetLufs = rmsToLufs(settings.targetRms);
+    const targetSlider = sliderMap.get('targetLufs');
+    if (targetSlider) targetSlider.value = targetLufs;
+    updateFieldText(fieldNodes, 'targetLufs', targetLufs);
+
+    const maxGainSlider = sliderMap.get('maxGain');
+    if (maxGainSlider) maxGainSlider.value = settings.maxGain;
+    updateFieldText(fieldNodes, 'maxGain', settings.maxGain);
+
+    const minGainSlider = sliderMap.get('minGain');
+    if (minGainSlider) minGainSlider.value = settings.minGain;
+    updateFieldText(fieldNodes, 'minGain', settings.minGain);
+
+    const bassBoostSlider = sliderMap.get('bassBoost');
+    if (bassBoostSlider) bassBoostSlider.value = settings.bassBoost;
+    updateFieldText(fieldNodes, 'bassBoost', settings.bassBoost);
+
+    renderToggle();
+  };
+
+  applySettingsToUI(currentSettings);
+
 
   // 开关按钮
   toggleBtn.addEventListener('click', () => {
@@ -898,7 +1412,16 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
       updateFieldText(fieldNodes, role, value);
     });
   });
+
+  if (settingsChangedOff) settingsChangedOff();
+  settingsChangedOff = eventBus.on(EVENTS.SETTINGS_CHANGED, ({ settings: nextSettings }) => {
+    if (!panelHost || !document.contains(panelHost)) return;
+    currentSettings = nextSettings;
+    applySettingsToUI(currentSettings);
+  });
 }
+
+
 
 /**
  * 获取字段节点
@@ -973,6 +1496,7 @@ function startMeterUpdateLoop(shadow, getMeterState) {
 
 
 
+
 // 检查浏览器支持
 if (!isAudioContextSupported()) {
   console.warn(`${BRAND} 当前浏览器不支持 AudioContext, 扩展已停用`);
@@ -1028,7 +1552,9 @@ function attachController(media) {
   );
   controllers.set(media, controller);
   updatePanelVisibility(controllers.size);
+  ensurePanel(settings, handleSettingsChange, getMeterState);
 }
+
 
 /**
  * 清理已断开的控制器
@@ -1049,11 +1575,15 @@ function cleanupControllers() {
  * @returns {Object} 更新后的设置
  */
 function handleSettingsChange(newSettings) {
-  settings = newSettings;
+  const changedField = newSettings._changedField || null;
+  const cleanedSettings = { ...newSettings };
+  delete cleanedSettings._changedField;
+
+  settings = cleanedSettings;
   persistSettings(settings);
   
   controllers.forEach((controller) => {
-    controller.updateSettings(settings);
+    controller.updateSettings({ ...settings, _changedField: changedField });
   });
 
   // 如果关闭功能，重置所有增益
@@ -1070,9 +1600,12 @@ function handleSettingsChange(newSettings) {
       sampleCount: 0
     };
   }
+
+  eventBus.emit(EVENTS.SETTINGS_CHANGED, { settings, changedField });
   
   return settings;
 }
+
 
 /**
  * 获取当前 meter 状态

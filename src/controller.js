@@ -1,12 +1,17 @@
 /**
  * MediaVolumeController - 媒体音量控制器
  * 负责音频信号链管理、响度测量和增益调整
+ * 
+ * 使用 ITU-R BS.1770-4 标准响度测量算法
  */
 
 import { ensureAudioContext } from './audio-context.js';
 import { PIDController } from './pid-controller.js';
 import { clamp } from './lufs-calculator.js';
 import { INTEGRATION_PARAMS, DATASET_FLAG, BRAND } from './config.js';
+import { eventBus, EVENTS } from './events/index.js';
+import { LoudnessMeter, calculateGainForLoudness, rmsToLufs } from './loudness-meter.js';
+
 
 export class MediaVolumeController {
   constructor(media, settings, meterStateCallback) {
@@ -15,12 +20,12 @@ export class MediaVolumeController {
     this.meterStateCallback = meterStateCallback;
     this.rafId = 0;
 
-    // 积分响度计算
-    this.rmsHistory = [];
-    this.originalRmsHistory = [];
-    this.maxHistorySize = INTEGRATION_PARAMS.maxHistorySize;
-    this.integratedRms = null;
-    this.originalIntegratedRms = null;
+    // ITU-R BS.1770-4 标准响度测量器
+    this.originalMeter = null;  // 原始响度 (增益前)
+    this.outputMeter = null;    // 输出响度 (增益后)
+
+    // tick 计时
+    this.lastTickTime = performance.now();
 
     // PID 控制器
     this.pidController = new PIDController();
@@ -62,6 +67,10 @@ export class MediaVolumeController {
     this.bassFilter.frequency.value = 200;
     this.bassFilter.gain.value = this.settings.bassBoost;
 
+    // 初始化 ITU-R BS.1770-4 响度测量器
+    this.originalMeter = new LoudnessMeter(ctx.sampleRate);
+    this.outputMeter = new LoudnessMeter(ctx.sampleRate);
+
     this.applyCompressor();
 
     // 信号链: source → compressor → originalAnalyser → gain → bassFilter → analyser → destination
@@ -77,12 +86,18 @@ export class MediaVolumeController {
    * 绑定媒体事件监听器
    */
   bindEventListeners() {
-    this.handleEmptied = () => this.resetGain();
-    this.handleSeeked = () => this.resetIntegration();
-    
-    this.media.addEventListener('emptied', this.handleEmptied);
-    this.media.addEventListener('seeked', this.handleSeeked);
-    this.media.addEventListener('play', () => {
+    this.handleEmptied = () => {
+      eventBus.emit(EVENTS.MEDIA_EMPTIED, { media: this.media });
+      this.resetGain();
+    };
+
+    this.handleSeeked = () => {
+      eventBus.emit(EVENTS.MEDIA_SEEKED, { media: this.media });
+      this.resetIntegration();
+    };
+
+    this.handlePlay = () => {
+      eventBus.emit(EVENTS.MEDIA_PLAY, { media: this.media });
       try {
         const ctx = ensureAudioContext();
         if (ctx.state === 'suspended') {
@@ -93,8 +108,18 @@ export class MediaVolumeController {
       } catch (err) {
         console.debug(`${BRAND} Play event handler error:`, err);
       }
-    });
+    };
+
+    this.handlePause = () => {
+      eventBus.emit(EVENTS.MEDIA_PAUSE, { media: this.media });
+    };
+
+    this.media.addEventListener('emptied', this.handleEmptied);
+    this.media.addEventListener('seeked', this.handleSeeked);
+    this.media.addEventListener('play', this.handlePlay);
+    this.media.addEventListener('pause', this.handlePause);
   }
+
 
   /**
    * 应用压缩器设置
@@ -113,20 +138,20 @@ export class MediaVolumeController {
    */
   updateSettings(newSettings) {
     // 检查是否是目标响度变化（通过标记字段判断）
-    const targetChanged = newSettings._changedField === 'targetLufs';
+    const { _changedField, ...restSettings } = newSettings;
+    const targetChanged = _changedField === 'targetLufs';
     
-    // 清除临时标记并更新设置
-    delete newSettings._changedField;
-    this.settings = newSettings;
+    this.settings = restSettings;
     
     this.applyCompressor();
-    this.bassFilter.gain.value = newSettings.bassBoost;
+    this.bassFilter.gain.value = restSettings.bassBoost;
 
     // 只有目标响度改变时才重置输出响度积分
     if (targetChanged) {
       this.resetOutputIntegration();
     }
   }
+
 
   /**
    * 重置增益到 1.0 并清空积分历史
@@ -141,10 +166,9 @@ export class MediaVolumeController {
    * 触发场景: 用户跳转视频
    */
   resetIntegration() {
-    this.rmsHistory = [];
-    this.originalRmsHistory = [];
-    this.integratedRms = null;
-    this.originalIntegratedRms = null;
+    this.originalMeter.reset();
+    this.outputMeter.reset();
+    this.lastTickTime = performance.now();
     this.pidController.reset();
   }
 
@@ -153,8 +177,8 @@ export class MediaVolumeController {
    * 触发场景: 目标响度改变
    */
   resetOutputIntegration() {
-    this.rmsHistory = [];
-    this.integratedRms = null;
+    this.outputMeter.reset();
+    this.lastTickTime = performance.now();
     this.pidController.reset();
 
     // 立即更新 meter 状态，触发 UI 刷新
@@ -162,6 +186,7 @@ export class MediaVolumeController {
     const originalRms = this.measureOriginalRms();
     this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
   }
+
 
   /**
    * 测量输出 RMS
@@ -192,35 +217,37 @@ export class MediaVolumeController {
   }
 
   /**
-   * 更新积分 RMS (滑动窗口能量平均)
-   * @param {number} currentRms - 当前输出 RMS
-   * @param {number} originalRms - 当前原始 RMS
+   * 更新 ITU-R BS.1770-4 响度测量
+   * @param {Float32Array} originalBuffer - 原始音频数据
+   * @param {Float32Array} outputBuffer - 输出音频数据
    */
-  updateIntegratedRms(currentRms, originalRms) {
-    // 过滤静音片段 (低于 -60dB)
-    if (currentRms > INTEGRATION_PARAMS.silenceThreshold) {
-      this.rmsHistory.push(currentRms);
-      if (this.rmsHistory.length > this.maxHistorySize) {
-        this.rmsHistory.shift();
+  updateLoudnessMeasurement(originalBuffer, outputBuffer) {
+    // 检查是否有有效音频 (静音检测)
+    const silenceThreshold = INTEGRATION_PARAMS.silenceThreshold;
+    
+    let hasOriginalAudio = false;
+    let hasOutputAudio = false;
+    
+    for (let i = 0; i < originalBuffer.length; i++) {
+      if (Math.abs(originalBuffer[i]) > silenceThreshold) {
+        hasOriginalAudio = true;
+        break;
       }
     }
-
-    if (originalRms > INTEGRATION_PARAMS.silenceThreshold) {
-      this.originalRmsHistory.push(originalRms);
-      if (this.originalRmsHistory.length > this.maxHistorySize) {
-        this.originalRmsHistory.shift();
+    
+    for (let i = 0; i < outputBuffer.length; i++) {
+      if (Math.abs(outputBuffer[i]) > silenceThreshold) {
+        hasOutputAudio = true;
+        break;
       }
     }
-
-    // 计算积分 RMS (能量平均后开方)
-    if (this.rmsHistory.length > 0) {
-      const sumSquares = this.rmsHistory.reduce((acc, rms) => acc + rms * rms, 0);
-      this.integratedRms = Math.sqrt(sumSquares / this.rmsHistory.length);
+    
+    // 只在有声音时更新响度测量
+    if (hasOriginalAudio) {
+      this.originalMeter.processBlock(originalBuffer);
     }
-
-    if (this.originalRmsHistory.length > 0) {
-      const sumSquares = this.originalRmsHistory.reduce((acc, rms) => acc + rms * rms, 0);
-      this.originalIntegratedRms = Math.sqrt(sumSquares / this.originalRmsHistory.length);
+    if (hasOutputAudio) {
+      this.outputMeter.processBlock(outputBuffer);
     }
   }
 
@@ -233,70 +260,76 @@ export class MediaVolumeController {
       return;
     }
 
-    // 始终测量原始和输出响度
+    const now = performance.now();
+    const deltaSec = Math.max(0.001, (now - this.lastTickTime) / 1000);
+    this.lastTickTime = now;
+
+    // 获取原始和输出音频数据
+    this.originalAnalyser.getFloatTimeDomainData(this.originalBuffer);
+    this.analyser.getFloatTimeDomainData(this.buffer);
+
+    // 计算瞬时 RMS (用于 UI 显示)
     const currentRms = this.measureRms();
     const originalRms = this.measureOriginalRms();
 
-    // 更新积分 RMS
-    this.updateIntegratedRms(currentRms, originalRms);
+    // 更新 ITU-R BS.1770-4 响度测量
+    this.updateLoudnessMeasurement(this.originalBuffer, this.buffer);
 
     if (this.settings.enabled && !this.media.muted && !this.media.paused && !this.media.ended) {
-      // 等待足够样本后再启用 PID 控制
-      if (this.originalRmsHistory.length >= INTEGRATION_PARAMS.minSamples && 
-          this.originalIntegratedRms > INTEGRATION_PARAMS.silenceThreshold &&
-          this.rmsHistory.length >= INTEGRATION_PARAMS.minSamples &&
-          this.integratedRms > INTEGRATION_PARAMS.silenceThreshold) {
-        
-        // 前馈控制：基于原始积分响度计算基准增益
-        const targetRms = this.settings.targetRms;
-        const currentOriginalRms = this.originalIntegratedRms;
-        const feedforwardGain = targetRms / currentOriginalRms;
+      // 获取积分响度 (LUFS)
+      const originalLufs = this.originalMeter.getIntegratedLoudness();
+      const outputLufs = this.outputMeter.getIntegratedLoudness();
+      const integrationTime = this.originalMeter.getIntegrationTime();
 
-        // 反馈修正：基于实际输出响度计算误差
-        const currentOutputRms = this.integratedRms;
-        const outputError = targetRms - currentOutputRms;  // RMS域的误差
+      // 等待足够积分时长后再启用控制
+      if (integrationTime >= INTEGRATION_PARAMS.minIntegrationSeconds && isFinite(originalLufs)) {
         
-        // 将误差转换为增益修正（小幅调整）
-        const currentGain = this.gainNode.gain.value;
-        const gainError = (outputError / currentOutputRms) * currentGain;  // 相对误差转增益修正
-
-        // 理想增益 = 前馈基准 + 反馈修正
-        const idealGain = feedforwardGain + gainError * 0.5;  // 反馈修正权重0.5，避免过度响应
+        // 目标响度 (从 RMS 转换为 LUFS)
+        const targetLufs = rmsToLufs(this.settings.targetRms);
+        
+        // 计算理想增益 (基于 ITU-R BS.1770-4 积分响度)
+        const idealGain = calculateGainForLoudness(originalLufs, targetLufs);
 
         // 调试输出
         if (Math.random() < 0.01) {  // 1% 概率输出，避免刷屏
-          const outputLufs = 20 * Math.log10(currentOutputRms) - 0.691;
-          const originalLufs = 20 * Math.log10(currentOriginalRms) - 0.691;
-          const targetLufs = 20 * Math.log10(targetRms) - 0.691;
-          
-          console.log(`${BRAND} 调试信息:`, {
+          console.log(`${BRAND} ITU-R BS.1770-4 测量:`, {
             targetLufs: targetLufs.toFixed(1),
             originalLufs: originalLufs.toFixed(1),
-            outputLufs: outputLufs.toFixed(1),
-            feedforwardGain: feedforwardGain.toFixed(3),
-            gainError: gainError.toFixed(3),
+            outputLufs: isFinite(outputLufs) ? outputLufs.toFixed(1) : 'N/A',
             idealGain: idealGain.toFixed(3),
-            currentGain: currentGain.toFixed(3),
-            error: (idealGain - currentGain).toFixed(3)
+            currentGain: this.gainNode.gain.value.toFixed(3),
+            integrationTime: integrationTime.toFixed(1) + 's'
           });
         }
 
         // 误差 = 理想增益 - 当前增益
+        const currentGain = this.gainNode.gain.value;
         const error = idealGain - currentGain;
 
         // PID 输出
         const correction = this.pidController.compute(error);
 
-        // 应用增益调整
+        // 应用增益调整（非对称限速：降快升慢，避免过冲）
+        const rawNextGain = currentGain + correction;
+        const baseRate = this.settings.gainChangePerSec * deltaSec;
+        // 需要降低增益时速度快 3 倍，需要升高时正常速度
+        const maxUp = baseRate;
+        const maxDown = baseRate * 3;
+        let slewLimitedGain;
+        if (rawNextGain > currentGain) {
+          slewLimitedGain = Math.min(rawNextGain, currentGain + maxUp);
+        } else {
+          slewLimitedGain = Math.max(rawNextGain, currentGain - maxDown);
+        }
         const nextGain = clamp(
-          currentGain + correction,
+          slewLimitedGain,
           this.settings.minGain,
           this.settings.maxGain
         );
         this.gainNode.gain.value = nextGain;
 
         // 更新 meter 状态
-        this.updateMeterState(currentRms, originalRms, nextGain);
+        this.updateMeterState(currentRms, originalRms, nextGain, originalLufs, outputLufs);
       } else {
         // 样本不足，暂时不调整增益
         this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
@@ -304,7 +337,7 @@ export class MediaVolumeController {
     } else if (!this.settings.enabled) {
       this.gainNode.gain.value = 1.0;
       // 关闭时仍显示原始响度
-      this.updateMeterState(originalRms, originalRms, 1, true);
+      this.updateMeterState(originalRms, originalRms, 1, null, null, true);
     }
 
     this.rafId = requestAnimationFrame(this.tick);
@@ -315,19 +348,39 @@ export class MediaVolumeController {
    * @param {number} currentRms - 当前 RMS
    * @param {number} originalRms - 原始 RMS
    * @param {number} gain - 当前增益
+   * @param {number} originalLufs - 原始积分响度 (LUFS)
+   * @param {number} outputLufs - 输出积分响度 (LUFS)
    * @param {boolean} disabled - 是否禁用状态
    */
-  updateMeterState(currentRms, originalRms, gain, disabled = false) {
+  updateMeterState(currentRms, originalRms, gain, originalLufs = null, outputLufs = null, disabled = false) {
     if (this.meterStateCallback) {
+      // 如果没有提供 LUFS 值，从 meter 获取
+      if (originalLufs === null) {
+        originalLufs = this.originalMeter.getIntegratedLoudness();
+      }
+      if (outputLufs === null) {
+        outputLufs = this.outputMeter.getIntegratedLoudness();
+      }
+      
+      // 转换 LUFS 到 RMS 用于 UI 兼容
+      const integratedRms = isFinite(outputLufs) 
+        ? Math.pow(10, (outputLufs + 0.691) / 20) 
+        : currentRms;
+      const originalIntegratedRms = isFinite(originalLufs)
+        ? Math.pow(10, (originalLufs + 0.691) / 20)
+        : originalRms;
+
       this.meterStateCallback({
         rms: disabled ? originalRms : currentRms,
-        integratedRms: disabled 
-          ? (this.originalIntegratedRms || originalRms)
-          : (this.integratedRms || currentRms),
+        integratedRms: disabled ? originalIntegratedRms : integratedRms,
         originalRms: originalRms,
-        originalIntegratedRms: this.originalIntegratedRms || originalRms,
+        originalIntegratedRms: originalIntegratedRms,
         gain: gain,
-        sampleCount: disabled ? this.originalRmsHistory.length : this.rmsHistory.length
+        sampleCount: Math.floor(this.originalMeter.getIntegrationTime() * 10),  // 近似块数
+        // 新增: 直接传递 LUFS 值
+        originalLufs: originalLufs,
+        outputLufs: outputLufs,
+        integrationTime: this.originalMeter.getIntegrationTime()
       });
     }
   }
@@ -339,6 +392,8 @@ export class MediaVolumeController {
     cancelAnimationFrame(this.rafId);
     this.media.removeEventListener('emptied', this.handleEmptied);
     this.media.removeEventListener('seeked', this.handleSeeked);
+    this.media.removeEventListener('play', this.handlePlay);
+    this.media.removeEventListener('pause', this.handlePause);
     this.sourceNode.disconnect();
     this.originalAnalyser.disconnect();
     this.compressor.disconnect();

@@ -12,7 +12,10 @@ const outputFile = path.join(__dirname, 'content.js');
 // 读取所有源文件
 const files = [
   'config.js',
+  'events/event-bus.js',
+  'events/events.js',
   'lufs-calculator.js',
+  'loudness-meter.js',  // ITU-R BS.1770-4 响度测量
   'settings.js',
   'audio-context.js',
   'pid-controller.js',
@@ -21,6 +24,7 @@ const files = [
   'ui-panel.js',
   'main.js'
 ];
+
 
 console.log('🔨 开始构建...');
 
