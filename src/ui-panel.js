@@ -33,11 +33,12 @@ export function createPanel(settings, onSettingsChange, getMeterState) {
   host.id = PANEL_ID;
   host.style.cssText = `
     position: fixed;
-    right: 16px;
+    right: 0;
     bottom: 120px;
     z-index: 2147483647;
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     display: none;
+    width: 260px;
   `;
   document.documentElement.appendChild(host);
   panelHost = host;
@@ -106,6 +107,8 @@ function getPanelStyles() {
       all: initial;
     }
     .panel {
+      --dock-width: 26px;
+      position: relative;
       min-width: 220px;
       background: rgba(15, 15, 15, 0.9);
       color: #f5f5f5;
@@ -114,6 +117,31 @@ function getPanelStyles() {
       box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
       border: 1px solid rgba(255, 255, 255, 0.08);
       backdrop-filter: blur(8px);
+      transform: translateX(calc(100% - var(--dock-width)));
+      transition: transform 200ms ease;
+    }
+    :host(:hover) .panel,
+    :host(:focus-within) .panel {
+      transform: translateX(0);
+    }
+    .dock {
+      position: absolute;
+      left: 0;
+      top: 18px;
+      width: var(--dock-width);
+      height: 72px;
+      margin-left: calc(var(--dock-width) * -1);
+      background: linear-gradient(160deg, rgba(0, 178, 255, 0.9), rgba(0, 122, 180, 0.9));
+      color: #fff;
+      border-radius: 10px 0 0 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      letter-spacing: 0.5px;
+      writing-mode: vertical-rl;
+      text-orientation: mixed;
+      box-shadow: -2px 4px 10px rgba(0, 0, 0, 0.3);
     }
     .header {
       display: flex;
@@ -171,6 +199,7 @@ function getPanelStyles() {
  */
 function getPanelHTML(settings) {
   return `
+    <div class="dock">EQ</div>
     <div class="header">
       <span>音量均衡</span>
       <button class="toggle">···</button>

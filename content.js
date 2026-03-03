@@ -671,6 +671,7 @@ let audioCtx = null;
     this.settings = settings;
     this.meterStateCallback = meterStateCallback;
     this.rafId = 0;
+    this.processingEnabled = null;
 
     // ITU-R BS.1770-4 标准响度测量器
     this.originalMeter = null;  // 原始响度 (增益前)
@@ -698,6 +699,7 @@ let audioCtx = null;
    */
   initAudioNodes() {
     const ctx = ensureAudioContext();
+    this.audioContext = ctx;
     
     this.sourceNode = ctx.createMediaElementSource(this.media);
     this.compressor = ctx.createDynamicsCompressor();
@@ -725,13 +727,7 @@ let audioCtx = null;
 
     this.applyCompressor();
 
-    // 信号链: source → compressor → originalAnalyser → gain → bassFilter → analyser → destination
-    this.sourceNode.connect(this.compressor);
-    this.compressor.connect(this.originalAnalyser);
-    this.originalAnalyser.connect(this.gainNode);
-    this.gainNode.connect(this.bassFilter);
-    this.bassFilter.connect(this.analyser);
-    this.analyser.connect(ctx.destination);
+    this.setProcessingEnabled(this.settings.enabled);
   }
 
   /**
@@ -784,6 +780,46 @@ let audioCtx = null;
     this.compressor.release.value = this.settings.compressorRelease;
   }
 
+  setProcessingEnabled(enabled) {
+    if (this.processingEnabled === enabled) return;
+    this.processingEnabled = enabled;
+
+    if (enabled) {
+      this.connectProcessingChain();
+    } else {
+      this.connectBypassChain();
+      this.gainNode.gain.value = 1.0;
+    }
+  }
+
+  disconnectNodes() {
+    this.sourceNode.disconnect();
+    this.compressor.disconnect();
+    this.originalAnalyser.disconnect();
+    this.gainNode.disconnect();
+    this.bassFilter.disconnect();
+    this.analyser.disconnect();
+  }
+
+  connectProcessingChain() {
+    this.disconnectNodes();
+    // 信号链: source → compressor → originalAnalyser → gain → bassFilter → analyser → destination
+    this.sourceNode.connect(this.compressor);
+    this.compressor.connect(this.originalAnalyser);
+    this.originalAnalyser.connect(this.gainNode);
+    this.gainNode.connect(this.bassFilter);
+    this.bassFilter.connect(this.analyser);
+    this.analyser.connect(this.audioContext.destination);
+  }
+
+  connectBypassChain() {
+    this.disconnectNodes();
+    // 直通链路: source → originalAnalyser → analyser → destination
+    this.sourceNode.connect(this.originalAnalyser);
+    this.originalAnalyser.connect(this.analyser);
+    this.analyser.connect(this.audioContext.destination);
+  }
+
   /**
    * 更新设置
    * @param {Object} newSettings - 新的设置对象
@@ -792,11 +828,15 @@ let audioCtx = null;
     // 检查是否是目标响度变化（通过标记字段判断）
     const { _changedField, ...restSettings } = newSettings;
     const targetChanged = _changedField === 'targetLufs';
+    const wasEnabled = this.settings.enabled;
     
     this.settings = restSettings;
     
     this.applyCompressor();
     this.bassFilter.gain.value = restSettings.bassBoost;
+    if (wasEnabled !== restSettings.enabled) {
+      this.setProcessingEnabled(restSettings.enabled);
+    }
 
     // 只有目标响度改变时才重置输出响度积分
     if (targetChanged) {
@@ -990,6 +1030,9 @@ let audioCtx = null;
       this.gainNode.gain.value = 1.0;
       // 关闭时仍显示原始响度
       this.updateMeterState(originalRms, originalRms, 1, null, null, true);
+    } else {
+      // 暂停/静音/结束时保持 meter 刷新
+      this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
     }
 
     this.rafId = requestAnimationFrame(this.tick);
@@ -1046,12 +1089,7 @@ let audioCtx = null;
     this.media.removeEventListener('seeked', this.handleSeeked);
     this.media.removeEventListener('play', this.handlePlay);
     this.media.removeEventListener('pause', this.handlePause);
-    this.sourceNode.disconnect();
-    this.originalAnalyser.disconnect();
-    this.compressor.disconnect();
-    this.gainNode.disconnect();
-    this.bassFilter.disconnect();
-    this.analyser.disconnect();
+    this.disconnectNodes();
     delete this.media.dataset[DATASET_FLAG];
   }
 }
@@ -1156,11 +1194,12 @@ let settingsChangedOff = null;
   host.id = PANEL_ID;
   host.style.cssText = `
     position: fixed;
-    right: 16px;
+    right: 0;
     bottom: 120px;
     z-index: 2147483647;
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     display: none;
+    width: 260px;
   `;
   document.documentElement.appendChild(host);
   panelHost = host;
@@ -1229,6 +1268,8 @@ function getPanelStyles() {
       all: initial;
     }
     .panel {
+      --dock-width: 26px;
+      position: relative;
       min-width: 220px;
       background: rgba(15, 15, 15, 0.9);
       color: #f5f5f5;
@@ -1237,6 +1278,31 @@ function getPanelStyles() {
       box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
       border: 1px solid rgba(255, 255, 255, 0.08);
       backdrop-filter: blur(8px);
+      transform: translateX(calc(100% - var(--dock-width)));
+      transition: transform 200ms ease;
+    }
+    :host(:hover) .panel,
+    :host(:focus-within) .panel {
+      transform: translateX(0);
+    }
+    .dock {
+      position: absolute;
+      left: 0;
+      top: 18px;
+      width: var(--dock-width);
+      height: 72px;
+      margin-left: calc(var(--dock-width) * -1);
+      background: linear-gradient(160deg, rgba(0, 178, 255, 0.9), rgba(0, 122, 180, 0.9));
+      color: #fff;
+      border-radius: 10px 0 0 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      letter-spacing: 0.5px;
+      writing-mode: vertical-rl;
+      text-orientation: mixed;
+      box-shadow: -2px 4px 10px rgba(0, 0, 0, 0.3);
     }
     .header {
       display: flex;
@@ -1294,6 +1360,7 @@ function getPanelStyles() {
  */
 function getPanelHTML(settings) {
   return `
+    <div class="dock">EQ</div>
     <div class="header">
       <span>音量均衡</span>
       <button class="toggle">···</button>
