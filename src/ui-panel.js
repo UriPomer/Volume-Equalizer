@@ -38,7 +38,7 @@ export function createPanel(settings, onSettingsChange, getMeterState) {
     z-index: 2147483647;
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     display: none;
-    width: 260px;
+    overflow: hidden;
   `;
   document.documentElement.appendChild(host);
   panelHost = host;
@@ -53,9 +53,8 @@ export function createPanel(settings, onSettingsChange, getMeterState) {
 
   // 创建面板内容
   const wrapper = document.createElement('div');
-  wrapper.className = 'panel';
   wrapper.innerHTML = getPanelHTML(settings);
-  shadow.appendChild(wrapper);
+  shadow.appendChild(wrapper.firstElementChild);
 
   // 绑定事件监听器
   bindPanelEvents(shadow, settings, onSettingsChange);
@@ -105,89 +104,198 @@ function getPanelStyles() {
   return `
     :host {
       all: initial;
+      pointer-events: none;
     }
-    .panel {
-      --dock-width: 26px;
-      position: relative;
-      min-width: 220px;
-      background: rgba(15, 15, 15, 0.9);
-      color: #f5f5f5;
-      border-radius: 12px;
-      padding: 12px;
-      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      backdrop-filter: blur(8px);
-      transform: translateX(calc(100% - var(--dock-width)));
-      transition: transform 200ms ease;
+
+    /* ── 整体容器：用 transform 控制滑出 ── */
+    .panel-wrapper {
+      display: flex;
+      align-items: flex-end;
+      pointer-events: none;
+      transform: translateX(240px);
+      transition: transform 0.28s cubic-bezier(0.25, 0.46, 0.45, 0.94);
     }
-    :host(:hover) .panel,
-    :host(:focus-within) .panel {
+    :host([data-expanded]) .panel-wrapper {
       transform: translateX(0);
     }
+
+    /* ── 卡片 ── */
+    .panel {
+      width: 240px;
+      box-sizing: border-box;
+      flex-shrink: 0;
+      background: rgba(12, 12, 14, 0.92);
+      color: #f0f0f0;
+      border-radius: 14px 0 0 14px;
+      padding: 14px 14px 12px;
+      box-shadow: -4px 0 16px rgba(0, 0, 0, 0.4);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-right: none;
+      backdrop-filter: blur(16px) saturate(180%);
+      pointer-events: auto;
+      opacity: 0;
+      transition: opacity 0.2s ease 0.05s;
+    }
+    :host([data-expanded]) .panel {
+      opacity: 1;
+    }
+
+    /* ── Dock 把手 ── */
     .dock {
-      position: absolute;
-      left: 0;
-      top: 18px;
-      width: var(--dock-width);
+      flex-shrink: 0;
+      width: 26px;
       height: 72px;
-      margin-left: calc(var(--dock-width) * -1);
       background: linear-gradient(160deg, rgba(0, 178, 255, 0.9), rgba(0, 122, 180, 0.9));
       color: #fff;
       border-radius: 10px 0 0 10px;
       display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
-      font-size: 12px;
+      gap: 6px;
+      box-shadow: -2px 0 8px rgba(0, 0, 0, 0.3);
+      cursor: pointer;
+      pointer-events: auto;
+      transition: border-radius 0.28s cubic-bezier(0.25, 0.46, 0.45, 0.94),
+                  box-shadow 0.2s ease;
+    }
+    .dock:hover {
+      box-shadow: -3px 0 10px rgba(0, 0, 0, 0.45);
+    }
+    :host([data-expanded]) .dock {
+      box-shadow: none;
+    }
+    .dock-label {
+      font-size: 11px;
+      font-weight: 700;
       letter-spacing: 0.5px;
       writing-mode: vertical-rl;
       text-orientation: mixed;
-      box-shadow: -2px 4px 10px rgba(0, 0, 0, 0.3);
+      user-select: none;
     }
+    .dock-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #4ade80;
+      box-shadow: 0 0 6px #4ade80;
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+    .dock-dot.off {
+      background: rgba(255,255,255,0.3);
+      box-shadow: none;
+    }
+
+    /* ── 标题行 ── */
     .header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      font-size: 14px;
-      font-weight: 600;
-      margin-bottom: 8px;
+      margin-bottom: 10px;
     }
-    button.toggle {
+    .header-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #fff;
+      letter-spacing: 0.3px;
+    }
+    .toggle-pill {
       border: none;
       border-radius: 999px;
-      padding: 4px 12px;
-      font-size: 12px;
+      padding: 3px 10px;
+      font-size: 11px;
+      font-weight: 600;
       cursor: pointer;
+      transition: background 0.2s, box-shadow 0.2s;
+      letter-spacing: 0.3px;
+    }
+    .toggle-pill.on {
+      background: linear-gradient(90deg, #0ea5e9, #0284c7);
       color: #fff;
+      box-shadow: 0 2px 8px rgba(14, 165, 233, 0.4);
     }
-    button.toggle.on {
-      background: #00b2ff;
+    .toggle-pill.off {
+      background: rgba(255,255,255,0.1);
+      color: rgba(255,255,255,0.5);
     }
-    button.toggle.off {
-      background: #555;
+
+    /* ── 分割线 ── */
+    .divider {
+      height: 1px;
+      background: rgba(255,255,255,0.07);
+      margin: 8px 0;
     }
-    label {
+
+    /* ── 参数行 ── */
+    .param-row {
+      margin-top: 8px;
+    }
+    .param-label {
       display: flex;
       justify-content: space-between;
+      align-items: baseline;
+      font-size: 11px;
+      color: rgba(255,255,255,0.55);
+      margin-bottom: 4px;
+    }
+    .param-label span:last-child {
       font-size: 12px;
-      margin-top: 10px;
+      font-weight: 600;
+      color: #e2e8f0;
+      font-variant-numeric: tabular-nums;
     }
     input[type='range'] {
+      -webkit-appearance: none;
       width: 100%;
+      height: 3px;
+      border-radius: 2px;
+      background: rgba(255,255,255,0.12);
+      outline: none;
+      cursor: pointer;
     }
+    input[type='range']::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 13px;
+      height: 13px;
+      border-radius: 50%;
+      background: #38bdf8;
+      box-shadow: 0 0 0 2px rgba(56,189,248,0.3);
+      transition: box-shadow 0.15s;
+    }
+    input[type='range']:hover::-webkit-slider-thumb {
+      box-shadow: 0 0 0 4px rgba(56,189,248,0.3);
+    }
+
+    /* ── Meter 区域 ── */
     .meter {
-      margin-top: 10px;
-      font-size: 12px;
-      color: #c8c8c8;
+      margin-top: 2px;
+      font-size: 11px;
     }
-    .meter-section {
-      margin-top: 8px;
-      padding-top: 8px;
-      border-top: 1px solid rgba(255,255,255,0.1);
+    .meter-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 2px 0;
+      font-variant-numeric: tabular-nums;
     }
-    .meter-title {
+    .meter-row .label {
+      color: rgba(255,255,255,0.35);
+    }
+    .meter-row .val {
+      color: #cbd5e1;
+      font-weight: 500;
+    }
+    .meter-row .val.highlight {
+      color: #38bdf8;
+    }
+    .meter-sub-title {
+      font-size: 10px;
       font-weight: 600;
-      color: #fff;
-      margin-bottom: 4px;
+      color: rgba(255,255,255,0.3);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      margin-top: 6px;
+      margin-bottom: 2px;
     }
   `;
 }
@@ -198,42 +306,79 @@ function getPanelStyles() {
  * @returns {string} HTML 字符串
  */
 function getPanelHTML(settings) {
+  const targetLufs = rmsToLufs(settings.targetRms).toFixed(1);
+  const bassSign = settings.bassBoost > 0 ? '+' : '';
   return `
-    <div class="dock">EQ</div>
-    <div class="header">
-      <span>音量均衡</span>
-      <button class="toggle">···</button>
-    </div>
-    <label>
-      <span>目标响度 (LUFS)</span>
-      <span data-field="targetLufs">${rmsToLufs(settings.targetRms).toFixed(1)}</span>
-    </label>
-    <input type="range" min="-23" max="-10" step="0.5" data-role="targetLufs" value="${rmsToLufs(settings.targetRms).toFixed(1)}">
-    <label>
-      <span>增益上限</span>
-      <span data-field="maxGain">${settings.maxGain.toFixed(1)}x</span>
-    </label>
-    <input type="range" min="1" max="3" step="0.1" data-role="maxGain" value="${settings.maxGain}">
-    <label>
-      <span>增益下限</span>
-      <span data-field="minGain">${settings.minGain.toFixed(1)}x</span>
-    </label>
-    <input type="range" min="0.2" max="1" step="0.05" data-role="minGain" value="${settings.minGain}">
-    <label>
-      <span>低频增益</span>
-      <span data-field="bassBoost">${settings.bassBoost > 0 ? '+' : ''}${settings.bassBoost.toFixed(1)} dB</span>
-    </label>
-    <input type="range" min="-6" max="6" step="0.5" data-role="bassBoost" value="${settings.bassBoost}">
-    <div class="meter">
-      <div class="meter-title">原始响度</div>
-      <div>积分: <span data-field="meterOriginalIntegratedLufs">-∞</span> LUFS <span style="color:#888;" data-field="sampleCount">(0样本)</span></div>
-      <div>瞬时: <span data-field="meterOriginalLufs">-∞</span> LUFS</div>
-      
-      <div class="meter-section">
-        <div class="meter-title">输出响度</div>
-        <div>积分: <span data-field="meterIntegratedLufs">-∞</span> LUFS</div>
-        <div>瞬时: <span data-field="meterLufs">-∞</span> LUFS</div>
-        <div>增益: <span data-field="meterGain">1.00x</span></div>
+    <div class="panel-wrapper">
+      <div class="dock">
+        <div class="dock-dot off"></div>
+        <div class="dock-label">EQ</div>
+      </div>
+      <div class="panel">
+        <div class="header">
+          <span class="header-title">音量均衡</span>
+          <button class="toggle-pill">···</button>
+        </div>
+        <div class="divider"></div>
+
+        <div class="param-row">
+          <div class="param-label">
+            <span>目标响度</span>
+            <span data-field="targetLufs">${targetLufs} LUFS</span>
+          </div>
+          <input type="range" min="-23" max="-10" step="0.5" data-role="targetLufs" value="${targetLufs}">
+        </div>
+
+        <div class="param-row">
+          <div class="param-label">
+            <span>增益上限</span>
+            <span data-field="maxGain">${settings.maxGain.toFixed(1)}x</span>
+          </div>
+          <input type="range" min="1" max="3" step="0.1" data-role="maxGain" value="${settings.maxGain}">
+        </div>
+
+        <div class="param-row">
+          <div class="param-label">
+            <span>增益下限</span>
+            <span data-field="minGain">${settings.minGain.toFixed(1)}x</span>
+          </div>
+          <input type="range" min="0.2" max="1" step="0.05" data-role="minGain" value="${settings.minGain}">
+        </div>
+
+        <div class="param-row">
+          <div class="param-label">
+            <span>低频增益</span>
+            <span data-field="bassBoost">${bassSign}${settings.bassBoost.toFixed(1)} dB</span>
+          </div>
+          <input type="range" min="-6" max="6" step="0.5" data-role="bassBoost" value="${settings.bassBoost}">
+        </div>
+
+        <div class="divider" style="margin-top:10px;"></div>
+        <div class="meter">
+          <div class="meter-sub-title">原始</div>
+          <div class="meter-row">
+            <span class="label">积分</span>
+            <span class="val"><span data-field="meterOriginalIntegratedLufs">-∞</span> LUFS <span style="opacity:0.5;font-size:10px;" data-field="sampleCount"></span></span>
+          </div>
+          <div class="meter-row">
+            <span class="label">瞬时</span>
+            <span class="val"><span data-field="meterOriginalLufs">-∞</span> LUFS</span>
+          </div>
+
+          <div class="meter-sub-title" style="margin-top:6px;">输出</div>
+          <div class="meter-row">
+            <span class="label">积分</span>
+            <span class="val"><span data-field="meterIntegratedLufs">-∞</span> LUFS</span>
+          </div>
+          <div class="meter-row">
+            <span class="label">瞬时</span>
+            <span class="val"><span data-field="meterLufs">-∞</span> LUFS</span>
+          </div>
+          <div class="meter-row">
+            <span class="label">增益</span>
+            <span class="val highlight"><span data-field="meterGain">1.00x</span></span>
+          </div>
+        </div>
       </div>
     </div>
   `;
@@ -246,22 +391,23 @@ function getPanelHTML(settings) {
  * @param {Function} onSettingsChange - 设置改变回调，返回更新后的设置
  */
 function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
-  const toggleBtn = shadow.querySelector('button.toggle');
+  const toggleBtn = shadow.querySelector('button.toggle-pill');
+  const dockDot = shadow.querySelector('.dock-dot');
   const sliders = shadow.querySelectorAll('input[type="range"]');
   const fieldNodes = getFieldNodes(shadow);
   const sliderMap = new Map([...sliders].map((slider) => [slider.dataset.role, slider]));
-  
-  // 使用可变引用来跟踪当前设置状态
+
   let currentSettings = initialSettings;
 
-  // 渲染开关状态
   const renderToggle = () => {
     if (currentSettings.enabled) {
       toggleBtn.textContent = '已开启';
-      toggleBtn.className = 'toggle on';
+      toggleBtn.className = 'toggle-pill on';
+      dockDot.className = 'dock-dot';
     } else {
       toggleBtn.textContent = '已关闭';
-      toggleBtn.className = 'toggle off';
+      toggleBtn.className = 'toggle-pill off';
+      dockDot.className = 'dock-dot off';
     }
   };
 
@@ -294,6 +440,7 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
     const newSettings = { ...currentSettings, enabled: !currentSettings.enabled };
     currentSettings = onSettingsChange(newSettings) || newSettings;
     renderToggle();
+    toggleBtn.blur();
   });
 
   // 滑块事件
@@ -317,6 +464,45 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
       currentSettings = onSettingsChange(newSettings) || newSettings;
       updateFieldText(fieldNodes, role, value);
     });
+    slider.addEventListener('change', (event) => {
+      event.target.blur();
+    });
+  });
+
+  // Hover 展开/收起逻辑，带延迟防止误触
+  let expandTimer = null;
+  let collapseTimer = null;
+  const host = panelHost;
+  const dock = shadow.querySelector('.dock');
+  const panelWrapper = shadow.querySelector('.panel-wrapper');
+
+  const startExpand = () => {
+    clearTimeout(collapseTimer);
+    collapseTimer = null;
+    if (!host.hasAttribute('data-expanded')) {
+      expandTimer = setTimeout(() => {
+        host.setAttribute('data-expanded', '');
+      }, 80);
+    }
+  };
+
+  const startCollapse = () => {
+    clearTimeout(expandTimer);
+    expandTimer = null;
+    collapseTimer = setTimeout(() => {
+      host.removeAttribute('data-expanded');
+    }, 300);
+  };
+
+  // dock 触发展开
+  dock.addEventListener('mouseenter', startExpand);
+
+  // 整个 wrapper（卡片+dock）离开才收起
+  panelWrapper.addEventListener('mouseleave', startCollapse);
+  // 进入 wrapper 任何子元素都取消收起
+  panelWrapper.addEventListener('mouseenter', () => {
+    clearTimeout(collapseTimer);
+    collapseTimer = null;
   });
 
   if (settingsChangedOff) settingsChangedOff();
@@ -356,7 +542,7 @@ function getFieldNodes(shadow) {
  * @param {number} value - 值
  */
 function updateFieldText(fieldNodes, role, value) {
-  if (role === 'targetLufs') fieldNodes.targetLufs.textContent = value.toFixed(1);
+  if (role === 'targetLufs') fieldNodes.targetLufs.textContent = `${value.toFixed(1)} LUFS`;
   if (role === 'maxGain') fieldNodes.maxGain.textContent = `${value.toFixed(1)}x`;
   if (role === 'minGain') fieldNodes.minGain.textContent = `${value.toFixed(1)}x`;
   if (role === 'bassBoost') fieldNodes.bassBoost.textContent = `${value > 0 ? '+' : ''}${value.toFixed(1)} dB`;
@@ -386,6 +572,6 @@ function startMeterUpdateLoop(shadow, getMeterState) {
     fieldNodes.meterLufs.textContent = instantLufs > -70 ? instantLufs.toFixed(1) : '-∞';
     fieldNodes.meterIntegratedLufs.textContent = integratedLufs > -70 ? integratedLufs.toFixed(1) : '-∞';
     fieldNodes.meterGain.textContent = `${gain.toFixed(2)}x`;
-    fieldNodes.sampleCount.textContent = `(${sampleCount}样本)`;
+    fieldNodes.sampleCount.textContent = `${sampleCount}s`;
   }, 100);
 }
