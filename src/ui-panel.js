@@ -111,7 +111,7 @@ function getPanelStyles() {
       display: flex;
       align-items: flex-end;
       pointer-events: none;
-      transform: translateX(240px);
+      transform: translateX(220px);
       transition: transform 0.28s cubic-bezier(0.25, 0.46, 0.45, 0.94);
     }
     :host([data-expanded]) .panel-wrapper {
@@ -120,23 +120,24 @@ function getPanelStyles() {
 
     /* ── 卡片 ── */
     .panel {
-      width: 240px;
+      width: 220px;
       box-sizing: border-box;
       flex-shrink: 0;
-      background: rgba(12, 12, 14, 0.55);
+      background: rgba(12, 12, 14, 0.35);
       color: #f0f0f0;
       border-radius: 14px 0 0 14px;
-      padding: 14px 14px 12px;
+      padding: 12px 12px 10px;
       box-shadow: -4px 0 16px rgba(0, 0, 0, 0.4);
       border: 1px solid rgba(255, 255, 255, 0.12);
       border-right: none;
       backdrop-filter: blur(20px) saturate(180%);
       pointer-events: auto;
       opacity: 0;
-      transition: opacity 0.2s ease 0.05s;
+      transition: opacity 0.2s ease 0.05s, border-radius 0.28s cubic-bezier(0.25, 0.46, 0.45, 0.94);
     }
     :host([data-expanded]) .panel {
       opacity: 1;
+      border-radius: 14px 0 0 0;
     }
 
     /* ── Dock 把手 ── */
@@ -144,7 +145,7 @@ function getPanelStyles() {
       flex-shrink: 0;
       width: 26px;
       height: 72px;
-      background: linear-gradient(160deg, rgba(0, 178, 255, 0.45), rgba(0, 122, 180, 0.45));
+      background: linear-gradient(160deg, rgba(0, 178, 255, 0.30), rgba(0, 122, 180, 0.30));
       backdrop-filter: blur(20px) saturate(180%);
       border: 1px solid rgba(255, 255, 255, 0.15);
       border-right: none;
