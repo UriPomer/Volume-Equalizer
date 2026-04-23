@@ -9,7 +9,7 @@ export const TARGET_SELECTOR = 'video, audio';
 
 export const DEFAULT_SETTINGS = {
   enabled: true,
-  targetRms: 0.1924,  // 对应 -15 LUFS (YouTube标准, 实际计算: 10^((-15+0.691)/20))
+  targetRms: 0.1363,  // 对应 -18 LUFS (10^((-18+0.691)/20))
   minGain: 0.5,      // 最小增益 (避免过度压缩)
   maxGain: 2.0,      // 最大增益 (避免失真)
   compressorThreshold: -20,  // 压缩器阈值 (dB)
