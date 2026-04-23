@@ -2,21 +2,20 @@
  * AudioContext 管理
  */
 
-import { BRAND } from './config.js';
+import { BRAND } from './config';
 
-const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
 
 if (!AudioContextClass) {
   console.warn(`${BRAND} 当前浏览器不支持 AudioContext, 扩展已停用`);
 }
 
-let audioCtx = null;
+let audioCtx: AudioContext | null = null;
 
 /**
  * 获取或创建全局 AudioContext
- * @returns {AudioContext} AudioContext 实例
  */
-export function ensureAudioContext() {
+export function ensureAudioContext(): AudioContext {
   if (!audioCtx) {
     audioCtx = new AudioContextClass();
   }
@@ -27,7 +26,7 @@ export function ensureAudioContext() {
  * 安装全局 AudioContext resume 处理器
  * 在用户交互时自动恢复 AudioContext
  */
-export function installGlobalResumeHandlers() {
+export function installGlobalResumeHandlers(): void {
   const resume = () => {
     try {
       if (audioCtx && audioCtx.state === 'suspended') {
@@ -39,11 +38,11 @@ export function installGlobalResumeHandlers() {
       console.debug(`${BRAND} Resume handler error:`, err);
     }
   };
-  
-  ['pointerdown', 'keydown', 'click', 'touchstart'].forEach((evt) => {
-    document.addEventListener(evt, resume, { capture: true, once: false, passive: true });
+
+  (['pointerdown', 'keydown', 'click', 'touchstart'] as const).forEach((evt) => {
+    document.addEventListener(evt, resume, { capture: true, passive: true });
   });
-  
+
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') resume();
   });
@@ -51,8 +50,7 @@ export function installGlobalResumeHandlers() {
 
 /**
  * 检查浏览器是否支持 Web Audio API
- * @returns {boolean}
  */
-export function isAudioContextSupported() {
+export function isAudioContextSupported(): boolean {
   return !!AudioContextClass;
 }

@@ -4,11 +4,14 @@
   "description": "B站视频音量均衡器 - 将所有视频标准化到 -15 LUFS",
   "scripts": {
     "build": "vite build",
-    "watch": "vite build --watch"
+    "watch": "vite build --watch",
+    "pack": "vite build && node pack.js"
   },
   "devDependencies": {
+    "@types/chrome": "^0.1.40",
     "esbuild": "^0.28.0",
     "nodemon": "^3.0.0",
+    "typescript": "^6.0.3",
     "vite": "^8.0.10"
   },
   "keywords": [

@@ -8,4 +8,4 @@ export const EVENTS = {
   MEDIA_PAUSE: 'media:pause',
   MEDIA_SEEKED: 'media:seeked',
   MEDIA_EMPTIED: 'media:emptied'
-};
+} as const;

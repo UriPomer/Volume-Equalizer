@@ -2,33 +2,51 @@
  * UI 面板 - 创建和管理设置面板
  */
 
-import { PANEL_ID } from './config.js';
+import { PANEL_ID, Settings } from './config';
+import { rmsToLufs, lufsToRms } from './lufs-calculator';
+import { eventBus, EVENTS } from './events/index';
 
-import { rmsToLufs, lufsToRms } from './lufs-calculator.js';
-import { eventBus, EVENTS } from './events/index.js';
+interface FieldNodes {
+  targetLufs: Element | null;
+  maxGain: Element | null;
+  minGain: Element | null;
+  bassBoost: Element | null;
+  meterOriginalIntegratedLufs: Element | null;
+  meterOriginalLufs: Element | null;
+  meterIntegratedLufs: Element | null;
+  meterLufs: Element | null;
+  meterGain: Element | null;
+  sampleCount: Element | null;
+}
 
+interface MeterState {
+  rms: number;
+  integratedRms: number;
+  originalRms: number;
+  originalIntegratedRms: number;
+  gain: number;
+  sampleCount: number;
+}
 
-let panelHost = null;
-let settingsChangedOff = null;
-
+let panelHost: HTMLElement | null = null;
+let settingsChangedOff: (() => void) | null = null;
 
 /**
  * 创建设置面板
- * @param {Object} settings - 当前设置
- * @param {Function} onSettingsChange - 设置改变回调
- * @param {Function} getMeterState - 获取 meter 状态的回调
- * @returns {HTMLElement} 面板元素
  */
-export function createPanel(settings, onSettingsChange, getMeterState) {
+export function createPanel(
+  settings: Settings,
+  onSettingsChange: (s: Settings) => Settings,
+  getMeterState: () => MeterState
+): HTMLElement {
   if (panelHost && document.contains(panelHost)) return panelHost;
-  
+
   const existing = document.getElementById(PANEL_ID);
   if (existing) {
     panelHost = existing;
     return panelHost;
   }
 
-  // 创建主容器
   const host = document.createElement('div');
   host.id = PANEL_ID;
   host.style.cssText = `
@@ -42,23 +60,17 @@ export function createPanel(settings, onSettingsChange, getMeterState) {
   document.documentElement.appendChild(host);
   panelHost = host;
 
-  // 创建 Shadow DOM
   const shadow = host.attachShadow({ mode: 'open' });
-  
-  // 添加样式
+
   const style = document.createElement('style');
   style.textContent = getPanelStyles();
   shadow.appendChild(style);
 
-  // 创建面板内容
   const wrapper = document.createElement('div');
   wrapper.innerHTML = getPanelHTML(settings);
-  shadow.appendChild(wrapper.firstElementChild);
+  shadow.appendChild(wrapper.firstElementChild!);
 
-  // 绑定事件监听器
   bindPanelEvents(shadow, settings, onSettingsChange);
-
-  // 启动 meter 更新循环
   startMeterUpdateLoop(shadow, getMeterState);
 
   return host;
@@ -66,12 +78,12 @@ export function createPanel(settings, onSettingsChange, getMeterState) {
 
 /**
  * 确保面板存在
- * @param {Object} settings - 当前设置
- * @param {Function} onSettingsChange - 设置改变回调
- * @param {Function} getMeterState - 获取 meter 状态的回调
- * @returns {HTMLElement} 面板元素
  */
-export function ensurePanel(settings, onSettingsChange, getMeterState) {
+export function ensurePanel(
+  settings: Settings,
+  onSettingsChange: (s: Settings) => Settings,
+  getMeterState: () => MeterState
+): HTMLElement {
   if (panelHost && document.contains(panelHost)) {
     return panelHost;
   }
@@ -81,9 +93,8 @@ export function ensurePanel(settings, onSettingsChange, getMeterState) {
 
 /**
  * 更新面板可见性
- * @param {number} controllerCount - 控制器数量
  */
-export function updatePanelVisibility(controllerCount) {
+export function updatePanelVisibility(controllerCount: number): void {
   if (controllerCount === 0) {
     if (panelHost && document.contains(panelHost)) {
       panelHost.style.display = 'none';
@@ -97,9 +108,8 @@ export function updatePanelVisibility(controllerCount) {
 
 /**
  * 获取面板样式
- * @returns {string} CSS 样式
  */
-function getPanelStyles() {
+function getPanelStyles(): string {
   return `
     :host {
       all: initial;
@@ -305,10 +315,8 @@ function getPanelStyles() {
 
 /**
  * 获取面板 HTML
- * @param {Object} settings - 当前设置
- * @returns {string} HTML 字符串
  */
-function getPanelHTML(settings) {
+function getPanelHTML(settings: Settings): string {
   const targetLufs = rmsToLufs(settings.targetRms).toFixed(1);
   const bassSign = settings.bassBoost > 0 ? '+' : '';
   return `
@@ -389,13 +397,14 @@ function getPanelHTML(settings) {
 
 /**
  * 绑定面板事件
- * @param {ShadowRoot} shadow - Shadow DOM 根节点
- * @param {Object} initialSettings - 初始设置（会被更新）
- * @param {Function} onSettingsChange - 设置改变回调，返回更新后的设置
  */
-function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
-  const toggleBtn = shadow.querySelector('button.toggle-pill');
-  const dockDot = shadow.querySelector('.dock-dot');
+function bindPanelEvents(
+  shadow: ShadowRoot,
+  initialSettings: Settings,
+  onSettingsChange: (s: Settings) => Settings
+): void {
+  const toggleBtn = shadow.querySelector('button.toggle-pill')!;
+  const dockDot = shadow.querySelector('.dock-dot')!;
   const sliders = shadow.querySelectorAll('input[type="range"]');
   const fieldNodes = getFieldNodes(shadow);
   const sliderMap = new Map([...sliders].map((slider) => [slider.dataset.role, slider]));
@@ -414,22 +423,22 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
     }
   };
 
-  const applySettingsToUI = (settings) => {
+  const applySettingsToUI = (settings: Settings) => {
     const targetLufs = rmsToLufs(settings.targetRms);
     const targetSlider = sliderMap.get('targetLufs');
-    if (targetSlider) targetSlider.value = targetLufs;
+    if (targetSlider) (targetSlider as HTMLInputElement).value = String(targetLufs);
     updateFieldText(fieldNodes, 'targetLufs', targetLufs);
 
     const maxGainSlider = sliderMap.get('maxGain');
-    if (maxGainSlider) maxGainSlider.value = settings.maxGain;
+    if (maxGainSlider) (maxGainSlider as HTMLInputElement).value = String(settings.maxGain);
     updateFieldText(fieldNodes, 'maxGain', settings.maxGain);
 
     const minGainSlider = sliderMap.get('minGain');
-    if (minGainSlider) minGainSlider.value = settings.minGain;
+    if (minGainSlider) (minGainSlider as HTMLInputElement).value = String(settings.minGain);
     updateFieldText(fieldNodes, 'minGain', settings.minGain);
 
     const bassBoostSlider = sliderMap.get('bassBoost');
-    if (bassBoostSlider) bassBoostSlider.value = settings.bassBoost;
+    if (bassBoostSlider) (bassBoostSlider as HTMLInputElement).value = String(settings.bassBoost);
     updateFieldText(fieldNodes, 'bassBoost', settings.bassBoost);
 
     renderToggle();
@@ -437,8 +446,6 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
 
   applySettingsToUI(currentSettings);
 
-
-  // 开关按钮
   toggleBtn.addEventListener('click', () => {
     const newSettings = { ...currentSettings, enabled: !currentSettings.enabled };
     currentSettings = onSettingsChange(newSettings) || newSettings;
@@ -446,41 +453,38 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
     toggleBtn.blur();
   });
 
-  // 滑块事件
   sliders.forEach((slider) => {
     slider.addEventListener('input', (event) => {
-      const { role } = event.target.dataset;
-      const value = parseFloat(event.target.value);
+      const target = event.target as HTMLInputElement;
+      const role = target.dataset.role!;
+      const value = parseFloat(target.value);
       if (Number.isNaN(value)) return;
 
-      // 基于当前最新设置创建新对象
-      const newSettings = { ...currentSettings };
-      newSettings._changedField = role;  // 标记是哪个字段改变了
-      
-      // 如果是 LUFS 滑块，转换为 RMS 存储
+      const newSettings = { ...currentSettings } as Settings;
+      newSettings._changedField = role;
+
       if (role === 'targetLufs') {
         newSettings.targetRms = lufsToRms(value);
       } else {
-        newSettings[role] = value;
+        (newSettings as any)[role] = value;
       }
 
       currentSettings = onSettingsChange(newSettings) || newSettings;
       updateFieldText(fieldNodes, role, value);
     });
     slider.addEventListener('change', (event) => {
-      event.target.blur();
+      (event.target as HTMLInputElement).blur();
     });
   });
 
-  // Hover 展开/收起逻辑，带延迟防止误触
-  let expandTimer = null;
-  let collapseTimer = null;
-  const host = panelHost;
-  const dock = shadow.querySelector('.dock');
-  const panelWrapper = shadow.querySelector('.panel-wrapper');
+  let expandTimer: ReturnType<typeof setTimeout> | null = null;
+  let collapseTimer: ReturnType<typeof setTimeout> | null = null;
+  const host = panelHost!;
+  const dock = shadow.querySelector('.dock')!;
+  const panelWrapper = shadow.querySelector('.panel-wrapper')!;
 
   const startExpand = () => {
-    clearTimeout(collapseTimer);
+    clearTimeout(collapseTimer!);
     collapseTimer = null;
     if (!host.hasAttribute('data-expanded')) {
       expandTimer = setTimeout(() => {
@@ -490,40 +494,33 @@ function bindPanelEvents(shadow, initialSettings, onSettingsChange) {
   };
 
   const startCollapse = () => {
-    clearTimeout(expandTimer);
+    clearTimeout(expandTimer!);
     expandTimer = null;
     collapseTimer = setTimeout(() => {
       host.removeAttribute('data-expanded');
     }, 300);
   };
 
-  // dock 触发展开
   dock.addEventListener('mouseenter', startExpand);
-
-  // 整个 wrapper（卡片+dock）离开才收起
   panelWrapper.addEventListener('mouseleave', startCollapse);
-  // 进入 wrapper 任何子元素都取消收起
   panelWrapper.addEventListener('mouseenter', () => {
-    clearTimeout(collapseTimer);
+    clearTimeout(collapseTimer!);
     collapseTimer = null;
   });
 
   if (settingsChangedOff) settingsChangedOff();
-  settingsChangedOff = eventBus.on(EVENTS.SETTINGS_CHANGED, ({ settings: nextSettings }) => {
+  settingsChangedOff = eventBus.on(EVENTS.SETTINGS_CHANGED, (payload) => {
+    const { settings: nextSettings } = payload as { settings: Settings };
     if (!panelHost || !document.contains(panelHost)) return;
     currentSettings = nextSettings;
     applySettingsToUI(currentSettings);
   });
 }
 
-
-
 /**
  * 获取字段节点
- * @param {ShadowRoot} shadow - Shadow DOM 根节点
- * @returns {Object} 字段节点映射
  */
-function getFieldNodes(shadow) {
+function getFieldNodes(shadow: ShadowRoot): FieldNodes {
   return {
     targetLufs: shadow.querySelector('[data-field="targetLufs"]'),
     maxGain: shadow.querySelector('[data-field="maxGain"]'),
@@ -540,28 +537,23 @@ function getFieldNodes(shadow) {
 
 /**
  * 更新字段文本
- * @param {Object} fieldNodes - 字段节点映射
- * @param {string} role - 字段角色
- * @param {number} value - 值
  */
-function updateFieldText(fieldNodes, role, value) {
-  if (role === 'targetLufs') fieldNodes.targetLufs.textContent = `${value.toFixed(1)} LUFS`;
-  if (role === 'maxGain') fieldNodes.maxGain.textContent = `${value.toFixed(1)}x`;
-  if (role === 'minGain') fieldNodes.minGain.textContent = `${value.toFixed(1)}x`;
-  if (role === 'bassBoost') fieldNodes.bassBoost.textContent = `${value > 0 ? '+' : ''}${value.toFixed(1)} dB`;
+function updateFieldText(fieldNodes: FieldNodes, role: string, value: number): void {
+  if (role === 'targetLufs' && fieldNodes.targetLufs) fieldNodes.targetLufs.textContent = `${value.toFixed(1)} LUFS`;
+  if (role === 'maxGain' && fieldNodes.maxGain) fieldNodes.maxGain.textContent = `${value.toFixed(1)}x`;
+  if (role === 'minGain' && fieldNodes.minGain) fieldNodes.minGain.textContent = `${value.toFixed(1)}x`;
+  if (role === 'bassBoost' && fieldNodes.bassBoost) fieldNodes.bassBoost.textContent = `${value > 0 ? '+' : ''}${value.toFixed(1)} dB`;
 }
 
 /**
  * 启动 meter 更新循环
- * @param {ShadowRoot} shadow - Shadow DOM 根节点
- * @param {Function} getMeterState - 获取 meter 状态的回调
  */
-function startMeterUpdateLoop(shadow, getMeterState) {
+function startMeterUpdateLoop(shadow: ShadowRoot, getMeterState: () => MeterState): void {
   const fieldNodes = getFieldNodes(shadow);
 
   setInterval(() => {
     if (!document.contains(panelHost)) return;
-    
+
     const meterState = getMeterState();
     const { rms, integratedRms, originalRms, originalIntegratedRms, gain, sampleCount } = meterState;
 
@@ -570,11 +562,11 @@ function startMeterUpdateLoop(shadow, getMeterState) {
     const originalInstantLufs = rmsToLufs(originalRms);
     const originalIntegratedLufs = rmsToLufs(originalIntegratedRms || originalRms);
 
-    fieldNodes.meterOriginalLufs.textContent = originalInstantLufs > -70 ? originalInstantLufs.toFixed(1) : '-∞';
-    fieldNodes.meterOriginalIntegratedLufs.textContent = originalIntegratedLufs > -70 ? originalIntegratedLufs.toFixed(1) : '-∞';
-    fieldNodes.meterLufs.textContent = instantLufs > -70 ? instantLufs.toFixed(1) : '-∞';
-    fieldNodes.meterIntegratedLufs.textContent = integratedLufs > -70 ? integratedLufs.toFixed(1) : '-∞';
-    fieldNodes.meterGain.textContent = `${gain.toFixed(2)}x`;
-    fieldNodes.sampleCount.textContent = `${sampleCount}s`;
+    if (fieldNodes.meterOriginalLufs) fieldNodes.meterOriginalLufs.textContent = originalInstantLufs > -70 ? originalInstantLufs.toFixed(1) : '-∞';
+    if (fieldNodes.meterOriginalIntegratedLufs) fieldNodes.meterOriginalIntegratedLufs.textContent = originalIntegratedLufs > -70 ? originalIntegratedLufs.toFixed(1) : '-∞';
+    if (fieldNodes.meterLufs) fieldNodes.meterLufs.textContent = instantLufs > -70 ? instantLufs.toFixed(1) : '-∞';
+    if (fieldNodes.meterIntegratedLufs) fieldNodes.meterIntegratedLufs.textContent = integratedLufs > -70 ? integratedLufs.toFixed(1) : '-∞';
+    if (fieldNodes.meterGain) fieldNodes.meterGain.textContent = `${gain.toFixed(2)}x`;
+    if (fieldNodes.sampleCount) fieldNodes.sampleCount.textContent = `${sampleCount}s`;
   }, 100);
 }

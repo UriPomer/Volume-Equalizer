@@ -2,18 +2,19 @@
  * 媒体扫描器 - 检测页面上的 video/audio 元素并附加控制器
  */
 
-import { TARGET_SELECTOR, DATASET_FLAG, BRAND } from './config.js';
+import { TARGET_SELECTOR, DATASET_FLAG, BRAND } from './config';
 
 let scanScheduled = false;
 
 /**
  * 扫描页面上的媒体元素
- * @param {Function} attachCallback - 附加控制器的回调函数
- * @param {Function} cleanupCallback - 清理不存在元素的回调函数
  */
-export function scanForMedia(attachCallback, cleanupCallback) {
+export function scanForMedia(
+  attachCallback: (media: HTMLMediaElement) => void,
+  cleanupCallback: () => void
+): void {
   document.querySelectorAll(TARGET_SELECTOR).forEach((media) => {
-    tryAttachController(media, attachCallback);
+    tryAttachController(media as HTMLMediaElement, attachCallback);
   });
 
   if (cleanupCallback) {
@@ -23,13 +24,14 @@ export function scanForMedia(attachCallback, cleanupCallback) {
 
 /**
  * 尝试为媒体元素附加控制器
- * @param {HTMLMediaElement} media - 媒体元素
- * @param {Function} attachCallback - 附加控制器的回调函数
  */
-function tryAttachController(media, attachCallback) {
+function tryAttachController(
+  media: HTMLMediaElement,
+  attachCallback: (media: HTMLMediaElement) => void
+): void {
   if (!(media instanceof HTMLMediaElement)) return;
   if (media.dataset[DATASET_FLAG] === '1') return;
-  
+
   try {
     attachCallback(media);
     media.dataset[DATASET_FLAG] = '1';
@@ -40,9 +42,8 @@ function tryAttachController(media, attachCallback) {
 
 /**
  * 调度扫描 (防抖)
- * @param {Function} scanCallback - 扫描回调函数
  */
-export function scheduleScan(scanCallback) {
+export function scheduleScan(scanCallback: () => void): void {
   if (scanScheduled) return;
   scanScheduled = true;
   requestAnimationFrame(() => {
@@ -53,9 +54,8 @@ export function scheduleScan(scanCallback) {
 
 /**
  * 观察 DOM 变化并自动扫描新的媒体元素
- * @param {Function} scanCallback - 扫描回调函数
  */
-export function observeMutations(scanCallback) {
+export function observeMutations(scanCallback: () => void): void {
   const observer = new MutationObserver(() => scheduleScan(scanCallback));
   observer.observe(document.documentElement, {
     childList: true,

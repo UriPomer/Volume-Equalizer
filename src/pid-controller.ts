@@ -2,13 +2,18 @@
  * PID 控制器 - 用于平滑增益调整
  */
 
-import { PID_PARAMS } from './config.js';
-import { clamp } from './lufs-calculator.js';
+import { PID_PARAMS } from './config';
+import { clamp } from './lufs-calculator';
 
 export class PIDController {
+  integral = 0;
+  lastError = 0;
+  Kp: number;
+  Ki: number;
+  Kd: number;
+  integralLimit: number;
+
   constructor() {
-    this.integral = 0;
-    this.lastError = 0;
     this.Kp = PID_PARAMS.Kp;
     this.Ki = PID_PARAMS.Ki;
     this.Kd = PID_PARAMS.Kd;
@@ -17,10 +22,10 @@ export class PIDController {
 
   /**
    * 计算 PID 输出
-   * @param {number} error - 当前误差 (目标值 - 当前值)
-   * @returns {number} PID 输出（修正量）
+   * @param error - 当前误差 (目标值 - 当前值)
+   * @returns PID 输出（修正量）
    */
-  compute(error) {
+  compute(error: number): number {
     // P 项：比例控制，快速响应
     const proportional = this.Kp * error;
 
@@ -33,14 +38,13 @@ export class PIDController {
     const derivative = this.Kd * (error - this.lastError);
     this.lastError = error;
 
-    // PID 输出
     return proportional + integral + derivative;
   }
 
   /**
    * 重置 PID 状态
    */
-  reset() {
+  reset(): void {
     this.integral = 0;
     this.lastError = 0;
   }
