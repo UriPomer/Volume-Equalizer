@@ -329,19 +329,25 @@ export class MediaVolumeController {
       const originalLufs = this.originalMeter.getIntegratedLoudness();
       const outputLufs = this.outputMeter.getIntegratedLoudness();
       const integrationTime = this.originalMeter.getIntegrationTime();
+      const momentaryLufs = this.originalMeter.getMomentaryLoudness();
 
-      if (integrationTime >= INTEGRATION_PARAMS.minIntegrationSeconds && isFinite(originalLufs)) {
+      const hasIntegratedLoudness = integrationTime >= INTEGRATION_PARAMS.minIntegrationSeconds && isFinite(originalLufs);
+      const hasMomentaryLoudness = isFinite(momentaryLufs);
+
+      if (hasIntegratedLoudness || hasMomentaryLoudness) {
         const targetLufs = rmsToLufs(this.settings.targetRms);
-        const idealGain = calculateGainForLoudness(originalLufs, targetLufs);
+        const currentLufs = hasIntegratedLoudness ? originalLufs : momentaryLufs;
+        const idealGain = calculateGainForLoudness(currentLufs, targetLufs);
 
         if (Math.random() < 0.01) {
           console.log(`${BRAND} ITU-R BS.1770-4 测量:`, {
             targetLufs: targetLufs.toFixed(1),
-            originalLufs: originalLufs.toFixed(1),
+            originalLufs: hasIntegratedLoudness ? originalLufs.toFixed(1) : `${momentaryLufs.toFixed(1)}(M)`,
             outputLufs: isFinite(outputLufs) ? outputLufs.toFixed(1) : 'N/A',
             idealGain: idealGain.toFixed(3),
             currentGain: this.gainNode.gain.value.toFixed(3),
-            integrationTime: integrationTime.toFixed(1) + 's'
+            integrationTime: integrationTime.toFixed(1) + 's',
+            mode: hasIntegratedLoudness ? 'integrated' : 'cold-start'
           });
         }
 
@@ -351,8 +357,9 @@ export class MediaVolumeController {
 
         const rawNextGain = currentGain + correction;
         const baseRate = this.settings.gainChangePerSec * deltaSec;
-        const maxUp = baseRate;
-        const maxDown = baseRate * 3;
+        const coldStartMultiplier = hasIntegratedLoudness ? 1 : 5;
+        const maxUp = baseRate * coldStartMultiplier;
+        const maxDown = baseRate * 3 * coldStartMultiplier;
         let slewLimitedGain: number;
         if (rawNextGain > currentGain) {
           slewLimitedGain = Math.min(rawNextGain, currentGain + maxUp);
@@ -362,7 +369,9 @@ export class MediaVolumeController {
         const nextGain = clamp(slewLimitedGain, this.settings.minGain, this.settings.maxGain);
         this.gainNode.gain.value = nextGain;
 
-        this.updateMeterState(currentRms, originalRms, nextGain, originalLufs, outputLufs);
+        const displayOriginalLufs = hasIntegratedLoudness ? originalLufs : momentaryLufs;
+        const displayOutputLufs = hasIntegratedLoudness ? outputLufs : this.outputMeter.getMomentaryLoudness();
+        this.updateMeterState(currentRms, originalRms, nextGain, displayOriginalLufs, displayOutputLufs);
       } else {
         this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
       }
