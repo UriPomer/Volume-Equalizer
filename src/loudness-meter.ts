@@ -130,7 +130,7 @@ export class LoudnessMeter {
   private stepSamples: number;
   private samplesSinceLastBlock = 0;
 
-  // 最大保留的块数 (约 60 秒)
+  // 最大保留的块数 (约 600 秒 = 10 分钟)
   private maxBlocks: number;
 
   constructor(sampleRate = 48000) {
@@ -154,7 +154,8 @@ export class LoudnessMeter {
     this.samplesPerBlock = Math.ceil(this.blockSize * sampleRate);
     this.stepSamples = Math.ceil(this.samplesPerBlock * (1 - this.overlap));
     this.blockBuffer = new Float32Array(this.samplesPerBlock);
-    this.maxBlocks = Math.ceil(60 / (this.blockSize * (1 - this.overlap)));
+    // 无限积分：维护近 600 秒的 block（用于长视频的稳定测量）
+    this.maxBlocks = Math.ceil(600 / (this.blockSize * (1 - this.overlap)));
   }
 
   /**

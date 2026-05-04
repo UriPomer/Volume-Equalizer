@@ -16,6 +16,9 @@ package-lock.json
 .DS_Store
 Thumbs.db
 
+# 自动生成的文档
+docs/
+
 # 临时文件
 *.log
 *.tmp

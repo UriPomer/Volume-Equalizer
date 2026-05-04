@@ -36,21 +36,6 @@ export const DEFAULT_SETTINGS: Settings = {
   gainChangePerSec: 0.2      // 最大增益变化速度 (x/秒)，慢速调整保留动态
 };
 
-export interface PidParams {
-  Kp: number;
-  Ki: number;
-  Kd: number;
-  integralLimit: number;
-}
-
-// PID 控制器参数
-export const PID_PARAMS: PidParams = {
-  Kp: 0.15,  // 比例系数：响应速度
-  Ki: 0.005, // 积分系数：消除稳态误差
-  Kd: 0.08,  // 微分系数：抑制震荡
-  integralLimit: 5  // 积分抗饱和限制
-};
-
 export interface IntegrationParams {
   minIntegrationSeconds: number;
   silenceThreshold: number;
@@ -59,6 +44,9 @@ export interface IntegrationParams {
 // 积分响度参数 (ITU-R BS.1770-4 标准)
 export const INTEGRATION_PARAMS: IntegrationParams = {
   // 标准算法使用 400ms 块 + 75% 重叠，由 LoudnessMeter 内部处理
-  minIntegrationSeconds: 3,       // 启动控制前的最小积分时长（3秒 = ~30个块）
-  silenceThreshold: 0.001         // 静音阈值 (低于此值不送入响度测量)
+  minIntegrationSeconds: 1,           // 启动增益控制前的最小积分时长（1秒 = ~10个块）
+  silenceThreshold: 0.001             // 静音阈值 (低于此值不送入响度测量)
 };
+
+// 增益平滑参数
+export const GAIN_TIME_CONSTANT = 5.0;  // setTargetAtTime 时间常数（秒），越大越平缓

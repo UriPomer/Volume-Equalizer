@@ -6,11 +6,10 @@
  */
 
 import { ensureAudioContext } from './audio-context';
-import { PIDController } from './pid-controller';
 import { clamp } from './lufs-calculator';
-import { INTEGRATION_PARAMS, DATASET_FLAG, BRAND, Settings } from './config';
+import { INTEGRATION_PARAMS, DATASET_FLAG, BRAND, Settings, GAIN_TIME_CONSTANT } from './config';
 import { eventBus, EVENTS } from './events/index';
-import { LoudnessMeter, calculateGainForLoudness, rmsToLufs } from './loudness-meter';
+import { LoudnessMeter, calculateGainForLoudness } from './loudness-meter';
 
 interface MeterState {
   rms: number;
@@ -37,12 +36,6 @@ export class MediaVolumeController {
   private originalMeter: LoudnessMeter;
   private outputMeter: LoudnessMeter;
 
-  // tick 计时
-  private lastTickTime: number;
-
-  // PID 控制器
-  private pidController: PIDController;
-
   // Web Audio 节点
   private audioContext!: AudioContext;
   private sourceNode!: MediaElementAudioSourceNode;
@@ -67,8 +60,6 @@ export class MediaVolumeController {
 
     this.originalMeter = new LoudnessMeter(48000);
     this.outputMeter = new LoudnessMeter(48000);
-    this.lastTickTime = performance.now();
-    this.pidController = new PIDController();
 
     this.initAudioNodes();
     this.bindEventListeners();
@@ -225,13 +216,11 @@ export class MediaVolumeController {
   }
 
   /**
-   * 重置积分历史和PID状态
+   * 重置积分历史
    */
   private resetIntegration(): void {
     this.originalMeter.reset();
     this.outputMeter.reset();
-    this.lastTickTime = performance.now();
-    this.pidController.reset();
   }
 
   /**
@@ -239,8 +228,6 @@ export class MediaVolumeController {
    */
   private resetOutputIntegration(): void {
     this.outputMeter.reset();
-    this.lastTickTime = performance.now();
-    this.pidController.reset();
 
     const currentRms = this.measureRms();
     const originalRms = this.measureOriginalRms();
@@ -313,10 +300,6 @@ export class MediaVolumeController {
       return;
     }
 
-    const now = performance.now();
-    const deltaSec = Math.max(0.001, (now - this.lastTickTime) / 1000);
-    this.lastTickTime = now;
-
     this.originalAnalyser.getFloatTimeDomainData(this.originalBuffer);
     this.analyser.getFloatTimeDomainData(this.buffer);
 
@@ -329,49 +312,26 @@ export class MediaVolumeController {
       const originalLufs = this.originalMeter.getIntegratedLoudness();
       const outputLufs = this.outputMeter.getIntegratedLoudness();
       const integrationTime = this.originalMeter.getIntegrationTime();
-      const momentaryLufs = this.originalMeter.getMomentaryLoudness();
 
-      const hasIntegratedLoudness = integrationTime >= INTEGRATION_PARAMS.minIntegrationSeconds && isFinite(originalLufs);
-      const hasMomentaryLoudness = isFinite(momentaryLufs);
+      if (isFinite(originalLufs) && integrationTime >= INTEGRATION_PARAMS.minIntegrationSeconds) {
+        const targetLufs = 20 * Math.log10(this.settings.targetRms) - 0.691;
+        const idealGain = calculateGainForLoudness(originalLufs, targetLufs);
+        const clampedTarget = clamp(idealGain, this.settings.minGain, this.settings.maxGain);
 
-      if (hasIntegratedLoudness || hasMomentaryLoudness) {
-        const targetLufs = rmsToLufs(this.settings.targetRms);
-        const currentLufs = hasIntegratedLoudness ? originalLufs : momentaryLufs;
-        const idealGain = calculateGainForLoudness(currentLufs, targetLufs);
+        this.gainNode.gain.setTargetAtTime(clampedTarget, this.audioContext.currentTime, GAIN_TIME_CONSTANT);
 
         if (Math.random() < 0.01) {
-          console.log(`${BRAND} ITU-R BS.1770-4 测量:`, {
+          console.log(`${BRAND} 测量:`, {
             targetLufs: targetLufs.toFixed(1),
-            originalLufs: hasIntegratedLoudness ? originalLufs.toFixed(1) : `${momentaryLufs.toFixed(1)}(M)`,
+            originalLufs: originalLufs.toFixed(1),
             outputLufs: isFinite(outputLufs) ? outputLufs.toFixed(1) : 'N/A',
-            idealGain: idealGain.toFixed(3),
+            targetGain: clampedTarget.toFixed(3),
             currentGain: this.gainNode.gain.value.toFixed(3),
-            integrationTime: integrationTime.toFixed(1) + 's',
-            mode: hasIntegratedLoudness ? 'integrated' : 'cold-start'
+            integrationTime: integrationTime.toFixed(1) + 's'
           });
         }
 
-        const currentGain = this.gainNode.gain.value;
-        const error = idealGain - currentGain;
-        const correction = this.pidController.compute(error);
-
-        const rawNextGain = currentGain + correction;
-        const baseRate = this.settings.gainChangePerSec * deltaSec;
-        const coldStartMultiplier = hasIntegratedLoudness ? 1 : 5;
-        const maxUp = baseRate * coldStartMultiplier;
-        const maxDown = baseRate * 3 * coldStartMultiplier;
-        let slewLimitedGain: number;
-        if (rawNextGain > currentGain) {
-          slewLimitedGain = Math.min(rawNextGain, currentGain + maxUp);
-        } else {
-          slewLimitedGain = Math.max(rawNextGain, currentGain - maxDown);
-        }
-        const nextGain = clamp(slewLimitedGain, this.settings.minGain, this.settings.maxGain);
-        this.gainNode.gain.value = nextGain;
-
-        const displayOriginalLufs = hasIntegratedLoudness ? originalLufs : momentaryLufs;
-        const displayOutputLufs = hasIntegratedLoudness ? outputLufs : this.outputMeter.getMomentaryLoudness();
-        this.updateMeterState(currentRms, originalRms, nextGain, displayOriginalLufs, displayOutputLufs);
+        this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value, originalLufs, outputLufs);
       } else {
         this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
       }
