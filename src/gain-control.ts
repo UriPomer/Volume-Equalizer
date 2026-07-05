@@ -52,8 +52,8 @@ export function chooseControlLoudness(input: LoudnessSelectionInput): number {
     return isFinite(input.momentaryLufs) ? input.momentaryLufs : NaN;
   }
 
-  if (isFinite(input.shortTermLufs)) return input.shortTermLufs;
   if (isFinite(input.integratedLufs)) return input.integratedLufs;
+  if (isFinite(input.shortTermLufs)) return input.shortTermLufs;
   return isFinite(input.momentaryLufs) ? input.momentaryLufs : NaN;
 }
 

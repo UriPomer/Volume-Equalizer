@@ -47,10 +47,23 @@ test('cold start uses momentary loudness before integrated window is ready', () 
   );
 });
 
-test('program control uses short-term loudness after startup', () => {
+test('program control uses integrated loudness after startup', () => {
   assert.equal(
     chooseControlLoudness({
       integratedLufs: -24,
+      shortTermLufs: -18,
+      momentaryLufs: -35,
+      integrationTime: 3,
+      minIntegrationSeconds: 1
+    }),
+    -24
+  );
+});
+
+test('program control falls back to short-term loudness when integrated is unavailable', () => {
+  assert.equal(
+    chooseControlLoudness({
+      integratedLufs: NaN,
       shortTermLufs: -18,
       momentaryLufs: -35,
       integrationTime: 3,

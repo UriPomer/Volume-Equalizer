@@ -578,7 +578,7 @@ export class MediaVolumeController {
       originalRms,
       originalIntegratedRms,
       gain,
-      sampleCount: Math.floor(this.originalMeter.getIntegrationTime() * 10),
+      sampleCount: Math.floor(this.originalMeter.getIntegrationTime()),
       originalLufs,
       outputLufs,
       integrationTime: this.originalMeter.getIntegrationTime()
