@@ -10,6 +10,11 @@
 
 type FilterType = 'high_shelf' | 'high_pass';
 
+interface ChannelFilterState {
+  highShelf: IIRFilter;
+  highPass: IIRFilter;
+}
+
 /**
  * Biquad IIR 滤波器
  * 用于 K-weighting 预加权
@@ -117,14 +122,13 @@ export class LoudnessMeter {
   private absoluteThreshold = -70;  // 绝对门限 LUFS
   private relativeThreshold = -10;  // 相对门限 LU (低于平均 10 LU)
 
-  // K-weighting 滤波器
-  private highShelfFilter: IIRFilter;
-  private highPassFilter: IIRFilter;
+  // K-weighting 滤波器（每个声道独立状态）
+  private channelFilters: ChannelFilterState[];
 
   // 实时积分状态
   private blocks: number[] = [];
   private blockLoudness: number[] = [];
-  private blockBuffer: Float32Array;
+  private blockBuffers: Float32Array[];
   private blockBufferIndex = 0;
   private samplesPerBlock: number;
   private stepSamples: number;
@@ -136,24 +140,11 @@ export class LoudnessMeter {
   constructor(sampleRate = 48000) {
     this.sampleRate = sampleRate;
 
-    this.highShelfFilter = new IIRFilter(
-      'high_shelf',
-      1681.9744509555319,
-      0.7071752369554193,
-      3.99984385397,
-      sampleRate
-    );
-    this.highPassFilter = new IIRFilter(
-      'high_pass',
-      38.13547087613982,
-      0.5003270373253953,
-      0,
-      sampleRate
-    );
+    this.channelFilters = [this.createChannelFilters(sampleRate)];
 
     this.samplesPerBlock = Math.ceil(this.blockSize * sampleRate);
     this.stepSamples = Math.ceil(this.samplesPerBlock * (1 - this.overlap));
-    this.blockBuffer = new Float32Array(this.samplesPerBlock);
+    this.blockBuffers = [new Float32Array(this.samplesPerBlock)];
     // 无限积分：维护近 600 秒的 block（用于长视频的稳定测量）
     this.maxBlocks = Math.ceil(600 / (this.blockSize * (1 - this.overlap)));
   }
@@ -161,9 +152,10 @@ export class LoudnessMeter {
   /**
    * 应用 K-weighting 滤波
    */
-  private applyKWeighting(sample: number): number {
-    let filtered = this.highShelfFilter.processSample(sample);
-    filtered = this.highPassFilter.processSample(filtered);
+  private applyKWeighting(sample: number, channel: number): number {
+    const filters = this.channelFilters[channel];
+    let filtered = filters.highShelf.processSample(sample);
+    filtered = filters.highPass.processSample(filtered);
     return filtered;
   }
 
@@ -171,15 +163,28 @@ export class LoudnessMeter {
    * 实时处理音频块
    */
   processBlock(data: Float32Array): void {
-    for (let i = 0; i < data.length; i++) {
-      const filtered = this.applyKWeighting(data[i]);
+    this.processChannels([data]);
+  }
 
-      this.blockBuffer[this.blockBufferIndex] = filtered;
+  /**
+   * 实时处理多声道音频块。Web 内容通常是 mono/stereo；L/R 以 BS.1770 常规权重 1.0 求和。
+   */
+  processChannels(channels: Float32Array[]): void {
+    const channelCount = Math.max(1, channels.length);
+    this.ensureChannelCount(channelCount);
+
+    const frameCount = channels.reduce((max, channel) => Math.max(max, channel.length), 0);
+    for (let i = 0; i < frameCount; i++) {
+      for (let channel = 0; channel < channelCount; channel++) {
+        const sample = channels[channel]?.[i] ?? 0;
+        this.blockBuffers[channel][this.blockBufferIndex] = this.applyKWeighting(sample, channel);
+      }
+
       this.blockBufferIndex++;
       this.samplesSinceLastBlock++;
 
       if (this.blockBufferIndex >= this.samplesPerBlock) {
-        const meanSquare = this.calculateMeanSquare(this.blockBuffer);
+        const meanSquare = this.calculateWeightedMeanSquare(this.blockBuffers, this.samplesPerBlock);
         const blockLufs = -0.691 + 10 * Math.log10(meanSquare);
 
         if (blockLufs >= this.absoluteThreshold) {
@@ -193,7 +198,9 @@ export class LoudnessMeter {
         }
 
         if (this.samplesSinceLastBlock >= this.stepSamples) {
-          this.blockBuffer.copyWithin(0, this.stepSamples);
+          for (let channel = 0; channel < this.blockBuffers.length; channel++) {
+            this.blockBuffers[channel].copyWithin(0, this.stepSamples);
+          }
           this.blockBufferIndex = this.samplesPerBlock - this.stepSamples;
           this.samplesSinceLastBlock = 0;
         }
@@ -204,12 +211,25 @@ export class LoudnessMeter {
   /**
    * 计算均方值
    */
-  private calculateMeanSquare(buffer: Float32Array): number {
+  private calculateMeanSquare(buffer: Float32Array, length = buffer.length): number {
     let sum = 0;
-    for (let i = 0; i < buffer.length; i++) {
+    for (let i = 0; i < length; i++) {
       sum += buffer[i] * buffer[i];
     }
-    return sum / buffer.length;
+    return sum / length;
+  }
+
+  private calculateWeightedMeanSquare(buffers: Float32Array[], length: number): number {
+    let sum = 0;
+    for (let channel = 0; channel < buffers.length; channel++) {
+      sum += this.channelWeight(channel) * this.calculateMeanSquare(buffers[channel], length);
+    }
+    return sum;
+  }
+
+  private channelWeight(channel: number): number {
+    // ITU-R BS.1770 uses +1.5 dB for surround channels and ignores LFE. Browser media here is stereo.
+    return channel <= 1 ? 1 : Math.pow(10, 1.5 / 10);
   }
 
   /**
@@ -253,10 +273,10 @@ export class LoudnessMeter {
     }
 
     let sum = 0;
-    for (let i = 0; i < this.blockBufferIndex; i++) {
-      sum += this.blockBuffer[i] * this.blockBuffer[i];
+    for (let channel = 0; channel < this.blockBuffers.length; channel++) {
+      sum += this.channelWeight(channel) * this.calculateMeanSquare(this.blockBuffers[channel], this.blockBufferIndex);
     }
-    const meanSquare = sum / this.blockBufferIndex;
+    const meanSquare = sum;
 
     if (meanSquare <= 0) return -Infinity;
     return -0.691 + 10 * Math.log10(meanSquare);
@@ -292,11 +312,13 @@ export class LoudnessMeter {
   reset(): void {
     this.blocks = [];
     this.blockLoudness = [];
-    this.blockBuffer.fill(0);
+    this.blockBuffers.forEach((buffer) => buffer.fill(0));
     this.blockBufferIndex = 0;
     this.samplesSinceLastBlock = 0;
-    this.highShelfFilter.reset();
-    this.highPassFilter.reset();
+    this.channelFilters.forEach((filters) => {
+      filters.highShelf.reset();
+      filters.highPass.reset();
+    });
   }
 
   /**
@@ -306,18 +328,31 @@ export class LoudnessMeter {
     if (this.sampleRate !== sampleRate) {
       this.sampleRate = sampleRate;
 
-      this.highShelfFilter = new IIRFilter(
-        'high_shelf', 1681.9744509555319, 0.7071752369554193, 3.99984385397, sampleRate
-      );
-      this.highPassFilter = new IIRFilter(
-        'high_pass', 38.13547087613982, 0.5003270373253953, 0, sampleRate
-      );
+      this.channelFilters = this.channelFilters.map(() => this.createChannelFilters(sampleRate));
 
       this.samplesPerBlock = Math.ceil(this.blockSize * sampleRate);
       this.stepSamples = Math.ceil(this.samplesPerBlock * (1 - this.overlap));
-      this.blockBuffer = new Float32Array(this.samplesPerBlock);
+      this.blockBuffers = this.blockBuffers.map(() => new Float32Array(this.samplesPerBlock));
 
       this.reset();
+    }
+  }
+
+  private createChannelFilters(sampleRate: number): ChannelFilterState {
+    return {
+      highShelf: new IIRFilter(
+        'high_shelf', 1681.9744509555319, 0.7071752369554193, 3.99984385397, sampleRate
+      ),
+      highPass: new IIRFilter(
+        'high_pass', 38.13547087613982, 0.5003270373253953, 0, sampleRate
+      )
+    };
+  }
+
+  private ensureChannelCount(channelCount: number): void {
+    while (this.channelFilters.length < channelCount) {
+      this.channelFilters.push(this.createChannelFilters(this.sampleRate));
+      this.blockBuffers.push(new Float32Array(this.samplesPerBlock));
     }
   }
 }

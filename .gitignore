@@ -22,6 +22,7 @@ docs/
 # 临时文件
 *.log
 *.tmp
+dist-test/
 
 # Chrome扩展私钥和打包文件
 *.pem

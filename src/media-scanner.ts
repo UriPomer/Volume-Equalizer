@@ -2,9 +2,12 @@
  * 媒体扫描器 - 检测页面上的 video/audio 元素并附加控制器
  */
 
-import { TARGET_SELECTOR, DATASET_FLAG, BRAND } from './config';
+import { TARGET_SELECTOR, DATASET_FLAG } from './config';
+import { warnFailure } from './logger';
 
 let scanScheduled = false;
+const attachRetryAfter = new WeakMap<HTMLMediaElement, number>();
+const ATTACH_RETRY_DELAY_MS = 5000;
 
 /**
  * 扫描页面上的媒体元素
@@ -31,12 +34,16 @@ function tryAttachController(
 ): void {
   if (!(media instanceof HTMLMediaElement)) return;
   if (media.dataset[DATASET_FLAG] === '1') return;
+  const retryAfter = attachRetryAfter.get(media) || 0;
+  if (Date.now() < retryAfter) return;
 
   try {
     attachCallback(media);
     media.dataset[DATASET_FLAG] = '1';
+    attachRetryAfter.delete(media);
   } catch (error) {
-    console.warn(`${BRAND} 无法绑定媒体元素`, error);
+    attachRetryAfter.set(media, Date.now() + ATTACH_RETRY_DELAY_MS);
+    warnFailure('media-attach', '无法绑定媒体元素，将稍后重试', error);
   }
 }
 

@@ -38,6 +38,7 @@ export const DEFAULT_SETTINGS: Settings = {
 
 export interface IntegrationParams {
   minIntegrationSeconds: number;
+  coldStartSeconds: number;
   silenceThreshold: number;
 }
 
@@ -45,8 +46,7 @@ export interface IntegrationParams {
 export const INTEGRATION_PARAMS: IntegrationParams = {
   // 标准算法使用 400ms 块 + 75% 重叠，由 LoudnessMeter 内部处理
   minIntegrationSeconds: 1,           // 启动增益控制前的最小积分时长（1秒 = ~10个块）
+  coldStartSeconds: 3,                // 前几秒只允许降增益，不允许预测放大
   silenceThreshold: 0.001             // 静音阈值 (低于此值不送入响度测量)
 };
 
-// 增益平滑参数
-export const GAIN_TIME_CONSTANT = 5.0;  // setTargetAtTime 时间常数（秒），越大越平缓

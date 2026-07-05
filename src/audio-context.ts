@@ -2,13 +2,9 @@
  * AudioContext 管理
  */
 
-import { BRAND } from './config';
+import { warnFailure } from './logger';
 
 const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-
-if (!AudioContextClass) {
-  console.warn(`${BRAND} 当前浏览器不支持 AudioContext, 扩展已停用`);
-}
 
 let audioCtx: AudioContext | null = null;
 
@@ -31,11 +27,11 @@ export function installGlobalResumeHandlers(): void {
     try {
       if (audioCtx && audioCtx.state === 'suspended') {
         audioCtx.resume().catch((err) => {
-          console.debug(`${BRAND} AudioContext resume failed:`, err);
+          warnFailure('audio-context-resume', 'AudioContext resume failed', err);
         });
       }
     } catch (err) {
-      console.debug(`${BRAND} Resume handler error:`, err);
+      warnFailure('audio-context-resume-handler', 'AudioContext resume handler failed', err);
     }
   };
 

@@ -2,17 +2,18 @@
  * 主入口文件 - 协调各模块
  */
 
-import { BRAND, DEFAULT_SETTINGS, Settings } from './config';
+import { DEFAULT_SETTINGS, Settings } from './config';
 import { isAudioContextSupported, installGlobalResumeHandlers } from './audio-context';
 import { loadSettings, persistSettings } from './settings';
 import { MediaVolumeController } from './controller';
 import { scanForMedia, observeMutations } from './media-scanner';
 import { ensurePanel, updatePanelVisibility } from './ui-panel';
 import { eventBus, EVENTS } from './events/index';
+import { errorFailure, warnFailure } from './logger';
 
 // 检查浏览器支持
 if (!isAudioContextSupported()) {
-  console.warn(`${BRAND} 当前浏览器不支持 AudioContext, 扩展已停用`);
+  warnFailure('audio-context-unsupported', '当前浏览器不支持 AudioContext, 扩展已停用');
   throw new Error('AudioContext not supported');
 }
 
@@ -21,8 +22,6 @@ let settings: Settings = { ...DEFAULT_SETTINGS };
 let meterState = { rms: 0, gain: 1 };
 const controllers = new Map<HTMLMediaElement, MediaVolumeController>();
 
-// 初始化
-console.debug(`${BRAND} 初始化: 在任意媒体元素上执行音量均衡`);
 installGlobalResumeHandlers();
 
 // 加载设置并启动
@@ -32,7 +31,7 @@ loadSettings()
     startScanning();
   })
   .catch((err) => {
-    console.error(`${BRAND} 设置加载失败`, err);
+    errorFailure('settings-load', '设置加载失败，使用默认设置启动', err);
     startScanning();
   });
 
