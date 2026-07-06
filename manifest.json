@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Universal Volume Equalizer",
   "description": "在任意网页媒体元素上实时做音量均衡与自适应增益",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "permissions": ["storage"],
   "host_permissions": [
     "https://*/*",
