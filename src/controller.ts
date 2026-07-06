@@ -58,15 +58,15 @@ export class MediaVolumeController {
   private compressor!: DynamicsCompressorNode;
   gainNode!: GainNode;
   private originalAnalyser!: AnalyserNode;
-  private originalBuffer!: Float32Array;
+  private originalBuffer!: Float32Array<ArrayBuffer>;
   private originalSplitter!: ChannelSplitterNode;
   private originalChannelAnalysers: AnalyserNode[] = [];
-  private originalChannelBuffers: Float32Array[] = [];
+  private originalChannelBuffers: Float32Array<ArrayBuffer>[] = [];
   private analyser!: AnalyserNode;
-  private buffer!: Float32Array;
+  private buffer!: Float32Array<ArrayBuffer>;
   private outputSplitter!: ChannelSplitterNode;
   private outputChannelAnalysers: AnalyserNode[] = [];
-  private outputChannelBuffers: Float32Array[] = [];
+  private outputChannelBuffers: Float32Array<ArrayBuffer>[] = [];
   private bassFilter!: BiquadFilterNode;
   private fallbackLimiter!: DynamicsCompressorNode;
   private workletLimiter: AudioWorkletNode | null = null;
@@ -541,7 +541,7 @@ export class MediaVolumeController {
     this.rafId = requestAnimationFrame(this.tick);
   }
 
-  private readChannelData(analysers: AnalyserNode[], buffers: Float32Array[]): void {
+  private readChannelData(analysers: AnalyserNode[], buffers: Float32Array<ArrayBuffer>[]): void {
     for (let channel = 0; channel < analysers.length; channel++) {
       analysers[channel].getFloatTimeDomainData(buffers[channel]);
     }

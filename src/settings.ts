@@ -13,9 +13,10 @@ export function loadSettings(): Promise<Settings> {
   if (!storageSupported) {
     return Promise.resolve({ ...DEFAULT_SETTINGS });
   }
+  const defaultSettings = { ...DEFAULT_SETTINGS } as Record<string, unknown>;
   return new Promise((resolve) => {
-    chrome.storage.local.get(DEFAULT_SETTINGS, (result) => {
-      resolve((result as Settings) || { ...DEFAULT_SETTINGS });
+    chrome.storage.local.get(defaultSettings, (result) => {
+      resolve((result as unknown as Settings) || { ...DEFAULT_SETTINGS });
     });
   });
 }

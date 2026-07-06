@@ -11,6 +11,32 @@ import { ensurePanel, updatePanelVisibility } from './ui-panel';
 import { eventBus, EVENTS } from './events/index';
 import { errorFailure, warnFailure } from './logger';
 
+interface MeterState {
+  rms: number;
+  integratedRms: number;
+  originalRms: number;
+  originalIntegratedRms: number;
+  gain: number;
+  sampleCount: number;
+  originalLufs: number;
+  outputLufs: number;
+  integrationTime: number;
+}
+
+function createEmptyMeterState(): MeterState {
+  return {
+    rms: 0,
+    integratedRms: 0,
+    originalRms: 0,
+    originalIntegratedRms: 0,
+    gain: 1,
+    sampleCount: 0,
+    originalLufs: NaN,
+    outputLufs: NaN,
+    integrationTime: 0
+  };
+}
+
 // 检查浏览器支持
 if (!isAudioContextSupported()) {
   warnFailure('audio-context-unsupported', '当前浏览器不支持 AudioContext, 扩展已停用');
@@ -19,7 +45,7 @@ if (!isAudioContextSupported()) {
 
 // 全局状态
 let settings: Settings = { ...DEFAULT_SETTINGS };
-let meterState = { rms: 0, gain: 1 };
+let meterState: MeterState = createEmptyMeterState();
 const controllers = new Map<HTMLMediaElement, MediaVolumeController>();
 
 installGlobalResumeHandlers();
@@ -83,7 +109,7 @@ function cleanupControllers(): void {
  * 设置改变处理
  */
 function handleSettingsChange(newSettings: Settings): Settings {
-  const changedField = newSettings._changedField || null;
+  const changedField = newSettings._changedField;
   const cleanedSettings = { ...newSettings };
   delete cleanedSettings._changedField;
 
@@ -98,14 +124,7 @@ function handleSettingsChange(newSettings: Settings): Settings {
     controllers.forEach((controller) => {
       controller.gainNode.gain.value = 1.0;
     });
-    meterState = {
-      rms: 0,
-      integratedRms: 0,
-      originalRms: 0,
-      originalIntegratedRms: 0,
-      gain: 1,
-      sampleCount: 0
-    };
+    meterState = createEmptyMeterState();
   }
 
   eventBus.emit(EVENTS.SETTINGS_CHANGED, { settings, changedField });

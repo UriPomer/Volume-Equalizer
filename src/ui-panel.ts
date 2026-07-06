@@ -7,16 +7,16 @@ import { rmsToLufs, lufsToRms } from './lufs-calculator';
 import { eventBus, EVENTS } from './events/index';
 
 interface FieldNodes {
-  targetLufs: Element | null;
-  maxGain: Element | null;
-  minGain: Element | null;
-  bassBoost: Element | null;
-  meterOriginalIntegratedLufs: Element | null;
-  meterOriginalLufs: Element | null;
-  meterIntegratedLufs: Element | null;
-  meterLufs: Element | null;
-  meterGain: Element | null;
-  sampleCount: Element | null;
+  targetLufs: HTMLElement | null;
+  maxGain: HTMLElement | null;
+  minGain: HTMLElement | null;
+  bassBoost: HTMLElement | null;
+  meterOriginalIntegratedLufs: HTMLElement | null;
+  meterOriginalLufs: HTMLElement | null;
+  meterIntegratedLufs: HTMLElement | null;
+  meterLufs: HTMLElement | null;
+  meterGain: HTMLElement | null;
+  sampleCount: HTMLElement | null;
 }
 
 interface MeterState {
@@ -403,9 +403,9 @@ function bindPanelEvents(
   initialSettings: Settings,
   onSettingsChange: (s: Settings) => Settings
 ): void {
-  const toggleBtn = shadow.querySelector('button.toggle-pill')!;
-  const dockDot = shadow.querySelector('.dock-dot')!;
-  const sliders = shadow.querySelectorAll('input[type="range"]');
+  const toggleBtn = shadow.querySelector<HTMLButtonElement>('button.toggle-pill')!;
+  const dockDot = shadow.querySelector<HTMLElement>('.dock-dot')!;
+  const sliders = shadow.querySelectorAll<HTMLInputElement>('input[type="range"]');
   const fieldNodes = getFieldNodes(shadow);
   const sliderMap = new Map([...sliders].map((slider) => [slider.dataset.role, slider]));
 
@@ -426,19 +426,19 @@ function bindPanelEvents(
   const applySettingsToUI = (settings: Settings) => {
     const targetLufs = rmsToLufs(settings.targetRms);
     const targetSlider = sliderMap.get('targetLufs');
-    if (targetSlider) (targetSlider as HTMLInputElement).value = String(targetLufs);
+    if (targetSlider) targetSlider.value = String(targetLufs);
     updateFieldText(fieldNodes, 'targetLufs', targetLufs);
 
     const maxGainSlider = sliderMap.get('maxGain');
-    if (maxGainSlider) (maxGainSlider as HTMLInputElement).value = String(settings.maxGain);
+    if (maxGainSlider) maxGainSlider.value = String(settings.maxGain);
     updateFieldText(fieldNodes, 'maxGain', settings.maxGain);
 
     const minGainSlider = sliderMap.get('minGain');
-    if (minGainSlider) (minGainSlider as HTMLInputElement).value = String(settings.minGain);
+    if (minGainSlider) minGainSlider.value = String(settings.minGain);
     updateFieldText(fieldNodes, 'minGain', settings.minGain);
 
     const bassBoostSlider = sliderMap.get('bassBoost');
-    if (bassBoostSlider) (bassBoostSlider as HTMLInputElement).value = String(settings.bassBoost);
+    if (bassBoostSlider) bassBoostSlider.value = String(settings.bassBoost);
     updateFieldText(fieldNodes, 'bassBoost', settings.bassBoost);
 
     renderToggle();
@@ -480,8 +480,8 @@ function bindPanelEvents(
   let expandTimer: ReturnType<typeof setTimeout> | null = null;
   let collapseTimer: ReturnType<typeof setTimeout> | null = null;
   const host = panelHost!;
-  const dock = shadow.querySelector('.dock')!;
-  const panelWrapper = shadow.querySelector('.panel-wrapper')!;
+  const dock = shadow.querySelector<HTMLElement>('.dock')!;
+  const panelWrapper = shadow.querySelector<HTMLElement>('.panel-wrapper')!;
 
   const startExpand = () => {
     clearTimeout(collapseTimer!);
@@ -522,16 +522,16 @@ function bindPanelEvents(
  */
 function getFieldNodes(shadow: ShadowRoot): FieldNodes {
   return {
-    targetLufs: shadow.querySelector('[data-field="targetLufs"]'),
-    maxGain: shadow.querySelector('[data-field="maxGain"]'),
-    minGain: shadow.querySelector('[data-field="minGain"]'),
-    bassBoost: shadow.querySelector('[data-field="bassBoost"]'),
-    meterOriginalIntegratedLufs: shadow.querySelector('[data-field="meterOriginalIntegratedLufs"]'),
-    meterOriginalLufs: shadow.querySelector('[data-field="meterOriginalLufs"]'),
-    meterIntegratedLufs: shadow.querySelector('[data-field="meterIntegratedLufs"]'),
-    meterLufs: shadow.querySelector('[data-field="meterLufs"]'),
-    meterGain: shadow.querySelector('[data-field="meterGain"]'),
-    sampleCount: shadow.querySelector('[data-field="sampleCount"]')
+    targetLufs: shadow.querySelector<HTMLElement>('[data-field="targetLufs"]'),
+    maxGain: shadow.querySelector<HTMLElement>('[data-field="maxGain"]'),
+    minGain: shadow.querySelector<HTMLElement>('[data-field="minGain"]'),
+    bassBoost: shadow.querySelector<HTMLElement>('[data-field="bassBoost"]'),
+    meterOriginalIntegratedLufs: shadow.querySelector<HTMLElement>('[data-field="meterOriginalIntegratedLufs"]'),
+    meterOriginalLufs: shadow.querySelector<HTMLElement>('[data-field="meterOriginalLufs"]'),
+    meterIntegratedLufs: shadow.querySelector<HTMLElement>('[data-field="meterIntegratedLufs"]'),
+    meterLufs: shadow.querySelector<HTMLElement>('[data-field="meterLufs"]'),
+    meterGain: shadow.querySelector<HTMLElement>('[data-field="meterGain"]'),
+    sampleCount: shadow.querySelector<HTMLElement>('[data-field="sampleCount"]')
   };
 }
 

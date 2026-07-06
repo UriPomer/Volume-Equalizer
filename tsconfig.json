@@ -11,7 +11,8 @@
     "rootDir": "src",
     "declaration": false,
     "sourceMap": false,
-    "lib": ["ES2020", "DOM", "DOM.Iterable"]
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "types": ["chrome"]
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
