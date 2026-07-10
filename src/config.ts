@@ -9,6 +9,7 @@ export const TARGET_SELECTOR = 'video, audio';
 
 export interface Settings {
   enabled: boolean;
+  fullAudioAnalysis: boolean;
   targetRms: number;
   minGain: number;
   maxGain: number;
@@ -24,8 +25,9 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = {
   enabled: true,
-  targetRms: 0.1363,  // 对应 -18 LUFS (10^((-18+0.691)/20))
-  minGain: 0.5,      // 最小增益 (避免过度压缩)
+  fullAudioAnalysis: false,
+  targetRms: 0.09650504109445904,  // 对应 -21 LUFS
+  minGain: 0.25,     // 最多衰减约 12 dB，保证高响度内容可接近 -21 LUFS
   maxGain: 2.0,      // 最大增益 (避免失真)
   compressorThreshold: -20,  // 压缩器阈值 (dB)
   compressorKnee: 20,        // 压缩器拐点柔和度
@@ -46,7 +48,7 @@ export interface IntegrationParams {
 export const INTEGRATION_PARAMS: IntegrationParams = {
   // 标准算法使用 400ms 块 + 75% 重叠，由 LoudnessMeter 内部处理
   minIntegrationSeconds: 1,           // 启动增益控制前的最小积分时长（1秒 = ~10个块）
-  coldStartSeconds: 3,                // 前几秒只允许降增益，不允许预测放大
+  coldStartSeconds: 10,               // 前 10 秒校准，之后限制在固定 0.2x 走廊
   silenceThreshold: 0.001             // 静音阈值 (低于此值不送入响度测量)
 };
 

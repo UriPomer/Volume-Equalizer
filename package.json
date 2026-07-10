@@ -5,7 +5,10 @@
   "scripts": {
     "build": "vite build",
     "watch": "vite build --watch",
-    "pack": "vite build && node pack.js"
+    "pack": "vite build && node pack.js",
+    "test:audio:download": "node scripts/download-audio-fixtures.mjs",
+    "test:audio:benchmark": "node scripts/audio-benchmark.mjs",
+    "test:audio:trace": "node scripts/audio-benchmark.mjs --trace"
   },
   "devDependencies": {
     "@types/chrome": "^0.1.40",

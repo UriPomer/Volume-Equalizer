@@ -22,6 +22,8 @@ docs/
 *.log
 *.tmp
 dist-test/
+tests/fixtures/videos/
+test-results/
 
 # Chrome扩展私钥和打包文件
 *.pem

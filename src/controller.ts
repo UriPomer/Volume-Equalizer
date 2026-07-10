@@ -12,6 +12,13 @@ import { eventBus, EVENTS } from './events/index';
 import { LoudnessMeter, calculateGainForLoudness } from './loudness-meter';
 import { RealtimeAgc, chooseControlLoudness } from './gain-control';
 import { warnFailure } from './logger';
+import {
+  analyzeFullAudio,
+  calculateFullAudioGain,
+  FullAudioAnalysisResult
+} from './full-audio-analysis';
+
+type AnalysisStatus = 'realtime' | 'analyzing' | 'full-track' | 'fallback';
 
 interface MeterState {
   rms: number;
@@ -23,6 +30,7 @@ interface MeterState {
   originalLufs: number;
   outputLufs: number;
   integrationTime: number;
+  analysisStatus: AnalysisStatus;
 }
 
 type MeterStateCallback = (state: MeterState) => void;
@@ -71,12 +79,16 @@ export class MediaVolumeController {
   private fallbackLimiter!: DynamicsCompressorNode;
   private workletLimiter: AudioWorkletNode | null = null;
   private destroyed = false;
+  private fullAnalysisAbort: AbortController | null = null;
+  private fullAnalysisResult: FullAudioAnalysisResult | null = null;
+  private analysisStatus: AnalysisStatus = 'realtime';
 
   // 事件处理器引用（用于移除）
   private handleEmptied!: () => void;
   private handleSeeked!: () => void;
   private handlePlay!: () => void;
   private handlePause!: () => void;
+  private handleLoadedMetadata!: () => void;
   private handleVisibilityChange!: () => void;
 
   constructor(media: HTMLMediaElement, settings: Settings, meterStateCallback: MeterStateCallback) {
@@ -89,6 +101,7 @@ export class MediaVolumeController {
 
     this.initAudioNodes();
     this.bindEventListeners();
+    this.startFullAudioAnalysis();
 
     this.tick = this.tick.bind(this);
     this.rafId = requestAnimationFrame(this.tick);
@@ -142,11 +155,13 @@ export class MediaVolumeController {
     this.handleEmptied = () => {
       eventBus.emit(EVENTS.MEDIA_EMPTIED, { media: this.media });
       this.resetGain();
+      this.cancelFullAudioAnalysis();
+      this.fullAnalysisResult = null;
+      this.analysisStatus = this.settings.fullAudioAnalysis ? 'analyzing' : 'realtime';
     };
 
     this.handleSeeked = () => {
       eventBus.emit(EVENTS.MEDIA_SEEKED, { media: this.media });
-      this.resetIntegration();
     };
 
     this.handlePlay = () => {
@@ -158,6 +173,7 @@ export class MediaVolumeController {
             warnFailure('media-play-resume', 'AudioContext play resume failed', err);
           });
         }
+        this.startFullAudioAnalysis();
       } catch (err) {
         warnFailure('media-play-handler', 'Media play handler failed', err);
       }
@@ -167,14 +183,16 @@ export class MediaVolumeController {
       eventBus.emit(EVENTS.MEDIA_PAUSE, { media: this.media });
     };
 
+    this.handleLoadedMetadata = () => this.startFullAudioAnalysis();
+
     this.media.addEventListener('emptied', this.handleEmptied);
     this.media.addEventListener('seeked', this.handleSeeked);
     this.media.addEventListener('play', this.handlePlay);
     this.media.addEventListener('pause', this.handlePause);
+    this.media.addEventListener('loadedmetadata', this.handleLoadedMetadata);
 
     this.handleVisibilityChange = () => {
       this.freezeGain();
-      this.resetIntegration();
       this.lastTickTime = performance.now();
     };
     document.addEventListener('visibilitychange', this.handleVisibilityChange);
@@ -330,6 +348,7 @@ export class MediaVolumeController {
   updateSettings(newSettings: Settings): void {
     const { _changedField, ...restSettings } = newSettings;
     const targetChanged = _changedField === 'targetLufs';
+    const analysisModeChanged = _changedField === 'fullAudioAnalysis';
     const wasEnabled = this.settings.enabled;
 
     this.settings = restSettings;
@@ -341,8 +360,52 @@ export class MediaVolumeController {
     }
 
     if (targetChanged) {
+      this.agc.reset();
       this.resetOutputIntegration();
     }
+    if (analysisModeChanged) {
+      if (restSettings.fullAudioAnalysis) {
+        this.startFullAudioAnalysis();
+      } else {
+        this.cancelFullAudioAnalysis();
+        this.fullAnalysisResult = null;
+        this.analysisStatus = 'realtime';
+        this.resetIntegration();
+      }
+    }
+  }
+
+  private startFullAudioAnalysis(): void {
+    if (
+      !this.settings.fullAudioAnalysis ||
+      this.destroyed ||
+      this.fullAnalysisAbort ||
+      this.fullAnalysisResult
+    ) return;
+
+    const abort = new AbortController();
+    this.fullAnalysisAbort = abort;
+    this.analysisStatus = 'analyzing';
+
+    analyzeFullAudio(this.media, this.audioContext, abort.signal)
+      .then((result) => {
+        if (this.destroyed || abort.signal.aborted) return;
+        this.fullAnalysisResult = result;
+        this.analysisStatus = this.agc.isLocked() ? 'fallback' : 'analyzing';
+      })
+      .catch((error) => {
+        if (abort.signal.aborted) return;
+        this.analysisStatus = 'fallback';
+        warnFailure('full-audio-analysis', '完整音轨分析失败，继续使用实时算法', error);
+      })
+      .finally(() => {
+        if (this.fullAnalysisAbort === abort) this.fullAnalysisAbort = null;
+      });
+  }
+
+  private cancelFullAudioAnalysis(): void {
+    this.fullAnalysisAbort?.abort();
+    this.fullAnalysisAbort = null;
   }
 
   /**
@@ -506,6 +569,28 @@ export class MediaVolumeController {
 
       if (isFinite(controlLufs)) {
         const targetLufs = rmsToLufs(this.settings.targetRms);
+        if (this.settings.fullAudioAnalysis && this.fullAnalysisResult) {
+          const fixedGain = calculateFullAudioGain(
+            this.fullAnalysisResult,
+            targetLufs,
+            this.settings.minGain,
+            this.settings.maxGain
+          );
+          if (!this.agc.isLocked()) {
+            this.agc.lockGain(fixedGain);
+            this.analysisStatus = 'full-track';
+            this.setGainImmediate(fixedGain);
+            this.updateMeterState(
+              currentRms,
+              originalRms,
+              fixedGain,
+              this.fullAnalysisResult.integratedLufs,
+              outputLufs
+            );
+            this.rafId = requestAnimationFrame(this.tick);
+            return;
+          }
+        }
         const idealGain = calculateGainForLoudness(controlLufs, targetLufs);
         const agcResult = this.agc.update({
           currentGain: this.gainNode.gain.value,
@@ -520,7 +605,8 @@ export class MediaVolumeController {
           sourcePeak: originalPeak,
           momentaryLufs,
           shortTermLufs,
-          gainChangePerSec: this.settings.gainChangePerSec
+          gainChangePerSec: this.settings.gainChangePerSec,
+          programTimeSeconds: this.media.currentTime
         });
         const nextGain = agcResult.nextGain;
 
@@ -581,7 +667,8 @@ export class MediaVolumeController {
       sampleCount: Math.floor(this.originalMeter.getIntegrationTime()),
       originalLufs,
       outputLufs,
-      integrationTime: this.originalMeter.getIntegrationTime()
+      integrationTime: this.originalMeter.getIntegrationTime(),
+      analysisStatus: this.analysisStatus
     });
   }
 
@@ -595,7 +682,9 @@ export class MediaVolumeController {
     this.media.removeEventListener('seeked', this.handleSeeked);
     this.media.removeEventListener('play', this.handlePlay);
     this.media.removeEventListener('pause', this.handlePause);
+    this.media.removeEventListener('loadedmetadata', this.handleLoadedMetadata);
     document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    this.cancelFullAudioAnalysis();
     this.disconnectNodes();
     delete (this.media.dataset as Record<string, string | undefined>)[DATASET_FLAG];
   }

@@ -134,10 +134,10 @@ export class LoudnessMeter {
   private stepSamples: number;
   private samplesSinceLastBlock = 0;
 
-  // 最大保留的块数 (约 600 秒 = 10 分钟)
+  // 实时模式默认保留 10 分钟；完整音轨分析可取消上限。
   private maxBlocks: number;
 
-  constructor(sampleRate = 48000) {
+  constructor(sampleRate = 48000, maxIntegrationSeconds = 600) {
     this.sampleRate = sampleRate;
 
     this.channelFilters = [this.createChannelFilters(sampleRate)];
@@ -145,8 +145,9 @@ export class LoudnessMeter {
     this.samplesPerBlock = Math.ceil(this.blockSize * sampleRate);
     this.stepSamples = Math.ceil(this.samplesPerBlock * (1 - this.overlap));
     this.blockBuffers = [new Float32Array(this.samplesPerBlock)];
-    // 无限积分：维护近 600 秒的 block（用于长视频的稳定测量）
-    this.maxBlocks = Math.ceil(600 / (this.blockSize * (1 - this.overlap)));
+    this.maxBlocks = Number.isFinite(maxIntegrationSeconds)
+      ? Math.ceil(maxIntegrationSeconds / (this.blockSize * (1 - this.overlap)))
+      : Number.POSITIVE_INFINITY;
   }
 
   /**

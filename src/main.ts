@@ -21,6 +21,7 @@ interface MeterState {
   originalLufs: number;
   outputLufs: number;
   integrationTime: number;
+  analysisStatus: 'realtime' | 'analyzing' | 'full-track' | 'fallback';
 }
 
 function createEmptyMeterState(): MeterState {
@@ -33,7 +34,8 @@ function createEmptyMeterState(): MeterState {
     sampleCount: 0,
     originalLufs: NaN,
     outputLufs: NaN,
-    integrationTime: 0
+    integrationTime: 0,
+    analysisStatus: 'realtime'
   };
 }
 

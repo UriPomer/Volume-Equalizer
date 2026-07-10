@@ -17,6 +17,7 @@ interface FieldNodes {
   meterLufs: HTMLElement | null;
   meterGain: HTMLElement | null;
   sampleCount: HTMLElement | null;
+  analysisStatus: HTMLElement | null;
 }
 
 interface MeterState {
@@ -26,6 +27,7 @@ interface MeterState {
   originalIntegratedRms: number;
   gain: number;
   sampleCount: number;
+  analysisStatus: 'realtime' | 'analyzing' | 'full-track' | 'fallback';
 }
 
 let panelHost: HTMLElement | null = null;
@@ -243,6 +245,27 @@ function getPanelStyles(): string {
     .param-row {
       margin-top: 8px;
     }
+    .mode-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 9px;
+      font-size: 11px;
+      color: rgba(255,255,255,0.55);
+    }
+    .mode-button {
+      border: 0;
+      border-radius: 999px;
+      padding: 3px 9px;
+      background: rgba(255,255,255,0.1);
+      color: rgba(255,255,255,0.7);
+      cursor: pointer;
+      font-size: 10px;
+    }
+    .mode-button.on {
+      background: rgba(56,189,248,0.24);
+      color: #7dd3fc;
+    }
     .param-label {
       display: flex;
       justify-content: space-between;
@@ -332,6 +355,11 @@ function getPanelHTML(settings: Settings): string {
         </div>
         <div class="divider"></div>
 
+        <div class="mode-row">
+          <span>完整音轨预分析</span>
+          <button class="mode-button" data-role="fullAudioAnalysis"></button>
+        </div>
+
         <div class="param-row">
           <div class="param-label">
             <span>目标响度</span>
@@ -389,6 +417,10 @@ function getPanelHTML(settings: Settings): string {
             <span class="label">增益</span>
             <span class="val highlight"><span data-field="meterGain">1.00x</span></span>
           </div>
+          <div class="meter-row">
+            <span class="label">算法</span>
+            <span class="val" data-field="analysisStatus">实时</span>
+          </div>
         </div>
       </div>
     </div>
@@ -408,6 +440,7 @@ function bindPanelEvents(
   const sliders = shadow.querySelectorAll<HTMLInputElement>('input[type="range"]');
   const fieldNodes = getFieldNodes(shadow);
   const sliderMap = new Map([...sliders].map((slider) => [slider.dataset.role, slider]));
+  const analysisModeButton = shadow.querySelector<HTMLButtonElement>('[data-role="fullAudioAnalysis"]')!;
 
   let currentSettings = initialSettings;
 
@@ -421,6 +454,11 @@ function bindPanelEvents(
       toggleBtn.className = 'toggle-pill off';
       dockDot.className = 'dock-dot off';
     }
+  };
+
+  const renderAnalysisMode = () => {
+    analysisModeButton.textContent = currentSettings.fullAudioAnalysis ? '已开启' : '实时模式';
+    analysisModeButton.className = currentSettings.fullAudioAnalysis ? 'mode-button on' : 'mode-button';
   };
 
   const applySettingsToUI = (settings: Settings) => {
@@ -442,6 +480,7 @@ function bindPanelEvents(
     updateFieldText(fieldNodes, 'bassBoost', settings.bassBoost);
 
     renderToggle();
+    renderAnalysisMode();
   };
 
   applySettingsToUI(currentSettings);
@@ -451,6 +490,17 @@ function bindPanelEvents(
     currentSettings = onSettingsChange(newSettings) || newSettings;
     renderToggle();
     toggleBtn.blur();
+  });
+
+  analysisModeButton.addEventListener('click', () => {
+    const newSettings = {
+      ...currentSettings,
+      fullAudioAnalysis: !currentSettings.fullAudioAnalysis,
+      _changedField: 'fullAudioAnalysis'
+    };
+    currentSettings = onSettingsChange(newSettings) || newSettings;
+    renderAnalysisMode();
+    analysisModeButton.blur();
   });
 
   sliders.forEach((slider) => {
@@ -531,7 +581,8 @@ function getFieldNodes(shadow: ShadowRoot): FieldNodes {
     meterIntegratedLufs: shadow.querySelector<HTMLElement>('[data-field="meterIntegratedLufs"]'),
     meterLufs: shadow.querySelector<HTMLElement>('[data-field="meterLufs"]'),
     meterGain: shadow.querySelector<HTMLElement>('[data-field="meterGain"]'),
-    sampleCount: shadow.querySelector<HTMLElement>('[data-field="sampleCount"]')
+    sampleCount: shadow.querySelector<HTMLElement>('[data-field="sampleCount"]'),
+    analysisStatus: shadow.querySelector<HTMLElement>('[data-field="analysisStatus"]')
   };
 }
 
@@ -555,7 +606,7 @@ function startMeterUpdateLoop(shadow: ShadowRoot, getMeterState: () => MeterStat
     if (!document.contains(panelHost)) return;
 
     const meterState = getMeterState();
-    const { rms, integratedRms, originalRms, originalIntegratedRms, gain, sampleCount } = meterState;
+    const { rms, integratedRms, originalRms, originalIntegratedRms, gain, sampleCount, analysisStatus } = meterState;
 
     const instantLufs = rmsToLufs(rms);
     const integratedLufs = rmsToLufs(integratedRms || rms);
@@ -568,5 +619,13 @@ function startMeterUpdateLoop(shadow: ShadowRoot, getMeterState: () => MeterStat
     if (fieldNodes.meterIntegratedLufs) fieldNodes.meterIntegratedLufs.textContent = integratedLufs > -70 ? integratedLufs.toFixed(1) : '-∞';
     if (fieldNodes.meterGain) fieldNodes.meterGain.textContent = `${gain.toFixed(2)}x`;
     if (fieldNodes.sampleCount) fieldNodes.sampleCount.textContent = `${sampleCount}s`;
+    if (fieldNodes.analysisStatus) {
+      fieldNodes.analysisStatus.textContent = {
+        realtime: '实时',
+        analyzing: '分析中',
+        'full-track': '整段锁定',
+        fallback: '实时回退'
+      }[analysisStatus];
+    }
   }, 100);
 }

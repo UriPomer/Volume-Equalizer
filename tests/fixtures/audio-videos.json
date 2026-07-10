@@ -1,0 +1,38 @@
+[
+  {
+    "id": "sintel-original",
+    "title": "Sintel trailer — original level",
+    "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
+    "file": "sintel-trailer.mp4",
+    "inputGainDb": 0
+  },
+  {
+    "id": "bunny-quiet",
+    "title": "Big Buck Bunny trailer — quiet programme",
+    "url": "https://media.w3.org/2010/05/bunny/trailer.mp4",
+    "file": "bunny-trailer.mp4",
+    "inputGainDb": -12
+  },
+  {
+    "id": "movie-loud",
+    "title": "W3C movie sample — high level",
+    "url": "https://media.w3.org/2010/05/video/movie_300.mp4",
+    "file": "movie-300.mp4",
+    "inputGainDb": 6,
+    "includeInEvaluation": false
+  },
+  {
+    "id": "clear-layout",
+    "title": "WAI clear layout — speech and music",
+    "url": "https://media.w3.org/wai/perspective-videos/clear-layout-design.mp4",
+    "file": "clear-layout-design.mp4",
+    "inputGainDb": 0
+  },
+  {
+    "id": "video-captions",
+    "title": "WAI video captions — speech and music",
+    "url": "https://media.w3.org/wai/perspective-videos/video-captions.mp4",
+    "file": "video-captions.mp4",
+    "inputGainDb": 0
+  }
+]
