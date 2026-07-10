@@ -91,20 +91,30 @@ export class RealtimeAgc {
   }
 
   isLocked(): boolean {
-    return this.lockedProgramGain !== null || this.corridorMinGain !== null;
+    return this.lockedProgramGain !== null;
   }
 
   lockGain(gain: number): void {
     if (Number.isFinite(gain)) this.lockedProgramGain = gain;
   }
 
+  unlockGain(currentGain: number, minGain: number, maxGain: number): void {
+    this.lockedProgramGain = null;
+    const halfRange = POST_CALIBRATION_GAIN_RANGE / 2;
+    const center = Math.min(Math.max(currentGain, minGain), maxGain);
+    this.corridorMinGain = Math.max(minGain, center - halfRange);
+    this.corridorMaxGain = Math.min(maxGain, center + halfRange);
+  }
+
   update(input: AgcUpdateInput): AgcUpdateResult {
     if (this.lockedProgramGain !== null) {
+      const currentGain = Math.min(Math.max(input.currentGain, input.minGain), input.maxGain);
+      const targetGain = Math.min(Math.max(this.lockedProgramGain, input.minGain), input.maxGain);
       return {
-        nextGain: this.lockedProgramGain,
+        nextGain: this.slewLimitGain(input, currentGain, targetGain, 1),
         gateOpen: this.gateOpen,
         state: 'locked',
-        peakLimitedGain: this.lockedProgramGain,
+        peakLimitedGain: targetGain,
         riseScale: 0
       };
     }
@@ -117,7 +127,8 @@ export class RealtimeAgc {
     const programTimeSeconds = Number.isFinite(input.programTimeSeconds)
       ? input.programTimeSeconds as number
       : this.predictionElapsedSec;
-    const isCalibrating = programTimeSeconds < input.coldStartSeconds;
+    const isCalibrating = programTimeSeconds < input.coldStartSeconds
+      || input.integrationTime < input.coldStartSeconds;
     const targetGain = isFinite(input.desiredGain ?? NaN)
       ? input.desiredGain as number
       : calculateGainForLoudness(input.controlLufs, input.targetLufs);

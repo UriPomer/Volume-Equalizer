@@ -7,6 +7,7 @@ import { warnFailure } from './logger';
 const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
 
 let audioCtx: AudioContext | null = null;
+const mediaSources = new WeakMap<HTMLMediaElement, MediaElementAudioSourceNode>();
 
 /**
  * 获取或创建全局 AudioContext
@@ -16,6 +17,15 @@ export function ensureAudioContext(): AudioContext {
     audioCtx = new AudioContextClass();
   }
   return audioCtx;
+}
+
+export function ensureMediaSource(media: HTMLMediaElement): MediaElementAudioSourceNode {
+  let source = mediaSources.get(media);
+  if (!source) {
+    source = ensureAudioContext().createMediaElementSource(media);
+    mediaSources.set(media, source);
+  }
+  return source;
 }
 
 /**

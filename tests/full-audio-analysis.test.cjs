@@ -1,7 +1,11 @@
 const assert = require('node:assert/strict');
 const {
+  assertFullAudioDurationComplete,
+  assertEstimatedDecodedAudioBudget,
   calculateFullAudioGain,
+  classifyMediaDuration,
   findBilibiliAudioUrl,
+  FullAudioAnalysisError,
   TruePeakEstimator
 } = require('../dist-test/full-audio-analysis.js');
 
@@ -57,4 +61,29 @@ test('true-peak estimator catches cubic inter-sample overshoot', () => {
     -0.89, -0.89, -0.89, -0.4
   ])]);
   assert.ok(estimator.getPeak() > 0.89);
+});
+
+test('accepts small audio and video duration differences', () => {
+  assert.doesNotThrow(() => assertFullAudioDurationComplete(119, 120));
+});
+
+test('rejects a partially decoded audio track', () => {
+  assert.throws(
+    () => assertFullAudioDurationComplete(90, 120),
+    (error) => error instanceof FullAudioAnalysisError && error.code === 'incomplete'
+  );
+});
+
+test('rejects full-track analysis that would decode beyond memory budget', () => {
+  assert.doesNotThrow(() => assertEstimatedDecodedAudioBudget(5 * 60));
+  assert.throws(
+    () => assertEstimatedDecodedAudioBudget(20 * 60),
+    (error) => error instanceof FullAudioAnalysisError && error.code === 'too-large'
+  );
+});
+
+test('distinguishes metadata wait from unsupported live media', () => {
+  assert.equal(classifyMediaDuration(NaN), 'waiting');
+  assert.equal(classifyMediaDuration(Infinity), 'unsupported');
+  assert.equal(classifyMediaDuration(120), 'ready');
 });

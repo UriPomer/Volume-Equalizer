@@ -4,7 +4,6 @@
 
 export const BRAND = '[Universal Volume EQ]';
 export const PANEL_ID = 'universal-volume-eq-panel';
-export const DATASET_FLAG = 'universalVolumeEqAttached';
 export const TARGET_SELECTOR = 'video, audio';
 
 export interface Settings {
@@ -13,11 +12,6 @@ export interface Settings {
   targetRms: number;
   minGain: number;
   maxGain: number;
-  compressorThreshold: number;
-  compressorKnee: number;
-  compressorRatio: number;
-  compressorAttack: number;
-  compressorRelease: number;
   bassBoost: number;
   gainChangePerSec: number;
   _changedField?: string;
@@ -29,11 +23,6 @@ export const DEFAULT_SETTINGS: Settings = {
   targetRms: 0.09650504109445904,  // 对应 -21 LUFS
   minGain: 0.25,     // 最多衰减约 12 dB，保证高响度内容可接近 -21 LUFS
   maxGain: 2.0,      // 最大增益 (避免失真)
-  compressorThreshold: -20,  // 压缩器阈值 (dB)
-  compressorKnee: 20,        // 压缩器拐点柔和度
-  compressorRatio: 3,        // 压缩比 (3:1)
-  compressorAttack: 0.003,   // 压缩器启动时间 (秒)
-  compressorRelease: 0.3,    // 压缩器释放时间 (秒)
   bassBoost: 0,              // 低频增益 (dB: -6 ~ +6)
   gainChangePerSec: 0.2      // 最大增益变化速度 (x/秒)，慢速调整保留动态
 };

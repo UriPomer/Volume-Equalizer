@@ -1,149 +1,76 @@
-/**
- * 主入口文件 - 协调各模块
- */
-
+import { installGlobalResumeHandlers, isAudioContextSupported } from './audio-context';
 import { DEFAULT_SETTINGS, Settings } from './config';
-import { isAudioContextSupported, installGlobalResumeHandlers } from './audio-context';
-import { loadSettings, persistSettings } from './settings';
 import { MediaVolumeController } from './controller';
-import { scanForMedia, observeMutations } from './media-scanner';
-import { ensurePanel, updatePanelVisibility } from './ui-panel';
-import { eventBus, EVENTS } from './events/index';
 import { errorFailure, warnFailure } from './logger';
+import { observeMutations, scanForMedia } from './media-scanner';
+import { loadSettings, persistSettings } from './settings';
+import { EMPTY_METER_STATE, MeterState } from './types';
+import { ensurePanel, updatePanelVisibility } from './ui-panel';
 
-interface MeterState {
-  rms: number;
-  integratedRms: number;
-  originalRms: number;
-  originalIntegratedRms: number;
-  gain: number;
-  sampleCount: number;
-  originalLufs: number;
-  outputLufs: number;
-  integrationTime: number;
-  analysisStatus: 'realtime' | 'analyzing' | 'full-track' | 'fallback';
-}
-
-function createEmptyMeterState(): MeterState {
-  return {
-    rms: 0,
-    integratedRms: 0,
-    originalRms: 0,
-    originalIntegratedRms: 0,
-    gain: 1,
-    sampleCount: 0,
-    originalLufs: NaN,
-    outputLufs: NaN,
-    integrationTime: 0,
-    analysisStatus: 'realtime'
-  };
-}
-
-// 检查浏览器支持
 if (!isAudioContextSupported()) {
-  warnFailure('audio-context-unsupported', '当前浏览器不支持 AudioContext, 扩展已停用');
+  warnFailure('audio-context-unsupported', '当前浏览器不支持 AudioContext，扩展已停用');
   throw new Error('AudioContext not supported');
 }
 
-// 全局状态
-let settings: Settings = { ...DEFAULT_SETTINGS };
-let meterState: MeterState = createEmptyMeterState();
+let settings = { ...DEFAULT_SETTINGS };
+let meterState = { ...EMPTY_METER_STATE };
+let activeMedia: HTMLMediaElement | null = null;
 const controllers = new Map<HTMLMediaElement, MediaVolumeController>();
 
 installGlobalResumeHandlers();
+loadSettings().then((loaded) => {
+  settings = { ...DEFAULT_SETTINGS, ...loaded };
+  start();
+}).catch((error) => {
+  errorFailure('settings-load', '设置加载失败，使用默认设置', error);
+  start();
+});
 
-// 加载设置并启动
-loadSettings()
-  .then((loaded) => {
-    settings = { ...DEFAULT_SETTINGS, ...loaded };
-    startScanning();
-  })
-  .catch((err) => {
-    errorFailure('settings-load', '设置加载失败，使用默认设置启动', err);
-    startScanning();
-  });
-
-/**
- * 启动媒体元素扫描
- */
-function startScanning(): void {
-  const scanCallback = () => {
-    scanForMedia(
-      (media) => attachController(media),
-      () => cleanupControllers()
-    );
+function start(): void {
+  const scan = () => {
+    scanForMedia(attachController);
+    cleanupControllers();
   };
-
-  scanCallback();
-  observeMutations(scanCallback);
+  scan();
+  observeMutations(scan);
 }
 
-/**
- * 为媒体元素附加控制器
- */
 function attachController(media: HTMLMediaElement): void {
+  if (controllers.has(media)) return;
   const controller = new MediaVolumeController(
     media,
     settings,
     (state) => {
-      meterState = state;
-    }
+      if (activeMedia === media || !activeMedia) {
+        activeMedia = media;
+        meterState = state;
+      }
+    },
+    () => { activeMedia = media; }
   );
   controllers.set(media, controller);
+  ensurePanel(settings, updateSettings, () => meterState);
   updatePanelVisibility(controllers.size);
-  ensurePanel(settings, handleSettingsChange, getMeterState);
 }
 
-/**
- * 清理已断开的控制器
- */
 function cleanupControllers(): void {
-  controllers.forEach((controller, media) => {
-    if (!media.isConnected) {
-      controller.destroy();
-      controllers.delete(media);
-    }
-  });
+  for (const [media, controller] of controllers) {
+    if (media.isConnected) continue;
+    controller.destroy();
+    controllers.delete(media);
+    if (activeMedia === media) activeMedia = null;
+  }
   updatePanelVisibility(controllers.size);
 }
 
-/**
- * 设置改变处理
- */
-function handleSettingsChange(newSettings: Settings): Settings {
-  const changedField = newSettings._changedField;
-  const cleanedSettings = { ...newSettings };
-  delete cleanedSettings._changedField;
-
-  settings = cleanedSettings;
+function updateSettings(next: Settings): Settings {
+  const changedField = next._changedField;
+  const { _changedField: _, ...clean } = next;
+  settings = clean;
   persistSettings(settings);
-
   controllers.forEach((controller) => {
     controller.updateSettings({ ...settings, _changedField: changedField });
   });
-
-  if (!settings.enabled) {
-    controllers.forEach((controller) => {
-      controller.gainNode.gain.value = 1.0;
-    });
-    meterState = createEmptyMeterState();
-  }
-
-  eventBus.emit(EVENTS.SETTINGS_CHANGED, { settings, changedField });
-
+  if (!settings.enabled) meterState = { ...EMPTY_METER_STATE };
   return settings;
 }
-
-/**
- * 获取当前 meter 状态
- */
-function getMeterState() {
-  return meterState;
-}
-
-// 创建 UI 面板（延迟创建，等待第一个媒体元素出现）
-setTimeout(() => {
-  if (controllers.size > 0) {
-    ensurePanel(settings, handleSettingsChange, getMeterState);
-  }
-}, 1000);

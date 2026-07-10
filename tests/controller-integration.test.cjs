@@ -1,0 +1,148 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+
+function loadProcessor() {
+  let Processor = null;
+  const context = {
+    sampleRate: 48000,
+    AudioWorkletProcessor: class {},
+    registerProcessor(name, klass) {
+      assert.equal(name, 'lookahead-peak-limiter');
+      Processor = klass;
+    }
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    fs.readFileSync(path.join(__dirname, '..', 'public', 'limiter-worklet.js'), 'utf8'),
+    context
+  );
+  return Processor;
+}
+
+const ProcessorClass = loadProcessor();
+
+class FakeParam {
+  constructor(value = 0) { this.value = value; }
+  cancelScheduledValues() {}
+  setValueAtTime(value) { this.value = value; }
+}
+
+class FakeNode {
+  constructor() { this.connections = []; }
+  connect(destination, output = 0, input = 0) {
+    this.connections.push({ destination, output, input });
+    return destination;
+  }
+  disconnect() { this.connections = []; }
+}
+
+class FakeAnalyser extends FakeNode {
+  constructor() { super(); this.fftSize = 2048; }
+  getFloatTimeDomainData(buffer) { buffer.fill(0.1); }
+}
+
+class FakeContext {
+  constructor() {
+    this.sampleRate = 48000;
+    this.currentTime = 0;
+    this.state = 'running';
+    this.destination = new FakeNode();
+    this.source = new FakeNode();
+    this.audioWorklet = { addModule: async () => {} };
+  }
+  createMediaElementSource() { return this.source; }
+  createGain() { const node = new FakeNode(); node.gain = new FakeParam(1); return node; }
+  createBiquadFilter() {
+    const node = new FakeNode();
+    node.frequency = new FakeParam();
+    node.gain = new FakeParam();
+    return node;
+  }
+  createDynamicsCompressor() {
+    const node = new FakeNode();
+    for (const key of ['threshold', 'knee', 'ratio', 'attack', 'release']) node[key] = new FakeParam();
+    return node;
+  }
+  createAnalyser() { return new FakeAnalyser(); }
+  resume() { return Promise.resolve(); }
+}
+
+class FakeWorkletNode extends FakeNode {
+  constructor(context, name, options) {
+    super();
+    this.context = context;
+    this.name = name;
+    this.options = options;
+    this.port = { onmessage: null };
+    this.processor = new ProcessorClass(options);
+    this.processor.port = {
+      postMessage: (data) => this.port.onmessage?.({ data })
+    };
+    global.lastWorklet = this;
+  }
+}
+
+class FakeMedia extends EventTarget {
+  constructor() {
+    super();
+    this.duration = 60;
+    this.currentTime = 0;
+    this.paused = false;
+    this.ended = false;
+    this.muted = false;
+  }
+}
+
+const rafCallbacks = [];
+global.window = { AudioContext: FakeContext };
+global.document = {
+  hidden: false,
+  addEventListener() {},
+  removeEventListener() {}
+};
+global.chrome = { runtime: { getURL: (path) => `chrome-extension://test/${path}` } };
+global.AudioWorkletNode = FakeWorkletNode;
+global.requestAnimationFrame = (callback) => { rafCallbacks.push(callback); return rafCallbacks.length; };
+global.cancelAnimationFrame = () => {};
+
+const { MediaVolumeController } = require('../dist-test/controller.js');
+const settings = {
+  enabled: true,
+  fullAudioAnalysis: false,
+  targetRms: 0.09650504109445904,
+  minGain: 0.25,
+  maxGain: 2,
+  bassBoost: 0,
+  gainChangePerSec: 0.2
+};
+
+test('controller connects continuous stereo meter and drives gain state', async () => {
+  const media = new FakeMedia();
+  let state = null;
+  const controller = new MediaVolumeController(media, settings, (next) => { state = next; }, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const worklet = global.lastWorklet;
+  assert.equal(worklet.options.numberOfInputs, 2);
+  assert.equal(worklet.channelCountMode, 'explicit');
+  assert.equal(worklet.channelCount, 2);
+  assert.ok(worklet.context.source.connections.some((item) => item.destination === worklet && item.input === 1));
+
+  for (let index = 0; index < 200; index++) {
+    const original = new Float32Array(128).fill(0.1);
+    const processed = new Float32Array(128).fill(0.1);
+    worklet.processor.process(
+      [[processed, processed], [original, original]],
+      [[new Float32Array(128), new Float32Array(128)]]
+    );
+  }
+  media.currentTime = 1;
+  rafCallbacks[0]();
+
+  assert.ok(state.originalRms > 0);
+  assert.ok(Number.isFinite(state.gain));
+  controller.destroy();
+});

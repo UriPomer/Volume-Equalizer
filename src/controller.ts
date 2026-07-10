@@ -1,691 +1,413 @@
-/**
- * MediaVolumeController - 媒体音量控制器
- * 负责音频信号链管理、响度测量和增益调整
- *
- * 使用 ITU-R BS.1770-4 标准响度测量算法
- */
-
-import { ensureAudioContext } from './audio-context';
-import { clamp, rmsToLufs } from './lufs-calculator';
-import { INTEGRATION_PARAMS, DATASET_FLAG, BRAND, Settings } from './config';
-import { eventBus, EVENTS } from './events/index';
-import { LoudnessMeter, calculateGainForLoudness } from './loudness-meter';
+import { ensureAudioContext, ensureMediaSource } from './audio-context';
+import { INTEGRATION_PARAMS, Settings } from './config';
+import { analyzeFullAudio, calculateFullAudioGain, classifyMediaDuration, FullAudioAnalysisError, FullAudioAnalysisResult } from './full-audio-analysis';
 import { RealtimeAgc, chooseControlLoudness } from './gain-control';
-import { warnFailure } from './logger';
-import {
-  analyzeFullAudio,
-  calculateFullAudioGain,
-  FullAudioAnalysisResult
-} from './full-audio-analysis';
+import { logDiagnostic, warnFailure } from './logger';
+import { LoudnessMeter, calculateGainForLoudness } from './loudness-meter';
+import { clamp, lufsToRms, rmsToLufs } from './lufs-calculator';
+import { AnalysisStatus, MeterState } from './types';
 
-type AnalysisStatus = 'realtime' | 'analyzing' | 'full-track' | 'fallback';
+type MeterMessage = {
+  type: 'meter';
+  original: Float32Array[];
+  output: Float32Array[];
+};
 
-interface MeterState {
-  rms: number;
-  integratedRms: number;
-  originalRms: number;
-  originalIntegratedRms: number;
-  gain: number;
-  sampleCount: number;
-  originalLufs: number;
-  outputLufs: number;
-  integrationTime: number;
-  analysisStatus: AnalysisStatus;
-}
+let processorModulePromise: Promise<void> | null = null;
 
-type MeterStateCallback = (state: MeterState) => void;
-
-let lookaheadLimiterModulePromise: Promise<void> | null = null;
-
-function loadLookaheadLimiterModule(ctx: AudioContext, workletUrl: string): Promise<void> {
-  if (!lookaheadLimiterModulePromise) {
-    lookaheadLimiterModulePromise = ctx.audioWorklet.addModule(workletUrl).catch((error) => {
-      lookaheadLimiterModulePromise = null;
-      throw error;
-    });
-  }
-  return lookaheadLimiterModulePromise;
+function loadProcessorModule(context: AudioContext, url: string): Promise<void> {
+  return processorModulePromise ??= context.audioWorklet.addModule(url).catch((error) => {
+    processorModulePromise = null;
+    throw error;
+  });
 }
 
 export class MediaVolumeController {
-  private media: HTMLMediaElement;
+  private readonly media: HTMLMediaElement;
+  private readonly onMeter: (state: MeterState) => void;
+  private readonly onActivate: () => void;
   private settings: Settings;
-  private meterStateCallback: MeterStateCallback;
-  private rafId = 0;
-  private processingEnabled: boolean | null = null;
-  private lastTickTime = performance.now();
-  private agc = new RealtimeAgc();
-
-  // ITU-R BS.1770-4 标准响度测量器
+  private readonly context: AudioContext;
+  private readonly source: MediaElementAudioSourceNode;
+  private readonly gain: GainNode;
+  private readonly bass: BiquadFilterNode;
+  private readonly fallbackLimiter: DynamicsCompressorNode;
+  private readonly fallbackAnalyser: AnalyserNode;
+  private readonly fallbackBuffer: Float32Array<ArrayBuffer>;
+  private processor: AudioWorkletNode | null = null;
   private originalMeter: LoudnessMeter;
   private outputMeter: LoudnessMeter;
-
-  // Web Audio 节点
-  private audioContext!: AudioContext;
-  private sourceNode!: MediaElementAudioSourceNode;
-  private compressor!: DynamicsCompressorNode;
-  gainNode!: GainNode;
-  private originalAnalyser!: AnalyserNode;
-  private originalBuffer!: Float32Array<ArrayBuffer>;
-  private originalSplitter!: ChannelSplitterNode;
-  private originalChannelAnalysers: AnalyserNode[] = [];
-  private originalChannelBuffers: Float32Array<ArrayBuffer>[] = [];
-  private analyser!: AnalyserNode;
-  private buffer!: Float32Array<ArrayBuffer>;
-  private outputSplitter!: ChannelSplitterNode;
-  private outputChannelAnalysers: AnalyserNode[] = [];
-  private outputChannelBuffers: Float32Array<ArrayBuffer>[] = [];
-  private bassFilter!: BiquadFilterNode;
-  private fallbackLimiter!: DynamicsCompressorNode;
-  private workletLimiter: AudioWorkletNode | null = null;
-  private destroyed = false;
-  private fullAnalysisAbort: AbortController | null = null;
-  private fullAnalysisResult: FullAudioAnalysisResult | null = null;
+  private agc = new RealtimeAgc();
   private analysisStatus: AnalysisStatus = 'realtime';
+  private analysisAbort: AbortController | null = null;
+  private analysisResult: FullAudioAnalysisResult | null = null;
+  private originalRms = 0;
+  private outputRms = 0;
+  private originalPeak = 0;
+  private rafId = 0;
+  private lastTickAt = performance.now();
+  private destroyed = false;
 
-  // 事件处理器引用（用于移除）
-  private handleEmptied!: () => void;
-  private handleSeeked!: () => void;
-  private handlePlay!: () => void;
-  private handlePause!: () => void;
-  private handleLoadedMetadata!: () => void;
-  private handleVisibilityChange!: () => void;
+  private readonly onEmptied = () => {
+    this.cancelAnalysis();
+    this.analysisResult = null;
+    this.analysisStatus = this.settings.fullAudioAnalysis ? 'waiting-metadata' : 'realtime';
+    this.setGain(1);
+    this.resetMeters();
+  };
 
-  constructor(media: HTMLMediaElement, settings: Settings, meterStateCallback: MeterStateCallback) {
+  private readonly onPlay = () => {
+    this.onActivate();
+    this.context.resume().catch((error) => {
+      warnFailure('media-play-resume', 'AudioContext play resume failed', error);
+    });
+    this.startAnalysis();
+  };
+
+  private readonly onLoadedMetadata = () => this.startAnalysis();
+  private readonly onVisibility = () => { this.lastTickAt = performance.now(); };
+
+  constructor(
+    media: HTMLMediaElement,
+    settings: Settings,
+    onMeter: (state: MeterState) => void,
+    onActivate: () => void
+  ) {
     this.media = media;
     this.settings = settings;
-    this.meterStateCallback = meterStateCallback;
-
-    this.originalMeter = new LoudnessMeter(48000);
-    this.outputMeter = new LoudnessMeter(48000);
-
-    this.initAudioNodes();
-    this.bindEventListeners();
-    this.startFullAudioAnalysis();
-
-    this.tick = this.tick.bind(this);
-    this.rafId = requestAnimationFrame(this.tick);
-  }
-
-  /**
-   * 初始化 Web Audio API 节点
-   */
-  private initAudioNodes(): void {
-    const ctx = ensureAudioContext();
-    this.audioContext = ctx;
-
-    this.sourceNode = ctx.createMediaElementSource(this.media);
-    this.compressor = ctx.createDynamicsCompressor();
-    this.gainNode = ctx.createGain();
-
-    this.originalAnalyser = ctx.createAnalyser();
-    this.originalAnalyser.fftSize = 2048;
-    this.originalBuffer = new Float32Array(this.originalAnalyser.fftSize);
-    this.originalSplitter = ctx.createChannelSplitter(2);
-    this.originalChannelAnalysers = this.createChannelAnalysers(ctx);
-    this.originalChannelBuffers = this.originalChannelAnalysers.map((analyser) => new Float32Array(analyser.fftSize));
-
-    this.analyser = ctx.createAnalyser();
-    this.analyser.fftSize = 2048;
-    this.buffer = new Float32Array(this.analyser.fftSize);
-    this.outputSplitter = ctx.createChannelSplitter(2);
-    this.outputChannelAnalysers = this.createChannelAnalysers(ctx);
-    this.outputChannelBuffers = this.outputChannelAnalysers.map((analyser) => new Float32Array(analyser.fftSize));
-
-    this.bassFilter = ctx.createBiquadFilter();
-    this.bassFilter.type = 'lowshelf';
-    this.bassFilter.frequency.value = 200;
-    this.bassFilter.gain.value = this.settings.bassBoost;
-
-    this.fallbackLimiter = ctx.createDynamicsCompressor();
-    this.applyLimiter();
-    this.initLookaheadLimiter();
-
-    this.originalMeter = new LoudnessMeter(ctx.sampleRate);
-    this.outputMeter = new LoudnessMeter(ctx.sampleRate);
-
-    this.applyCompressor();
-    this.setProcessingEnabled(this.settings.enabled);
-  }
-
-  /**
-   * 绑定媒体事件监听器
-   */
-  private bindEventListeners(): void {
-    this.handleEmptied = () => {
-      eventBus.emit(EVENTS.MEDIA_EMPTIED, { media: this.media });
-      this.resetGain();
-      this.cancelFullAudioAnalysis();
-      this.fullAnalysisResult = null;
-      this.analysisStatus = this.settings.fullAudioAnalysis ? 'analyzing' : 'realtime';
-    };
-
-    this.handleSeeked = () => {
-      eventBus.emit(EVENTS.MEDIA_SEEKED, { media: this.media });
-    };
-
-    this.handlePlay = () => {
-      eventBus.emit(EVENTS.MEDIA_PLAY, { media: this.media });
-      try {
-        const ctx = ensureAudioContext();
-        if (ctx.state === 'suspended') {
-          ctx.resume().catch((err) => {
-            warnFailure('media-play-resume', 'AudioContext play resume failed', err);
-          });
-        }
-        this.startFullAudioAnalysis();
-      } catch (err) {
-        warnFailure('media-play-handler', 'Media play handler failed', err);
-      }
-    };
-
-    this.handlePause = () => {
-      eventBus.emit(EVENTS.MEDIA_PAUSE, { media: this.media });
-    };
-
-    this.handleLoadedMetadata = () => this.startFullAudioAnalysis();
-
-    this.media.addEventListener('emptied', this.handleEmptied);
-    this.media.addEventListener('seeked', this.handleSeeked);
-    this.media.addEventListener('play', this.handlePlay);
-    this.media.addEventListener('pause', this.handlePause);
-    this.media.addEventListener('loadedmetadata', this.handleLoadedMetadata);
-
-    this.handleVisibilityChange = () => {
-      this.freezeGain();
-      this.lastTickTime = performance.now();
-    };
-    document.addEventListener('visibilitychange', this.handleVisibilityChange);
-  }
-
-  /**
-   * 应用压缩器设置
-   */
-  private applyCompressor(): void {
-    this.compressor.threshold.value = this.settings.compressorThreshold;
-    this.compressor.knee.value = this.settings.compressorKnee;
-    this.compressor.ratio.value = this.settings.compressorRatio;
-    this.compressor.attack.value = this.settings.compressorAttack;
-    this.compressor.release.value = this.settings.compressorRelease;
-  }
-
-  private applyLimiter(): void {
+    this.onMeter = onMeter;
+    this.onActivate = onActivate;
+    this.context = ensureAudioContext();
+    this.source = ensureMediaSource(media);
+    this.gain = this.context.createGain();
+    this.bass = this.context.createBiquadFilter();
+    this.bass.type = 'lowshelf';
+    this.bass.frequency.value = 200;
+    this.bass.gain.value = settings.bassBoost;
+    this.fallbackLimiter = this.context.createDynamicsCompressor();
     this.fallbackLimiter.threshold.value = -1;
     this.fallbackLimiter.knee.value = 0;
     this.fallbackLimiter.ratio.value = 20;
     this.fallbackLimiter.attack.value = 0.001;
     this.fallbackLimiter.release.value = 0.05;
-  }
+    this.fallbackAnalyser = this.context.createAnalyser();
+    this.fallbackAnalyser.fftSize = 2048;
+    this.fallbackBuffer = new Float32Array(this.fallbackAnalyser.fftSize);
+    this.originalMeter = new LoudnessMeter(this.context.sampleRate);
+    this.outputMeter = new LoudnessMeter(this.context.sampleRate);
 
-  private initLookaheadLimiter(): void {
-    const workletUrl = this.getExtensionUrl('limiter-worklet.js');
-    if (!workletUrl || !this.audioContext.audioWorklet || typeof AudioWorkletNode === 'undefined') {
-      return;
-    }
-
-    loadLookaheadLimiterModule(this.audioContext, workletUrl)
-      .then(() => {
-        if (this.destroyed) return;
-        const limiter = new AudioWorkletNode(this.audioContext, 'lookahead-peak-limiter', {
-          numberOfInputs: 1,
-          numberOfOutputs: 1,
-          outputChannelCount: [2],
-          processorOptions: {
-            lookaheadMs: 15,
-            releaseMs: 50,
-            ceiling: 0.8912509381337456,
-            interSampleMargin: 1.03
-          }
-        });
-        limiter.onprocessorerror = (event) => {
-          warnFailure('lookahead-limiter-processor', 'Lookahead limiter processor failed', event);
-        };
-        this.workletLimiter = limiter;
-        this.reconnectCurrentChain();
-      })
-      .catch((error) => {
-        warnFailure('lookahead-limiter-load', 'Lookahead limiter load failed; using compressor fallback', error);
-      });
-  }
-
-  private getExtensionUrl(path: string): string | null {
-    try {
-      if (typeof chrome !== 'undefined' && chrome.runtime?.getURL) {
-        return chrome.runtime.getURL(path);
-      }
-    } catch (error) {
-      warnFailure('extension-url', 'Failed to resolve extension asset URL', error);
-    }
-    return null;
-  }
-
-  private setProcessingEnabled(enabled: boolean): void {
-    if (this.processingEnabled === enabled) return;
-    this.processingEnabled = enabled;
-
-    if (enabled) {
-      this.connectProcessingChain();
-    } else {
-      this.connectBypassChain();
-      this.gainNode.gain.value = 1.0;
-    }
-  }
-
-  private disconnectNodes(): void {
-    this.safeDisconnect(this.sourceNode);
-    this.safeDisconnect(this.compressor);
-    this.safeDisconnect(this.originalAnalyser);
-    this.safeDisconnect(this.originalSplitter);
-    this.originalChannelAnalysers.forEach((node) => this.safeDisconnect(node));
-    this.safeDisconnect(this.gainNode);
-    this.safeDisconnect(this.bassFilter);
-    this.safeDisconnect(this.fallbackLimiter);
-    if (this.workletLimiter) this.safeDisconnect(this.workletLimiter);
-    this.safeDisconnect(this.analyser);
-    this.safeDisconnect(this.outputSplitter);
-    this.outputChannelAnalysers.forEach((node) => this.safeDisconnect(node));
-  }
-
-  private safeDisconnect(node: AudioNode): void {
-    try {
-      node.disconnect();
-    } catch {
-      // Nodes may already be disconnected during worklet hot-swap or teardown.
-    }
-  }
-
-  private reconnectCurrentChain(): void {
-    if (this.processingEnabled) {
-      this.connectProcessingChain();
-    } else {
-      this.connectBypassChain();
-    }
-  }
-
-  private connectProcessingChain(): void {
-    this.disconnectNodes();
-    this.sourceNode.connect(this.originalAnalyser);
-    this.originalAnalyser.connect(this.compressor);
-    this.originalAnalyser.connect(this.originalSplitter);
-    this.connectSplitter(this.originalSplitter, this.originalChannelAnalysers);
-    this.compressor.connect(this.gainNode);
-    this.gainNode.connect(this.bassFilter);
-    const limiter = this.workletLimiter ?? this.fallbackLimiter;
-    this.bassFilter.connect(limiter);
-    limiter.connect(this.analyser);
-    this.analyser.connect(this.outputSplitter);
-    this.connectSplitter(this.outputSplitter, this.outputChannelAnalysers);
-    this.analyser.connect(this.audioContext.destination);
-  }
-
-  private connectBypassChain(): void {
-    this.disconnectNodes();
-    this.sourceNode.connect(this.originalAnalyser);
-    this.originalAnalyser.connect(this.originalSplitter);
-    this.connectSplitter(this.originalSplitter, this.originalChannelAnalysers);
-    this.originalAnalyser.connect(this.analyser);
-    this.analyser.connect(this.outputSplitter);
-    this.connectSplitter(this.outputSplitter, this.outputChannelAnalysers);
-    this.analyser.connect(this.audioContext.destination);
-  }
-
-  private createChannelAnalysers(ctx: AudioContext): AnalyserNode[] {
-    return [ctx.createAnalyser(), ctx.createAnalyser()].map((analyser) => {
-      analyser.fftSize = 2048;
-      return analyser;
-    });
-  }
-
-  private connectSplitter(splitter: ChannelSplitterNode, analysers: AnalyserNode[]): void {
-    for (let channel = 0; channel < analysers.length; channel++) {
-      splitter.connect(analysers[channel], channel);
-    }
-  }
-
-  /**
-   * 更新设置
-   */
-  updateSettings(newSettings: Settings): void {
-    const { _changedField, ...restSettings } = newSettings;
-    const targetChanged = _changedField === 'targetLufs';
-    const analysisModeChanged = _changedField === 'fullAudioAnalysis';
-    const wasEnabled = this.settings.enabled;
-
-    this.settings = restSettings;
-
-    this.applyCompressor();
-    this.bassFilter.gain.value = restSettings.bassBoost;
-    if (wasEnabled !== restSettings.enabled) {
-      this.setProcessingEnabled(restSettings.enabled);
-    }
-
-    if (targetChanged) {
-      this.agc.reset();
-      this.resetOutputIntegration();
-    }
-    if (analysisModeChanged) {
-      if (restSettings.fullAudioAnalysis) {
-        this.startFullAudioAnalysis();
-      } else {
-        this.cancelFullAudioAnalysis();
-        this.fullAnalysisResult = null;
-        this.analysisStatus = 'realtime';
-        this.resetIntegration();
-      }
-    }
-  }
-
-  private startFullAudioAnalysis(): void {
-    if (
-      !this.settings.fullAudioAnalysis ||
-      this.destroyed ||
-      this.fullAnalysisAbort ||
-      this.fullAnalysisResult
-    ) return;
-
-    const abort = new AbortController();
-    this.fullAnalysisAbort = abort;
-    this.analysisStatus = 'analyzing';
-
-    analyzeFullAudio(this.media, this.audioContext, abort.signal)
-      .then((result) => {
-        if (this.destroyed || abort.signal.aborted) return;
-        this.fullAnalysisResult = result;
-        this.analysisStatus = this.agc.isLocked() ? 'fallback' : 'analyzing';
-      })
-      .catch((error) => {
-        if (abort.signal.aborted) return;
-        this.analysisStatus = 'fallback';
-        warnFailure('full-audio-analysis', '完整音轨分析失败，继续使用实时算法', error);
-      })
-      .finally(() => {
-        if (this.fullAnalysisAbort === abort) this.fullAnalysisAbort = null;
-      });
-  }
-
-  private cancelFullAudioAnalysis(): void {
-    this.fullAnalysisAbort?.abort();
-    this.fullAnalysisAbort = null;
-  }
-
-  /**
-   * 重置增益到 1.0 并清空积分历史
-   */
-  private resetGain(): void {
-    this.setGainImmediate(1);
-    this.resetIntegration();
-  }
-
-  /**
-   * 重置积分历史
-   */
-  private resetIntegration(): void {
-    this.originalMeter.reset();
-    this.outputMeter.reset();
-    this.agc.reset();
-  }
-
-  private setGainImmediate(gain: number): void {
-    const clampedGain = clamp(gain, this.settings.minGain, this.settings.maxGain);
-    this.gainNode.gain.cancelScheduledValues(this.audioContext.currentTime);
-    this.gainNode.gain.setValueAtTime(clampedGain, this.audioContext.currentTime);
-    this.gainNode.gain.value = clampedGain;
-  }
-
-  private freezeGain(): void {
-    this.setGainImmediate(this.gainNode.gain.value);
-  }
-
-  /**
-   * 只重置输出响度的积分历史
-   */
-  private resetOutputIntegration(): void {
-    this.outputMeter.reset();
-
-    const currentRms = this.measureRms();
-    const originalRms = this.measureOriginalRms();
-    this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
-  }
-
-  /**
-   * 测量输出 RMS
-   */
-  private measureRms(): number {
-    this.analyser.getFloatTimeDomainData(this.buffer);
-    let sum = 0;
-    for (let i = 0; i < this.buffer.length; i++) {
-      const sample = this.buffer[i];
-      sum += sample * sample;
-    }
-    return Math.sqrt(sum / this.buffer.length);
-  }
-
-  /**
-   * 测量原始 RMS (压缩和增益前)
-   */
-  private measureOriginalRms(): number {
-    this.originalAnalyser.getFloatTimeDomainData(this.originalBuffer);
-    let sum = 0;
-    for (let i = 0; i < this.originalBuffer.length; i++) {
-      const sample = this.originalBuffer[i];
-      sum += sample * sample;
-    }
-    return Math.sqrt(sum / this.originalBuffer.length);
-  }
-
-  private measureOriginalPeak(): number {
-    let peak = 0;
-    for (let channel = 0; channel < this.originalChannelBuffers.length; channel++) {
-      const buffer = this.originalChannelBuffers[channel];
-      for (let i = 0; i < buffer.length; i++) {
-        const sample = Math.abs(buffer[i]);
-        if (sample > peak) peak = sample;
-      }
-    }
-    return peak;
-  }
-
-  /**
-   * 更新 ITU-R BS.1770-4 响度测量
-   */
-  private updateLoudnessMeasurement(): void {
-    const silenceThreshold = INTEGRATION_PARAMS.silenceThreshold;
-
-    let hasOriginalAudio = false;
-    let hasOutputAudio = false;
-
-    for (const buffer of this.originalChannelBuffers) {
-      for (let i = 0; i < buffer.length; i++) {
-        if (Math.abs(buffer[i]) > silenceThreshold) {
-          hasOriginalAudio = true;
-          break;
-        }
-      }
-      if (hasOriginalAudio) break;
-    }
-
-    for (const buffer of this.outputChannelBuffers) {
-      for (let i = 0; i < buffer.length; i++) {
-        if (Math.abs(buffer[i]) > silenceThreshold) {
-          hasOutputAudio = true;
-          break;
-        }
-      }
-      if (hasOutputAudio) break;
-    }
-
-    if (hasOriginalAudio) {
-      this.originalMeter.processChannels(this.originalChannelBuffers);
-    }
-    if (hasOutputAudio) {
-      this.outputMeter.processChannels(this.outputChannelBuffers);
-    }
-  }
-
-  /**
-   * 主循环 - 测量响度并调整增益
-   */
-  private tick(): void {
-    if (!document.contains(this.media)) {
-      this.destroy();
-      return;
-    }
-
-    if (document.hidden) {
-      this.freezeGain();
-      this.lastTickTime = performance.now();
-      this.rafId = requestAnimationFrame(this.tick);
-      return;
-    }
-
-    const now = performance.now();
-    const deltaSec = Math.max(0.001, Math.min((now - this.lastTickTime) / 1000, 0.25));
-    this.lastTickTime = now;
-
-    this.originalAnalyser.getFloatTimeDomainData(this.originalBuffer);
-    this.analyser.getFloatTimeDomainData(this.buffer);
-    this.readChannelData(this.originalChannelAnalysers, this.originalChannelBuffers);
-    this.readChannelData(this.outputChannelAnalysers, this.outputChannelBuffers);
-
-    const currentRms = this.measureRms();
-    const originalRms = this.measureOriginalRms();
-    const originalPeak = this.measureOriginalPeak();
-
-    this.updateLoudnessMeasurement();
-
-    if (this.settings.enabled && !this.media.muted && !this.media.paused && !this.media.ended) {
-      const originalLufs = this.originalMeter.getIntegratedLoudness();
-      const outputLufs = this.outputMeter.getIntegratedLoudness();
-      const integrationTime = this.originalMeter.getIntegrationTime();
-      const momentaryLufs = this.originalMeter.getMomentaryLoudness();
-      const shortTermLufs = this.originalMeter.getShortTermLoudness();
-      const controlLufs = chooseControlLoudness({
-        integratedLufs: originalLufs,
-        shortTermLufs,
-        momentaryLufs,
-        integrationTime,
-        minIntegrationSeconds: INTEGRATION_PARAMS.minIntegrationSeconds
-      });
-
-      if (isFinite(controlLufs)) {
-        const targetLufs = rmsToLufs(this.settings.targetRms);
-        if (this.settings.fullAudioAnalysis && this.fullAnalysisResult) {
-          const fixedGain = calculateFullAudioGain(
-            this.fullAnalysisResult,
-            targetLufs,
-            this.settings.minGain,
-            this.settings.maxGain
-          );
-          if (!this.agc.isLocked()) {
-            this.agc.lockGain(fixedGain);
-            this.analysisStatus = 'full-track';
-            this.setGainImmediate(fixedGain);
-            this.updateMeterState(
-              currentRms,
-              originalRms,
-              fixedGain,
-              this.fullAnalysisResult.integratedLufs,
-              outputLufs
-            );
-            this.rafId = requestAnimationFrame(this.tick);
-            return;
-          }
-        }
-        const idealGain = calculateGainForLoudness(controlLufs, targetLufs);
-        const agcResult = this.agc.update({
-          currentGain: this.gainNode.gain.value,
-          desiredGain: idealGain,
-          minGain: this.settings.minGain,
-          maxGain: this.settings.maxGain,
-          deltaSec,
-          controlLufs,
-          targetLufs,
-          integrationTime,
-          coldStartSeconds: INTEGRATION_PARAMS.coldStartSeconds,
-          sourcePeak: originalPeak,
-          momentaryLufs,
-          shortTermLufs,
-          gainChangePerSec: this.settings.gainChangePerSec,
-          programTimeSeconds: this.media.currentTime
-        });
-        const nextGain = agcResult.nextGain;
-
-        this.setGainImmediate(nextGain);
-
-        const displayOriginalLufs = isFinite(originalLufs) ? originalLufs : controlLufs;
-        this.updateMeterState(currentRms, originalRms, nextGain, displayOriginalLufs, outputLufs);
-      } else {
-        this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
-      }
-    } else if (!this.settings.enabled) {
-      this.setGainImmediate(1.0);
-      this.updateMeterState(originalRms, originalRms, 1, null, null, true);
-    } else {
-      this.updateMeterState(currentRms, originalRms, this.gainNode.gain.value);
-    }
-
+    this.bindEvents();
+    this.connectGraph();
+    this.loadProcessor();
+    this.startAnalysis();
+    if (!media.paused) this.onActivate();
+    this.tick = this.tick.bind(this);
     this.rafId = requestAnimationFrame(this.tick);
   }
 
-  private readChannelData(analysers: AnalyserNode[], buffers: Float32Array<ArrayBuffer>[]): void {
-    for (let channel = 0; channel < analysers.length; channel++) {
-      analysers[channel].getFloatTimeDomainData(buffers[channel]);
+  updateSettings(next: Settings): void {
+    const changed = next._changedField;
+    const wasEnabled = this.settings.enabled;
+    const { _changedField: _, ...clean } = next;
+    this.settings = clean;
+    this.bass.gain.value = clean.bassBoost;
+    if (wasEnabled !== clean.enabled) this.connectGraph();
+
+    const boundsChanged = changed === 'minGain' || changed === 'maxGain';
+    if (changed === 'targetLufs') {
+      this.outputMeter.reset();
+      if (clean.fullAudioAnalysis && this.analysisResult) this.applyFullTrackGain();
+      else this.agc.reset();
+    }
+    if (boundsChanged) {
+      if (clean.fullAudioAnalysis && this.analysisResult) this.applyFullTrackGain();
+      else this.agc.unlockGain(this.gain.gain.value, clean.minGain, clean.maxGain);
+      this.setGain(this.gain.gain.value);
+    }
+    if (changed !== 'fullAudioAnalysis') return;
+
+    if (clean.fullAudioAnalysis) {
+      logDiagnostic('完整音轨模式：开启', this.diagnosticState());
+      this.startAnalysis();
+      return;
+    }
+    this.cancelAnalysis();
+    this.analysisResult = null;
+    if (this.agc.isLocked()) {
+      this.agc.unlockGain(this.gain.gain.value, clean.minGain, clean.maxGain);
+    }
+    this.analysisStatus = 'realtime';
+    logDiagnostic('完整音轨模式：关闭，保留实时状态', this.diagnosticState());
+  }
+
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    cancelAnimationFrame(this.rafId);
+    this.cancelAnalysis();
+    this.media.removeEventListener('emptied', this.onEmptied);
+    this.media.removeEventListener('play', this.onPlay);
+    this.media.removeEventListener('loadedmetadata', this.onLoadedMetadata);
+    document.removeEventListener('visibilitychange', this.onVisibility);
+    if (this.processor) this.processor.port.onmessage = null;
+    this.disconnectGraph();
+  }
+
+  private bindEvents(): void {
+    this.media.addEventListener('emptied', this.onEmptied);
+    this.media.addEventListener('play', this.onPlay);
+    this.media.addEventListener('loadedmetadata', this.onLoadedMetadata);
+    document.addEventListener('visibilitychange', this.onVisibility);
+  }
+
+  private loadProcessor(): void {
+    const url = chrome.runtime.getURL('limiter-worklet.js');
+    loadProcessorModule(this.context, url).then(() => {
+      if (this.destroyed) return;
+      const node = new AudioWorkletNode(this.context, 'lookahead-peak-limiter', {
+        numberOfInputs: 2,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+        processorOptions: {
+          lookaheadMs: 15,
+          releaseMs: 50,
+          ceiling: 0.8912509381337456,
+          interSampleMargin: 1.03
+        }
+      });
+      node.channelCount = 2;
+      node.channelCountMode = 'explicit';
+      node.channelInterpretation = 'speakers';
+      node.port.onmessage = (event: MessageEvent<MeterMessage>) => {
+        if (event.data?.type === 'meter') this.consumeAudio(event.data);
+      };
+      node.onprocessorerror = (error) => {
+        warnFailure('audio-processor', 'Audio processor failed', error);
+        if (this.processor === node) {
+          node.port.onmessage = null;
+          try { node.disconnect(); } catch { /* already disconnected */ }
+          this.processor = null;
+          this.connectGraph();
+        }
+      };
+      this.processor = node;
+      this.connectGraph();
+    }).catch((error) => {
+      warnFailure('audio-processor-load', 'AudioWorklet load failed; using snapshot fallback', error);
+    });
+  }
+
+  private connectGraph(): void {
+    this.disconnectGraph();
+    if (!this.settings.enabled) {
+      this.source.connect(this.context.destination);
+      return;
+    }
+    if (this.processor) {
+      this.source.connect(this.gain);
+      this.gain.connect(this.bass);
+      this.bass.connect(this.processor, 0, 0);
+      this.source.connect(this.processor, 0, 1);
+      this.processor.connect(this.context.destination);
+      return;
+    }
+    this.source.connect(this.fallbackAnalyser);
+    this.fallbackAnalyser.connect(this.gain);
+    this.gain.connect(this.bass);
+    this.bass.connect(this.fallbackLimiter);
+    this.fallbackLimiter.connect(this.context.destination);
+  }
+
+  private disconnectGraph(): void {
+    for (const node of [
+      this.source,
+      this.gain,
+      this.bass,
+      this.fallbackLimiter,
+      this.fallbackAnalyser,
+      this.processor
+    ]) {
+      try { node?.disconnect(); } catch { /* already disconnected */ }
     }
   }
 
-  /**
-   * 更新 meter 状态（用于 UI 显示）
-   */
-  private updateMeterState(
-    currentRms: number,
-    originalRms: number,
-    gain: number,
-    originalLufs: number | null = null,
-    outputLufs: number | null = null,
-    disabled = false
-  ): void {
-    if (originalLufs === null) {
-      originalLufs = this.originalMeter.getIntegratedLoudness();
-    }
-    if (outputLufs === null) {
-      outputLufs = this.outputMeter.getIntegratedLoudness();
-    }
+  private consumeAudio(message: MeterMessage): void {
+    if (this.destroyed || !message.original.length) return;
+    this.originalMeter.processChannels(message.original);
+    this.outputMeter.processChannels(message.output);
+    this.originalRms = channelRms(message.original);
+    this.outputRms = channelRms(message.output);
+    this.originalPeak = channelPeak(message.original);
+  }
 
-    const integratedRms = isFinite(outputLufs)
-      ? Math.pow(10, (outputLufs + 0.691) / 20)
-      : currentRms;
-    const originalIntegratedRms = isFinite(originalLufs)
-      ? Math.pow(10, (originalLufs + 0.691) / 20)
-      : originalRms;
+  private sampleFallback(): void {
+    this.fallbackAnalyser.getFloatTimeDomainData(this.fallbackBuffer);
+    this.originalMeter.processBlock(this.fallbackBuffer);
+    this.originalRms = channelRms([this.fallbackBuffer]);
+    this.outputRms = this.originalRms * this.gain.gain.value;
+    this.originalPeak = channelPeak([this.fallbackBuffer]);
+    for (let index = 0; index < this.fallbackBuffer.length; index++) {
+      this.fallbackBuffer[index] *= this.gain.gain.value;
+    }
+    this.outputMeter.processBlock(this.fallbackBuffer);
+  }
 
-    this.meterStateCallback({
-      rms: disabled ? originalRms : currentRms,
-      integratedRms: disabled ? originalIntegratedRms : integratedRms,
-      originalRms,
-      originalIntegratedRms,
-      gain,
+  private tick(): void {
+    if (this.destroyed) return;
+    const now = performance.now();
+    const deltaSec = clamp((now - this.lastTickAt) / 1000, 0.001, 0.25);
+    this.lastTickAt = now;
+
+    if (!document.hidden && this.settings.enabled && !this.processor) this.sampleFallback();
+    if (this.settings.enabled && !this.media.muted && !this.media.paused && !this.media.ended) {
+      this.updateGain(deltaSec);
+    }
+    this.emitMeter();
+    this.rafId = requestAnimationFrame(this.tick);
+  }
+
+  private updateGain(deltaSec: number): void {
+    const integratedLufs = this.originalMeter.getIntegratedLoudness();
+    const integrationTime = this.originalMeter.getIntegrationTime();
+    const momentaryLufs = this.originalMeter.getMomentaryLoudness();
+    const shortTermLufs = this.originalMeter.getShortTermLoudness();
+    const controlLufs = chooseControlLoudness({
+      integratedLufs,
+      shortTermLufs,
+      momentaryLufs,
+      integrationTime,
+      minIntegrationSeconds: INTEGRATION_PARAMS.minIntegrationSeconds
+    });
+    if (!Number.isFinite(controlLufs)) return;
+
+    const targetLufs = rmsToLufs(this.settings.targetRms);
+    const result = this.agc.update({
+      currentGain: this.gain.gain.value,
+      desiredGain: calculateGainForLoudness(controlLufs, targetLufs),
+      minGain: this.settings.minGain,
+      maxGain: this.settings.maxGain,
+      deltaSec,
+      controlLufs,
+      targetLufs,
+      integrationTime,
+      coldStartSeconds: INTEGRATION_PARAMS.coldStartSeconds,
+      sourcePeak: this.originalPeak,
+      momentaryLufs,
+      shortTermLufs,
+      gainChangePerSec: this.settings.gainChangePerSec,
+      programTimeSeconds: this.media.currentTime
+    });
+    this.setGain(result.nextGain);
+  }
+
+  private emitMeter(): void {
+    const originalLufs = this.originalMeter.getIntegratedLoudness();
+    const outputLufs = this.outputMeter.getIntegratedLoudness();
+    this.onMeter({
+      rms: this.settings.enabled ? this.outputRms : this.originalRms,
+      integratedRms: Number.isFinite(outputLufs) ? lufsToRms(outputLufs) : this.outputRms,
+      originalRms: this.originalRms,
+      originalIntegratedRms: Number.isFinite(originalLufs)
+        ? lufsToRms(originalLufs)
+        : this.originalRms,
+      gain: this.settings.enabled ? this.gain.gain.value : 1,
       sampleCount: Math.floor(this.originalMeter.getIntegrationTime()),
-      originalLufs,
-      outputLufs,
-      integrationTime: this.originalMeter.getIntegrationTime(),
       analysisStatus: this.analysisStatus
     });
   }
 
-  /**
-   * 销毁控制器并清理资源
-   */
-  destroy(): void {
-    this.destroyed = true;
-    cancelAnimationFrame(this.rafId);
-    this.media.removeEventListener('emptied', this.handleEmptied);
-    this.media.removeEventListener('seeked', this.handleSeeked);
-    this.media.removeEventListener('play', this.handlePlay);
-    this.media.removeEventListener('pause', this.handlePause);
-    this.media.removeEventListener('loadedmetadata', this.handleLoadedMetadata);
-    document.removeEventListener('visibilitychange', this.handleVisibilityChange);
-    this.cancelFullAudioAnalysis();
-    this.disconnectNodes();
-    delete (this.media.dataset as Record<string, string | undefined>)[DATASET_FLAG];
+  private setGain(value: number): void {
+    const gain = clamp(value, this.settings.minGain, this.settings.maxGain);
+    this.gain.gain.cancelScheduledValues(this.context.currentTime);
+    this.gain.gain.setValueAtTime(gain, this.context.currentTime);
   }
+
+  private resetMeters(): void {
+    this.originalMeter.reset();
+    this.outputMeter.reset();
+    this.agc.reset();
+    this.originalRms = this.outputRms = this.originalPeak = 0;
+  }
+
+  private startAnalysis(): void {
+    if (!this.settings.fullAudioAnalysis || this.destroyed || this.analysisAbort || this.analysisResult) return;
+    const durationStatus = classifyMediaDuration(this.media.duration);
+    if (durationStatus !== 'ready') {
+      this.analysisStatus = durationStatus === 'waiting' ? 'waiting-metadata' : 'unsupported';
+      return;
+    }
+    const abort = new AbortController();
+    this.analysisAbort = abort;
+    this.analysisStatus = 'analyzing';
+    analyzeFullAudio(this.media, this.context, abort.signal).then((result) => {
+      if (this.destroyed || abort.signal.aborted) return;
+      this.analysisResult = result;
+      this.applyFullTrackGain();
+    }).catch((error) => {
+      if (abort.signal.aborted) return;
+      this.analysisResult = null;
+      this.analysisStatus = error instanceof FullAudioAnalysisError && error.code === 'incomplete'
+        ? 'incomplete'
+        : 'failed';
+      logDiagnostic('完整音轨：分析失败详情', {
+        code: error instanceof FullAudioAnalysisError ? error.code : 'unknown',
+        message: error instanceof Error ? error.message : String(error),
+        ...this.diagnosticState()
+      });
+      warnFailure('full-audio-analysis', '完整音轨分析失败，继续使用实时算法', error);
+    }).finally(() => {
+      if (this.analysisAbort === abort) this.analysisAbort = null;
+    });
+  }
+
+  private applyFullTrackGain(): void {
+    if (!this.analysisResult || !this.settings.fullAudioAnalysis) return;
+    const fixedGain = calculateFullAudioGain(
+      this.analysisResult,
+      rmsToLufs(this.settings.targetRms),
+      this.settings.minGain,
+      this.settings.maxGain
+    );
+    this.agc.lockGain(fixedGain);
+    this.analysisStatus = 'full-track';
+    logDiagnostic('完整音轨：固定 gain 已应用', {
+      fixedGain,
+      integratedLufs: this.analysisResult.integratedLufs,
+      analyzedDurationSeconds: this.analysisResult.duration,
+      ...this.diagnosticState()
+    });
+  }
+
+  private cancelAnalysis(): void {
+    this.analysisAbort?.abort();
+    this.analysisAbort = null;
+  }
+
+  private diagnosticState(): Record<string, number> {
+    return {
+      currentGain: this.gain.gain.value,
+      currentTimeSeconds: this.media.currentTime,
+      videoDurationSeconds: this.media.duration
+    };
+  }
+}
+
+function channelRms(channels: Float32Array[]): number {
+  let sum = 0;
+  let count = 0;
+  for (const channel of channels) {
+    for (let index = 0; index < channel.length; index++) sum += channel[index] ** 2;
+    count += channel.length;
+  }
+  return count ? Math.sqrt(sum / count) : 0;
+}
+
+function channelPeak(channels: Float32Array[]): number {
+  let peak = 0;
+  for (const channel of channels) {
+    for (let index = 0; index < channel.length; index++) {
+      peak = Math.max(peak, Math.abs(channel[index]));
+    }
+  }
+  return peak;
 }

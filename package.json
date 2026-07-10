@@ -1,11 +1,12 @@
 {
   "name": "bili-volume-equalizer",
   "version": "1.0.0",
-  "description": "B站视频音量均衡器 - 将所有视频标准化到 -15 LUFS",
+  "description": "浏览器视频音量均衡器，默认目标 -21 LUFS",
   "scripts": {
     "build": "vite build",
     "watch": "vite build --watch",
     "pack": "vite build && node pack.js",
+    "test:unit": "node scripts/run-unit-tests.mjs",
     "test:audio:download": "node scripts/download-audio-fixtures.mjs",
     "test:audio:benchmark": "node scripts/audio-benchmark.mjs",
     "test:audio:trace": "node scripts/audio-benchmark.mjs --trace"

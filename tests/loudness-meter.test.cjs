@@ -31,3 +31,14 @@ test('stereo loudness sums channel energy instead of measuring a mono mix only',
   const deltaLu = stereo.getIntegratedLoudness() - mono.getIntegratedLoudness();
   assert.ok(deltaLu > 2.9 && deltaLu < 3.2);
 });
+
+test('short-term loudness includes recent silence', () => {
+  const meter = new LoudnessMeter(48000);
+  const tone = new Float32Array(4800).fill(0.1);
+  const silence = new Float32Array(4800);
+  fillBlocks(meter, [tone], 35);
+  assert.ok(Number.isFinite(meter.getShortTermLoudness()));
+  fillBlocks(meter, [silence], 35);
+  assert.ok(meter.getShortTermLoudness() < -70);
+  assert.ok(Math.abs(meter.getIntegrationTime() - 7) < 1e-9);
+});

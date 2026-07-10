@@ -17,14 +17,20 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
     this.previousSamples = [];
     this.gainLine = new Float32Array(this.lookaheadSamples);
     this.gainLine.fill(1);
+    this.meterSize = Math.max(128, Math.round(sampleRate / 10));
+    this.meterIndex = 0;
+    this.originalMeter = [];
+    this.outputMeter = [];
   }
 
   process(inputs, outputs) {
     const input = inputs[0];
+    const original = inputs[1] && inputs[1].length ? inputs[1] : input;
     const output = outputs[0];
     if (!input || input.length === 0 || !output || output.length === 0) return true;
 
     this.ensureDelayLines(Math.max(input.length, output.length));
+    this.ensureMeterBuffers(original.length, output.length);
 
     const frames = output[0].length;
     const channelCount = output.length;
@@ -66,6 +72,17 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
         output[channel][frame] = this.delayLines[channel][readIndex] * delayedGain;
       }
 
+      for (let channel = 0; channel < this.originalMeter.length; channel++) {
+        const originalChannel = original[channel];
+        this.originalMeter[channel][this.meterIndex] = originalChannel?.[frame] || 0;
+      }
+      for (let channel = 0; channel < this.outputMeter.length; channel++) {
+        const outputChannel = output[channel];
+        this.outputMeter[channel][this.meterIndex] = outputChannel?.[frame] || 0;
+      }
+      this.meterIndex++;
+      if (this.meterIndex === this.meterSize) this.flushMeter();
+
       this.writeIndex = readIndex;
     }
 
@@ -77,6 +94,25 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
       this.delayLines.push(new Float32Array(this.lookaheadSamples));
       this.previousSamples.push(new Float32Array(3));
     }
+  }
+
+  ensureMeterBuffers(originalChannels, outputChannels) {
+    while (this.originalMeter.length < originalChannels) {
+      this.originalMeter.push(new Float32Array(this.meterSize));
+    }
+    while (this.outputMeter.length < outputChannels) {
+      this.outputMeter.push(new Float32Array(this.meterSize));
+    }
+  }
+
+  flushMeter() {
+    if (this.port && this.port.postMessage) {
+      const original = this.originalMeter.map((channel) => channel.slice());
+      const output = this.outputMeter.map((channel) => channel.slice());
+      const transfers = [...original, ...output].map((channel) => channel.buffer);
+      this.port.postMessage({ type: 'meter', original, output }, transfers);
+    }
+    this.meterIndex = 0;
   }
 
   estimateCubicPeak(p0, p1, p2, p3) {

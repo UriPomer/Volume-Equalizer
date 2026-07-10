@@ -1,631 +1,187 @@
-/**
- * UI 面板 - 创建和管理设置面板
- */
-
 import { PANEL_ID, Settings } from './config';
-import { rmsToLufs, lufsToRms } from './lufs-calculator';
-import { eventBus, EVENTS } from './events/index';
+import { lufsToRms, rmsToLufs } from './lufs-calculator';
+import { AnalysisStatus, MeterState } from './types';
 
-interface FieldNodes {
-  targetLufs: HTMLElement | null;
-  maxGain: HTMLElement | null;
-  minGain: HTMLElement | null;
-  bassBoost: HTMLElement | null;
-  meterOriginalIntegratedLufs: HTMLElement | null;
-  meterOriginalLufs: HTMLElement | null;
-  meterIntegratedLufs: HTMLElement | null;
-  meterLufs: HTMLElement | null;
-  meterGain: HTMLElement | null;
-  sampleCount: HTMLElement | null;
-  analysisStatus: HTMLElement | null;
-}
+type SliderRole = 'targetLufs' | 'maxGain' | 'minGain' | 'bassBoost';
+type ChangeSettings = (settings: Settings) => Settings;
 
-interface MeterState {
-  rms: number;
-  integratedRms: number;
-  originalRms: number;
-  originalIntegratedRms: number;
-  gain: number;
-  sampleCount: number;
-  analysisStatus: 'realtime' | 'analyzing' | 'full-track' | 'fallback';
-}
+const STATUS_TEXT: Record<AnalysisStatus, string> = {
+  realtime: '实时',
+  'waiting-metadata': '等待视频元数据',
+  analyzing: '完整音轨分析中',
+  'full-track': '完整音轨已锁定',
+  incomplete: '音轨不完整 · 实时继续',
+  unsupported: '直播不支持完整分析',
+  failed: '分析失败 · 实时继续'
+};
 
-let panelHost: HTMLElement | null = null;
-let settingsChangedOff: (() => void) | null = null;
+let host: HTMLElement | null = null;
+let meterTimer: number | null = null;
 
-/**
- * 创建设置面板
- */
-export function createPanel(
+export function ensurePanel(
   settings: Settings,
-  onSettingsChange: (s: Settings) => Settings,
-  getMeterState: () => MeterState
+  changeSettings: ChangeSettings,
+  getMeter: () => MeterState
 ): HTMLElement {
-  if (panelHost && document.contains(panelHost)) return panelHost;
-
-  const existing = document.getElementById(PANEL_ID);
-  if (existing) {
-    panelHost = existing;
-    return panelHost;
-  }
-
-  const host = document.createElement('div');
+  if (host?.isConnected) return host;
+  if (meterTimer !== null) window.clearInterval(meterTimer);
+  host = document.createElement('div');
   host.id = PANEL_ID;
-  host.style.cssText = `
-    position: fixed;
-    right: 0;
-    bottom: 120px;
-    z-index: 2147483647;
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    display: none;
-  `;
+  host.style.cssText = 'position:fixed;right:0;bottom:120px;z-index:2147483647;display:none';
   document.documentElement.appendChild(host);
-  panelHost = host;
 
   const shadow = host.attachShadow({ mode: 'open' });
-
-  const style = document.createElement('style');
-  style.textContent = getPanelStyles();
-  shadow.appendChild(style);
-
-  const wrapper = document.createElement('div');
-  wrapper.innerHTML = getPanelHTML(settings);
-  shadow.appendChild(wrapper.firstElementChild!);
-
-  bindPanelEvents(shadow, settings, onSettingsChange);
-  startMeterUpdateLoop(shadow, getMeterState);
-
+  shadow.innerHTML = `<style>${PANEL_CSS}</style>${panelHtml(settings)}`;
+  bindPanel(shadow, settings, changeSettings);
+  updateMeter(shadow, getMeter);
   return host;
 }
 
-/**
- * 确保面板存在
- */
-export function ensurePanel(
-  settings: Settings,
-  onSettingsChange: (s: Settings) => Settings,
-  getMeterState: () => MeterState
-): HTMLElement {
-  if (panelHost && document.contains(panelHost)) {
-    return panelHost;
-  }
-  panelHost = null;
-  return createPanel(settings, onSettingsChange, getMeterState);
-}
-
-/**
- * 更新面板可见性
- */
 export function updatePanelVisibility(controllerCount: number): void {
-  if (controllerCount === 0) {
-    if (panelHost && document.contains(panelHost)) {
-      panelHost.style.display = 'none';
-    }
-    return;
-  }
-  if (panelHost) {
-    panelHost.style.display = 'block';
-  }
+  if (host) host.style.display = controllerCount ? 'block' : 'none';
 }
 
-/**
- * 获取面板样式
- */
-function getPanelStyles(): string {
-  return `
-    :host {
-      all: initial;
-      pointer-events: none;
-    }
-
-    /* ── 整体容器：用 transform 控制滑出 ── */
-    .panel-wrapper {
-      display: flex;
-      align-items: flex-end;
-      pointer-events: none;
-      transform: translateX(220px);
-      transition: transform 0.28s cubic-bezier(0.25, 0.46, 0.45, 0.94);
-    }
-    :host([data-expanded]) .panel-wrapper {
-      transform: translateX(0);
-    }
-
-    /* ── 卡片 ── */
-    .panel {
-      width: 220px;
-      box-sizing: border-box;
-      flex-shrink: 0;
-      background: rgba(12, 12, 14, 0.35);
-      color: #f0f0f0;
-      border-radius: 14px 0 0 14px;
-      padding: 12px 12px 10px;
-      box-shadow: -4px 0 16px rgba(0, 0, 0, 0.4);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-right: none;
-      backdrop-filter: blur(20px) saturate(180%);
-      pointer-events: auto;
-      opacity: 0;
-      transition: opacity 0.2s ease 0.05s, border-radius 0.28s cubic-bezier(0.25, 0.46, 0.45, 0.94);
-    }
-    :host([data-expanded]) .panel {
-      opacity: 1;
-      border-radius: 14px 0 0 0;
-    }
-
-    /* ── Dock 把手 ── */
-    .dock {
-      flex-shrink: 0;
-      width: 26px;
-      height: 72px;
-      background: linear-gradient(160deg, rgba(0, 178, 255, 0.30), rgba(0, 122, 180, 0.30));
-      backdrop-filter: blur(20px) saturate(180%);
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      border-right: none;
-      color: #fff;
-      border-radius: 10px 0 0 10px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      box-shadow: -2px 0 8px rgba(0, 0, 0, 0.3);
-      cursor: pointer;
-      pointer-events: auto;
-      transition: border-radius 0.28s cubic-bezier(0.25, 0.46, 0.45, 0.94),
-                  box-shadow 0.2s ease;
-    }
-    .dock:hover {
-      box-shadow: -3px 0 10px rgba(0, 0, 0, 0.45);
-    }
-    :host([data-expanded]) .dock {
-      box-shadow: none;
-    }
-    .dock-label {
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.5px;
-      writing-mode: vertical-rl;
-      text-orientation: mixed;
-      user-select: none;
-    }
-    .dock-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: #4ade80;
-      box-shadow: 0 0 6px #4ade80;
-      transition: background 0.3s, box-shadow 0.3s;
-    }
-    .dock-dot.off {
-      background: rgba(255,255,255,0.3);
-      box-shadow: none;
-    }
-
-    /* ── 标题行 ── */
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 10px;
-    }
-    .header-title {
-      font-size: 13px;
-      font-weight: 600;
-      color: #fff;
-      letter-spacing: 0.3px;
-    }
-    .toggle-pill {
-      border: none;
-      border-radius: 999px;
-      padding: 3px 10px;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.2s, box-shadow 0.2s;
-      letter-spacing: 0.3px;
-    }
-    .toggle-pill.on {
-      background: linear-gradient(90deg, #0ea5e9, #0284c7);
-      color: #fff;
-      box-shadow: 0 2px 8px rgba(14, 165, 233, 0.4);
-    }
-    .toggle-pill.off {
-      background: rgba(255,255,255,0.1);
-      color: rgba(255,255,255,0.5);
-    }
-
-    /* ── 分割线 ── */
-    .divider {
-      height: 1px;
-      background: rgba(255,255,255,0.07);
-      margin: 8px 0;
-    }
-
-    /* ── 参数行 ── */
-    .param-row {
-      margin-top: 8px;
-    }
-    .mode-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-top: 9px;
-      font-size: 11px;
-      color: rgba(255,255,255,0.55);
-    }
-    .mode-button {
-      border: 0;
-      border-radius: 999px;
-      padding: 3px 9px;
-      background: rgba(255,255,255,0.1);
-      color: rgba(255,255,255,0.7);
-      cursor: pointer;
-      font-size: 10px;
-    }
-    .mode-button.on {
-      background: rgba(56,189,248,0.24);
-      color: #7dd3fc;
-    }
-    .param-label {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      font-size: 11px;
-      color: rgba(255,255,255,0.55);
-      margin-bottom: 4px;
-    }
-    .param-label span:last-child {
-      font-size: 12px;
-      font-weight: 600;
-      color: #e2e8f0;
-      font-variant-numeric: tabular-nums;
-    }
-    input[type='range'] {
-      -webkit-appearance: none;
-      width: 100%;
-      height: 3px;
-      border-radius: 2px;
-      background: rgba(255,255,255,0.12);
-      outline: none;
-      cursor: pointer;
-    }
-    input[type='range']::-webkit-slider-thumb {
-      -webkit-appearance: none;
-      width: 13px;
-      height: 13px;
-      border-radius: 50%;
-      background: #38bdf8;
-      box-shadow: 0 0 0 2px rgba(56,189,248,0.3);
-      transition: box-shadow 0.15s;
-    }
-    input[type='range']:hover::-webkit-slider-thumb {
-      box-shadow: 0 0 0 4px rgba(56,189,248,0.3);
-    }
-
-    /* ── Meter 区域 ── */
-    .meter {
-      margin-top: 2px;
-      font-size: 11px;
-    }
-    .meter-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 2px 0;
-      font-variant-numeric: tabular-nums;
-    }
-    .meter-row .label {
-      color: rgba(255,255,255,0.35);
-    }
-    .meter-row .val {
-      color: #cbd5e1;
-      font-weight: 500;
-    }
-    .meter-row .val.highlight {
-      color: #38bdf8;
-    }
-    .meter-sub-title {
-      font-size: 10px;
-      font-weight: 600;
-      color: rgba(255,255,255,0.3);
-      text-transform: uppercase;
-      letter-spacing: 0.8px;
-      margin-top: 6px;
-      margin-bottom: 2px;
-    }
-  `;
-}
-
-/**
- * 获取面板 HTML
- */
-function getPanelHTML(settings: Settings): string {
-  const targetLufs = rmsToLufs(settings.targetRms).toFixed(1);
-  const bassSign = settings.bassBoost > 0 ? '+' : '';
-  return `
-    <div class="panel-wrapper">
-      <div class="dock">
-        <div class="dock-dot off"></div>
-        <div class="dock-label">EQ</div>
+function panelHtml(settings: Settings): string {
+  const target = rmsToLufs(settings.targetRms);
+  return `<div class="wrap">
+    <div class="dock"><i></i><b>EQ</b></div>
+    <section>
+      <header><strong>音量均衡</strong><button data-action="enabled"></button></header>
+      <hr>
+      <label class="mode">完整音轨预分析<button data-action="fullAudioAnalysis"></button></label>
+      ${slider('targetLufs', '目标响度', -23, -10, .5, target)}
+      ${slider('maxGain', '增益上限', 1, 3, .1, settings.maxGain)}
+      ${slider('minGain', '增益下限', .2, 1, .05, settings.minGain)}
+      ${slider('bassBoost', '低频增益', -6, 6, .5, settings.bassBoost)}
+      <hr>
+      <div class="meter">
+        <small>原始</small>
+        ${meterRow('积分', 'originalIntegrated', ' LUFS')} ${meterRow('瞬时', 'original', ' LUFS')}
+        <small>输出</small>
+        ${meterRow('积分', 'outputIntegrated', ' LUFS')} ${meterRow('瞬时', 'output', ' LUFS')}
+        ${meterRow('增益', 'gain')} ${meterRow('算法', 'status')}
       </div>
-      <div class="panel">
-        <div class="header">
-          <span class="header-title">音量均衡</span>
-          <button class="toggle-pill">···</button>
-        </div>
-        <div class="divider"></div>
-
-        <div class="mode-row">
-          <span>完整音轨预分析</span>
-          <button class="mode-button" data-role="fullAudioAnalysis"></button>
-        </div>
-
-        <div class="param-row">
-          <div class="param-label">
-            <span>目标响度</span>
-            <span data-field="targetLufs">${targetLufs} LUFS</span>
-          </div>
-          <input type="range" min="-23" max="-10" step="0.5" data-role="targetLufs" value="${targetLufs}">
-        </div>
-
-        <div class="param-row">
-          <div class="param-label">
-            <span>增益上限</span>
-            <span data-field="maxGain">${settings.maxGain.toFixed(1)}x</span>
-          </div>
-          <input type="range" min="1" max="3" step="0.1" data-role="maxGain" value="${settings.maxGain}">
-        </div>
-
-        <div class="param-row">
-          <div class="param-label">
-            <span>增益下限</span>
-            <span data-field="minGain">${settings.minGain.toFixed(1)}x</span>
-          </div>
-          <input type="range" min="0.2" max="1" step="0.05" data-role="minGain" value="${settings.minGain}">
-        </div>
-
-        <div class="param-row">
-          <div class="param-label">
-            <span>低频增益</span>
-            <span data-field="bassBoost">${bassSign}${settings.bassBoost.toFixed(1)} dB</span>
-          </div>
-          <input type="range" min="-6" max="6" step="0.5" data-role="bassBoost" value="${settings.bassBoost}">
-        </div>
-
-        <div class="divider" style="margin-top:10px;"></div>
-        <div class="meter">
-          <div class="meter-sub-title">原始</div>
-          <div class="meter-row">
-            <span class="label">积分</span>
-            <span class="val"><span data-field="meterOriginalIntegratedLufs">-∞</span> LUFS <span style="opacity:0.5;font-size:10px;" data-field="sampleCount"></span></span>
-          </div>
-          <div class="meter-row">
-            <span class="label">瞬时</span>
-            <span class="val"><span data-field="meterOriginalLufs">-∞</span> LUFS</span>
-          </div>
-
-          <div class="meter-sub-title" style="margin-top:6px;">输出</div>
-          <div class="meter-row">
-            <span class="label">积分</span>
-            <span class="val"><span data-field="meterIntegratedLufs">-∞</span> LUFS</span>
-          </div>
-          <div class="meter-row">
-            <span class="label">瞬时</span>
-            <span class="val"><span data-field="meterLufs">-∞</span> LUFS</span>
-          </div>
-          <div class="meter-row">
-            <span class="label">增益</span>
-            <span class="val highlight"><span data-field="meterGain">1.00x</span></span>
-          </div>
-          <div class="meter-row">
-            <span class="label">算法</span>
-            <span class="val" data-field="analysisStatus">实时</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
+    </section>
+  </div>`;
 }
 
-/**
- * 绑定面板事件
- */
-function bindPanelEvents(
-  shadow: ShadowRoot,
-  initialSettings: Settings,
-  onSettingsChange: (s: Settings) => Settings
-): void {
-  const toggleBtn = shadow.querySelector<HTMLButtonElement>('button.toggle-pill')!;
-  const dockDot = shadow.querySelector<HTMLElement>('.dock-dot')!;
-  const sliders = shadow.querySelectorAll<HTMLInputElement>('input[type="range"]');
-  const fieldNodes = getFieldNodes(shadow);
-  const sliderMap = new Map([...sliders].map((slider) => [slider.dataset.role, slider]));
-  const analysisModeButton = shadow.querySelector<HTMLButtonElement>('[data-role="fullAudioAnalysis"]')!;
+function slider(
+  role: SliderRole,
+  label: string,
+  min: number,
+  max: number,
+  step: number,
+  value: number
+): string {
+  return `<label class="param"><span>${label}<b data-value="${role}"></b></span>
+    <input data-role="${role}" type="range" min="${min}" max="${max}" step="${step}" value="${value}">
+  </label>`;
+}
 
-  let currentSettings = initialSettings;
+function meterRow(label: string, field: string, suffix = ''): string {
+  return `<div><span>${label}</span><b data-meter="${field}">-∞${suffix}</b></div>`;
+}
 
-  const renderToggle = () => {
-    if (currentSettings.enabled) {
-      toggleBtn.textContent = '已开启';
-      toggleBtn.className = 'toggle-pill on';
-      dockDot.className = 'dock-dot';
-    } else {
-      toggleBtn.textContent = '已关闭';
-      toggleBtn.className = 'toggle-pill off';
-      dockDot.className = 'dock-dot off';
+function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings): void {
+  let settings = initial;
+  const enabled = query<HTMLButtonElement>(shadow, '[data-action="enabled"]');
+  const full = query<HTMLButtonElement>(shadow, '[data-action="fullAudioAnalysis"]');
+  const sliders = [...shadow.querySelectorAll<HTMLInputElement>('input[data-role]')];
+
+  const render = () => {
+    enabled.textContent = settings.enabled ? '已开启' : '已关闭';
+    enabled.classList.toggle('on', settings.enabled);
+    full.textContent = settings.fullAudioAnalysis ? '已开启' : '实时模式';
+    full.classList.toggle('on', settings.fullAudioAnalysis);
+    query<HTMLElement>(shadow, '.dock i').classList.toggle('off', !settings.enabled);
+    for (const input of sliders) {
+      const role = input.dataset.role as SliderRole;
+      const value = role === 'targetLufs' ? rmsToLufs(settings.targetRms) : settings[role];
+      input.value = String(value);
+      setText(shadow, `[data-value="${role}"]`, formatValue(role, value));
     }
   };
 
-  const renderAnalysisMode = () => {
-    analysisModeButton.textContent = currentSettings.fullAudioAnalysis ? '已开启' : '实时模式';
-    analysisModeButton.className = currentSettings.fullAudioAnalysis ? 'mode-button on' : 'mode-button';
-  };
-
-  const applySettingsToUI = (settings: Settings) => {
-    const targetLufs = rmsToLufs(settings.targetRms);
-    const targetSlider = sliderMap.get('targetLufs');
-    if (targetSlider) targetSlider.value = String(targetLufs);
-    updateFieldText(fieldNodes, 'targetLufs', targetLufs);
-
-    const maxGainSlider = sliderMap.get('maxGain');
-    if (maxGainSlider) maxGainSlider.value = String(settings.maxGain);
-    updateFieldText(fieldNodes, 'maxGain', settings.maxGain);
-
-    const minGainSlider = sliderMap.get('minGain');
-    if (minGainSlider) minGainSlider.value = String(settings.minGain);
-    updateFieldText(fieldNodes, 'minGain', settings.minGain);
-
-    const bassBoostSlider = sliderMap.get('bassBoost');
-    if (bassBoostSlider) bassBoostSlider.value = String(settings.bassBoost);
-    updateFieldText(fieldNodes, 'bassBoost', settings.bassBoost);
-
-    renderToggle();
-    renderAnalysisMode();
-  };
-
-  applySettingsToUI(currentSettings);
-
-  toggleBtn.addEventListener('click', () => {
-    const newSettings = { ...currentSettings, enabled: !currentSettings.enabled };
-    currentSettings = onSettingsChange(newSettings) || newSettings;
-    renderToggle();
-    toggleBtn.blur();
-  });
-
-  analysisModeButton.addEventListener('click', () => {
-    const newSettings = {
-      ...currentSettings,
-      fullAudioAnalysis: !currentSettings.fullAudioAnalysis,
+  enabled.onclick = () => { settings = change({ ...settings, enabled: !settings.enabled }); render(); };
+  full.onclick = () => {
+    settings = change({
+      ...settings,
+      fullAudioAnalysis: !settings.fullAudioAnalysis,
       _changedField: 'fullAudioAnalysis'
+    });
+    render();
+  };
+  for (const input of sliders) {
+    input.oninput = () => {
+      const role = input.dataset.role as SliderRole;
+      const value = Number(input.value);
+      settings = change({
+        ...settings,
+        ...(role === 'targetLufs' ? { targetRms: lufsToRms(value) } : { [role]: value }),
+        _changedField: role
+      });
+      setText(shadow, `[data-value="${role}"]`, formatValue(role, value));
     };
-    currentSettings = onSettingsChange(newSettings) || newSettings;
-    renderAnalysisMode();
-    analysisModeButton.blur();
-  });
+  }
 
-  sliders.forEach((slider) => {
-    slider.addEventListener('input', (event) => {
-      const target = event.target as HTMLInputElement;
-      const role = target.dataset.role!;
-      const value = parseFloat(target.value);
-      if (Number.isNaN(value)) return;
-
-      const newSettings = { ...currentSettings } as Settings;
-      newSettings._changedField = role;
-
-      if (role === 'targetLufs') {
-        newSettings.targetRms = lufsToRms(value);
-      } else {
-        (newSettings as any)[role] = value;
-      }
-
-      currentSettings = onSettingsChange(newSettings) || newSettings;
-      updateFieldText(fieldNodes, role, value);
-    });
-    slider.addEventListener('change', (event) => {
-      (event.target as HTMLInputElement).blur();
-    });
-  });
-
-  let expandTimer: ReturnType<typeof setTimeout> | null = null;
-  let collapseTimer: ReturnType<typeof setTimeout> | null = null;
-  const host = panelHost!;
-  const dock = shadow.querySelector<HTMLElement>('.dock')!;
-  const panelWrapper = shadow.querySelector<HTMLElement>('.panel-wrapper')!;
-
-  const startExpand = () => {
-    clearTimeout(collapseTimer!);
-    collapseTimer = null;
-    if (!host.hasAttribute('data-expanded')) {
-      expandTimer = setTimeout(() => {
-        host.setAttribute('data-expanded', '');
-      }, 80);
-    }
+  const wrapper = query<HTMLElement>(shadow, '.wrap');
+  let closeTimer = 0;
+  query<HTMLElement>(shadow, '.dock').onmouseenter = () => {
+    clearTimeout(closeTimer);
+    host?.setAttribute('data-open', '');
   };
-
-  const startCollapse = () => {
-    clearTimeout(expandTimer!);
-    expandTimer = null;
-    collapseTimer = setTimeout(() => {
-      host.removeAttribute('data-expanded');
-    }, 300);
+  wrapper.onmouseenter = () => clearTimeout(closeTimer);
+  wrapper.onmouseleave = () => {
+    closeTimer = window.setTimeout(() => host?.removeAttribute('data-open'), 250);
   };
-
-  dock.addEventListener('mouseenter', startExpand);
-  panelWrapper.addEventListener('mouseleave', startCollapse);
-  panelWrapper.addEventListener('mouseenter', () => {
-    clearTimeout(collapseTimer!);
-    collapseTimer = null;
-  });
-
-  if (settingsChangedOff) settingsChangedOff();
-  settingsChangedOff = eventBus.on(EVENTS.SETTINGS_CHANGED, (payload) => {
-    const { settings: nextSettings } = payload as { settings: Settings };
-    if (!panelHost || !document.contains(panelHost)) return;
-    currentSettings = nextSettings;
-    applySettingsToUI(currentSettings);
-  });
+  render();
 }
 
-/**
- * 获取字段节点
- */
-function getFieldNodes(shadow: ShadowRoot): FieldNodes {
-  return {
-    targetLufs: shadow.querySelector<HTMLElement>('[data-field="targetLufs"]'),
-    maxGain: shadow.querySelector<HTMLElement>('[data-field="maxGain"]'),
-    minGain: shadow.querySelector<HTMLElement>('[data-field="minGain"]'),
-    bassBoost: shadow.querySelector<HTMLElement>('[data-field="bassBoost"]'),
-    meterOriginalIntegratedLufs: shadow.querySelector<HTMLElement>('[data-field="meterOriginalIntegratedLufs"]'),
-    meterOriginalLufs: shadow.querySelector<HTMLElement>('[data-field="meterOriginalLufs"]'),
-    meterIntegratedLufs: shadow.querySelector<HTMLElement>('[data-field="meterIntegratedLufs"]'),
-    meterLufs: shadow.querySelector<HTMLElement>('[data-field="meterLufs"]'),
-    meterGain: shadow.querySelector<HTMLElement>('[data-field="meterGain"]'),
-    sampleCount: shadow.querySelector<HTMLElement>('[data-field="sampleCount"]'),
-    analysisStatus: shadow.querySelector<HTMLElement>('[data-field="analysisStatus"]')
+function updateMeter(shadow: ShadowRoot, getMeter: () => MeterState): void {
+  const showLufs = (rms: number) => {
+    const lufs = rmsToLufs(rms);
+    return `${lufs > -70 ? lufs.toFixed(1) : '-∞'} LUFS`;
   };
-}
-
-/**
- * 更新字段文本
- */
-function updateFieldText(fieldNodes: FieldNodes, role: string, value: number): void {
-  if (role === 'targetLufs' && fieldNodes.targetLufs) fieldNodes.targetLufs.textContent = `${value.toFixed(1)} LUFS`;
-  if (role === 'maxGain' && fieldNodes.maxGain) fieldNodes.maxGain.textContent = `${value.toFixed(1)}x`;
-  if (role === 'minGain' && fieldNodes.minGain) fieldNodes.minGain.textContent = `${value.toFixed(1)}x`;
-  if (role === 'bassBoost' && fieldNodes.bassBoost) fieldNodes.bassBoost.textContent = `${value > 0 ? '+' : ''}${value.toFixed(1)} dB`;
-}
-
-/**
- * 启动 meter 更新循环
- */
-function startMeterUpdateLoop(shadow: ShadowRoot, getMeterState: () => MeterState): void {
-  const fieldNodes = getFieldNodes(shadow);
-
-  setInterval(() => {
-    if (!document.contains(panelHost)) return;
-
-    const meterState = getMeterState();
-    const { rms, integratedRms, originalRms, originalIntegratedRms, gain, sampleCount, analysisStatus } = meterState;
-
-    const instantLufs = rmsToLufs(rms);
-    const integratedLufs = rmsToLufs(integratedRms || rms);
-    const originalInstantLufs = rmsToLufs(originalRms);
-    const originalIntegratedLufs = rmsToLufs(originalIntegratedRms || originalRms);
-
-    if (fieldNodes.meterOriginalLufs) fieldNodes.meterOriginalLufs.textContent = originalInstantLufs > -70 ? originalInstantLufs.toFixed(1) : '-∞';
-    if (fieldNodes.meterOriginalIntegratedLufs) fieldNodes.meterOriginalIntegratedLufs.textContent = originalIntegratedLufs > -70 ? originalIntegratedLufs.toFixed(1) : '-∞';
-    if (fieldNodes.meterLufs) fieldNodes.meterLufs.textContent = instantLufs > -70 ? instantLufs.toFixed(1) : '-∞';
-    if (fieldNodes.meterIntegratedLufs) fieldNodes.meterIntegratedLufs.textContent = integratedLufs > -70 ? integratedLufs.toFixed(1) : '-∞';
-    if (fieldNodes.meterGain) fieldNodes.meterGain.textContent = `${gain.toFixed(2)}x`;
-    if (fieldNodes.sampleCount) fieldNodes.sampleCount.textContent = `${sampleCount}s`;
-    if (fieldNodes.analysisStatus) {
-      fieldNodes.analysisStatus.textContent = {
-        realtime: '实时',
-        analyzing: '分析中',
-        'full-track': '整段锁定',
-        fallback: '实时回退'
-      }[analysisStatus];
-    }
+  meterTimer = window.setInterval(() => {
+    if (!host?.isConnected) return;
+    const meter = getMeter();
+    setText(shadow, '[data-meter="original"]', showLufs(meter.originalRms));
+    setText(shadow, '[data-meter="originalIntegrated"]', `${showLufs(meter.originalIntegratedRms)} · ${meter.sampleCount}s`);
+    setText(shadow, '[data-meter="output"]', showLufs(meter.rms));
+    setText(shadow, '[data-meter="outputIntegrated"]', showLufs(meter.integratedRms || meter.rms));
+    setText(shadow, '[data-meter="gain"]', `${meter.gain.toFixed(2)}x`);
+    setText(shadow, '[data-meter="status"]', STATUS_TEXT[meter.analysisStatus]);
   }, 100);
 }
+
+function formatValue(role: SliderRole, value: number): string {
+  if (role === 'targetLufs') return `${value.toFixed(1)} LUFS`;
+  if (role === 'bassBoost') return `${value > 0 ? '+' : ''}${value.toFixed(1)} dB`;
+  return `${value.toFixed(2)}x`;
+}
+
+function query<T extends Element>(root: ParentNode, selector: string): T {
+  return root.querySelector<T>(selector)!;
+}
+
+function setText(root: ParentNode, selector: string, value: string): void {
+  const node = root.querySelector<HTMLElement>(selector);
+  if (node) node.textContent = value;
+}
+
+const PANEL_CSS = `
+:host{all:initial;pointer-events:none;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{display:flex;align-items:flex-end;transform:translateX(220px);transition:.25s;pointer-events:none}
+:host([data-open]) .wrap{transform:none}
+.dock,section{background:rgba(12,12,14,.55);backdrop-filter:blur(18px);border:1px solid #ffffff20;color:#f8fafc;pointer-events:auto}
+.dock{width:26px;height:72px;border-radius:10px 0 0 10px;border-right:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;cursor:pointer}
+.dock i{width:6px;height:6px;border-radius:50%;background:#4ade80;box-shadow:0 0 6px #4ade80}.dock i.off{background:#ffffff50;box-shadow:none}
+.dock b{font-size:11px;writing-mode:vertical-rl;letter-spacing:.5px}
+section{width:220px;box-sizing:border-box;padding:12px;border-radius:14px 0 0 0;border-right:0;opacity:0;transition:.2s}
+:host([data-open]) section{opacity:1}
+header,.mode,.param span,.meter div{display:flex;align-items:center;justify-content:space-between}
+header{font-size:13px}button{border:0;border-radius:99px;padding:3px 9px;background:#ffffff18;color:#ffffff90;cursor:pointer;font-size:10px}button.on{background:#0ea5e9;color:white}
+hr{border:0;height:1px;background:#ffffff12;margin:9px 0}.mode,.param{display:block;color:#ffffff90;font-size:11px}.mode{display:flex;margin:9px 0}
+.param{margin-top:8px}.param span b{color:#e2e8f0;font-size:12px}input{appearance:none;width:100%;height:3px;background:#ffffff20;border-radius:2px;cursor:pointer}input::-webkit-slider-thumb{appearance:none;width:13px;height:13px;border-radius:50%;background:#38bdf8}
+.meter{font-size:11px}.meter small{display:block;color:#ffffff50;font-weight:600;margin-top:6px}.meter div{padding:2px 0}.meter span{color:#ffffff60}.meter b{color:#cbd5e1;font-weight:500;font-variant-numeric:tabular-nums;text-align:right}
+`;

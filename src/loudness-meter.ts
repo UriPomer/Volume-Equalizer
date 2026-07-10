@@ -1,386 +1,193 @@
-/**
- * ITU-R BS.1770-4 响度测量器
- * 基于 pyloudnorm 实现的 JavaScript 版本
- *
- * 核心特性:
- * - K-weighting 滤波器 (高架 + 高通)
- * - 双门限机制 (绝对门限 -70 LUFS + 相对门限 -10 LU)
- * - 400ms 分块 + 75% 重叠
- */
+type FilterState = { shelf: Biquad; highPass: Biquad };
 
-type FilterType = 'high_shelf' | 'high_pass';
+const BLOCK_SECONDS = 0.4;
+const STEP_SECONDS = 0.1;
+const ABSOLUTE_GATE_LUFS = -70;
+const RELATIVE_GATE_LU = -10;
 
-interface ChannelFilterState {
-  highShelf: IIRFilter;
-  highPass: IIRFilter;
-}
-
-/**
- * Biquad IIR 滤波器
- * 用于 K-weighting 预加权
- */
-class IIRFilter {
-  private type: FilterType;
-  private fc: number;
-  private Q: number;
-  private gain: number;
-  private sampleRate: number;
-
-  // 滤波器状态
+class Biquad {
   private x1 = 0;
   private x2 = 0;
   private y1 = 0;
   private y2 = 0;
 
-  // 滤波器系数
-  private b0 = 0;
-  private b1 = 0;
-  private b2 = 0;
-  private a1 = 0;
-  private a2 = 0;
+  constructor(
+    private readonly b0: number,
+    private readonly b1: number,
+    private readonly b2: number,
+    private readonly a1: number,
+    private readonly a2: number
+  ) {}
 
-  constructor(type: FilterType, fc: number, Q: number, gain: number, sampleRate: number) {
-    this.type = type;
-    this.fc = fc;
-    this.Q = Q;
-    this.gain = gain;
-    this.sampleRate = sampleRate;
-    this.calculateCoefficients();
-  }
-
-  /**
-   * 计算 Biquad 滤波器系数
-   * 基于 ITU-R BS.1770-4 标准的 DeMan 精确实现
-   */
-  private calculateCoefficients(): void {
-    const K = Math.tan(Math.PI * this.fc / this.sampleRate);
-
-    if (this.type === 'high_shelf') {
-      const Vh = Math.pow(10.0, this.gain / 20.0);
-      const Vb = Math.pow(Vh, 0.499666774155);
-      const a0_ = 1.0 + K / this.Q + K * K;
-
-      this.b0 = (Vh + Vb * K / this.Q + K * K) / a0_;
-      this.b1 = 2.0 * (K * K - Vh) / a0_;
-      this.b2 = (Vh - Vb * K / this.Q + K * K) / a0_;
-      this.a1 = 2.0 * (K * K - 1.0) / a0_;
-      this.a2 = (1.0 - K / this.Q + K * K) / a0_;
-    } else if (this.type === 'high_pass') {
-      const a0_ = 1.0 + K / this.Q + K * K;
-
-      this.b0 = 1.0 / a0_;
-      this.b1 = -2.0 / a0_;
-      this.b2 = 1.0 / a0_;
-      this.a1 = 2.0 * (K * K - 1.0) / a0_;
-      this.a2 = (1.0 - K / this.Q + K * K) / a0_;
-    }
-  }
-
-  /**
-   * 处理单个样本 (实时)
-   */
-  processSample(x: number): number {
+  process(x: number): number {
     const y = this.b0 * x + this.b1 * this.x1 + this.b2 * this.x2
-              - this.a1 * this.y1 - this.a2 * this.y2;
-
+      - this.a1 * this.y1 - this.a2 * this.y2;
     this.x2 = this.x1;
     this.x1 = x;
     this.y2 = this.y1;
     this.y1 = y;
-
     return y;
   }
 
-  /**
-   * 处理音频块
-   */
-  processBlock(data: Float32Array): Float32Array {
-    const output = new Float32Array(data.length);
-    for (let i = 0; i < data.length; i++) {
-      output[i] = this.processSample(data[i]);
-    }
-    return output;
-  }
-
-  /**
-   * 重置滤波器状态
-   */
   reset(): void {
     this.x1 = this.x2 = this.y1 = this.y2 = 0;
   }
 }
 
-/**
- * ITU-R BS.1770-4 响度测量器
- */
 export class LoudnessMeter {
-  private sampleRate: number;
-
-  // ITU-R BS.1770-4 标准参数
-  private blockSize = 0.4;  // 400ms 门限块
-  private overlap = 0.75;   // 75% 重叠
-  private absoluteThreshold = -70;  // 绝对门限 LUFS
-  private relativeThreshold = -10;  // 相对门限 LU (低于平均 10 LU)
-
-  // K-weighting 滤波器（每个声道独立状态）
-  private channelFilters: ChannelFilterState[];
-
-  // 实时积分状态
+  private readonly samplesPerBlock: number;
+  private readonly stepSamples: number;
+  private readonly maxBlocks: number;
+  private filters: FilterState[] = [];
+  private buffers: Float32Array[] = [];
   private blocks: number[] = [];
-  private blockLoudness: number[] = [];
-  private blockBuffers: Float32Array[];
-  private blockBufferIndex = 0;
-  private samplesPerBlock: number;
-  private stepSamples: number;
-  private samplesSinceLastBlock = 0;
+  private recentBlocks: number[] = [];
+  private bufferIndex = 0;
+  private processedFrames = 0;
+  private momentaryEnergy = NaN;
 
-  // 实时模式默认保留 10 分钟；完整音轨分析可取消上限。
-  private maxBlocks: number;
-
-  constructor(sampleRate = 48000, maxIntegrationSeconds = 600) {
-    this.sampleRate = sampleRate;
-
-    this.channelFilters = [this.createChannelFilters(sampleRate)];
-
-    this.samplesPerBlock = Math.ceil(this.blockSize * sampleRate);
-    this.stepSamples = Math.ceil(this.samplesPerBlock * (1 - this.overlap));
-    this.blockBuffers = [new Float32Array(this.samplesPerBlock)];
+  constructor(
+    private readonly sampleRate = 48000,
+    maxIntegrationSeconds = 600
+  ) {
+    this.samplesPerBlock = Math.ceil(BLOCK_SECONDS * sampleRate);
+    this.stepSamples = Math.ceil(STEP_SECONDS * sampleRate);
     this.maxBlocks = Number.isFinite(maxIntegrationSeconds)
-      ? Math.ceil(maxIntegrationSeconds / (this.blockSize * (1 - this.overlap)))
+      ? Math.ceil(maxIntegrationSeconds / STEP_SECONDS)
       : Number.POSITIVE_INFINITY;
+    this.ensureChannels(1);
   }
 
-  /**
-   * 应用 K-weighting 滤波
-   */
-  private applyKWeighting(sample: number, channel: number): number {
-    const filters = this.channelFilters[channel];
-    let filtered = filters.highShelf.processSample(sample);
-    filtered = filters.highPass.processSample(filtered);
-    return filtered;
-  }
-
-  /**
-   * 实时处理音频块
-   */
   processBlock(data: Float32Array): void {
     this.processChannels([data]);
   }
 
-  /**
-   * 实时处理多声道音频块。Web 内容通常是 mono/stereo；L/R 以 BS.1770 常规权重 1.0 求和。
-   */
   processChannels(channels: Float32Array[]): void {
-    const channelCount = Math.max(1, channels.length);
-    this.ensureChannelCount(channelCount);
+    if (!channels.length) return;
+    this.ensureChannels(channels.length);
+    const frames = Math.max(...channels.map((channel) => channel.length));
+    this.processedFrames += frames;
 
-    const frameCount = channels.reduce((max, channel) => Math.max(max, channel.length), 0);
-    for (let i = 0; i < frameCount; i++) {
-      for (let channel = 0; channel < channelCount; channel++) {
-        const sample = channels[channel]?.[i] ?? 0;
-        this.blockBuffers[channel][this.blockBufferIndex] = this.applyKWeighting(sample, channel);
+    for (let frame = 0; frame < frames; frame++) {
+      for (let channel = 0; channel < channels.length; channel++) {
+        const state = this.filters[channel];
+        const shelf = state.shelf.process(channels[channel][frame] ?? 0);
+        this.buffers[channel][this.bufferIndex] = state.highPass.process(shelf);
       }
-
-      this.blockBufferIndex++;
-      this.samplesSinceLastBlock++;
-
-      if (this.blockBufferIndex >= this.samplesPerBlock) {
-        const meanSquare = this.calculateWeightedMeanSquare(this.blockBuffers, this.samplesPerBlock);
-        const blockLufs = -0.691 + 10 * Math.log10(meanSquare);
-
-        if (blockLufs >= this.absoluteThreshold) {
-          this.blocks.push(meanSquare);
-          this.blockLoudness.push(blockLufs);
-
-          if (this.blocks.length > this.maxBlocks) {
-            this.blocks.shift();
-            this.blockLoudness.shift();
-          }
-        }
-
-        if (this.samplesSinceLastBlock >= this.stepSamples) {
-          for (let channel = 0; channel < this.blockBuffers.length; channel++) {
-            this.blockBuffers[channel].copyWithin(0, this.stepSamples);
-          }
-          this.blockBufferIndex = this.samplesPerBlock - this.stepSamples;
-          this.samplesSinceLastBlock = 0;
-        }
-      }
+      this.bufferIndex++;
+      if (this.bufferIndex === this.samplesPerBlock) this.commitBlock(channels.length);
     }
   }
 
-  /**
-   * 计算均方值
-   */
-  private calculateMeanSquare(buffer: Float32Array, length = buffer.length): number {
-    let sum = 0;
-    for (let i = 0; i < length; i++) {
-      sum += buffer[i] * buffer[i];
-    }
-    return sum / length;
-  }
-
-  private calculateWeightedMeanSquare(buffers: Float32Array[], length: number): number {
-    let sum = 0;
-    for (let channel = 0; channel < buffers.length; channel++) {
-      sum += this.channelWeight(channel) * this.calculateMeanSquare(buffers[channel], length);
-    }
-    return sum;
-  }
-
-  private channelWeight(channel: number): number {
-    // ITU-R BS.1770 uses +1.5 dB for surround channels and ignores LFE. Browser media here is stereo.
-    return channel <= 1 ? 1 : Math.pow(10, 1.5 / 10);
-  }
-
-  /**
-   * 计算积分响度 (ITU-R BS.1770-4 双门限算法)
-   */
   getIntegratedLoudness(): number {
-    if (this.blocks.length === 0) {
-      return NaN;
-    }
-
-    const avgMeanSquare = this.blocks.reduce((a, b) => a + b, 0) / this.blocks.length;
-    const avgLoudness = -0.691 + 10 * Math.log10(avgMeanSquare);
-
-    const relativeThresholdLufs = avgLoudness + this.relativeThreshold;
-
-    let gatedSum = 0;
-    let gatedCount = 0;
-
-    for (let i = 0; i < this.blocks.length; i++) {
-      const blockLufs = this.blockLoudness[i];
-      if (blockLufs >= this.absoluteThreshold && blockLufs >= relativeThresholdLufs) {
-        gatedSum += this.blocks[i];
-        gatedCount++;
-      }
-    }
-
-    if (gatedCount === 0) {
-      return NaN;
-    }
-
-    const gatedMeanSquare = gatedSum / gatedCount;
-    return -0.691 + 10 * Math.log10(gatedMeanSquare);
+    if (!this.blocks.length) return NaN;
+    const ungatedMean = average(this.blocks);
+    const relativeGate = toLufs(ungatedMean) + RELATIVE_GATE_LU;
+    const gated = this.blocks.filter((energy) => toLufs(energy) >= relativeGate);
+    return gated.length ? toLufs(average(gated)) : NaN;
   }
 
-  /**
-   * 获取瞬时响度 (400ms 窗口，无门限)
-   */
   getMomentaryLoudness(): number {
-    if (this.blockBufferIndex < this.samplesPerBlock * 0.5) {
-      return NaN;
-    }
-
-    let sum = 0;
-    for (let channel = 0; channel < this.blockBuffers.length; channel++) {
-      sum += this.channelWeight(channel) * this.calculateMeanSquare(this.blockBuffers[channel], this.blockBufferIndex);
-    }
-    const meanSquare = sum;
-
-    if (meanSquare <= 0) return -Infinity;
-    return -0.691 + 10 * Math.log10(meanSquare);
+    return Number.isFinite(this.momentaryEnergy) ? toLufs(this.momentaryEnergy) : NaN;
   }
 
-  /**
-   * 获取短时响度 (3秒窗口)
-   */
   getShortTermLoudness(): number {
-    const blocksFor3s = Math.ceil(3 / (this.blockSize * (1 - this.overlap)));
-
-    if (this.blocks.length < blocksFor3s) {
-      return this.getIntegratedLoudness();
-    }
-
-    const recentBlocks = this.blocks.slice(-blocksFor3s);
-    const avgMeanSquare = recentBlocks.reduce((a, b) => a + b, 0) / recentBlocks.length;
-
-    if (avgMeanSquare <= 0) return -Infinity;
-    return -0.691 + 10 * Math.log10(avgMeanSquare);
+    if (this.recentBlocks.length < 30) return this.getIntegratedLoudness();
+    return toLufs(average(this.recentBlocks));
   }
 
-  /**
-   * 获取积分时长 (秒)
-   */
   getIntegrationTime(): number {
-    return this.blocks.length * this.blockSize * (1 - this.overlap);
+    return this.processedFrames / this.sampleRate;
   }
 
-  /**
-   * 重置测量器
-   */
   reset(): void {
     this.blocks = [];
-    this.blockLoudness = [];
-    this.blockBuffers.forEach((buffer) => buffer.fill(0));
-    this.blockBufferIndex = 0;
-    this.samplesSinceLastBlock = 0;
-    this.channelFilters.forEach((filters) => {
-      filters.highShelf.reset();
-      filters.highPass.reset();
+    this.recentBlocks = [];
+    this.bufferIndex = 0;
+    this.processedFrames = 0;
+    this.momentaryEnergy = NaN;
+    this.buffers.forEach((buffer) => buffer.fill(0));
+    this.filters.forEach(({ shelf, highPass }) => {
+      shelf.reset();
+      highPass.reset();
     });
   }
 
-  /**
-   * 更新采样率
-   */
-  setSampleRate(sampleRate: number): void {
-    if (this.sampleRate !== sampleRate) {
-      this.sampleRate = sampleRate;
-
-      this.channelFilters = this.channelFilters.map(() => this.createChannelFilters(sampleRate));
-
-      this.samplesPerBlock = Math.ceil(this.blockSize * sampleRate);
-      this.stepSamples = Math.ceil(this.samplesPerBlock * (1 - this.overlap));
-      this.blockBuffers = this.blockBuffers.map(() => new Float32Array(this.samplesPerBlock));
-
-      this.reset();
+  private commitBlock(channelCount: number): void {
+    const energy = this.weightedEnergy(channelCount, this.samplesPerBlock);
+    this.momentaryEnergy = energy;
+    this.recentBlocks.push(energy);
+    if (this.recentBlocks.length > 30) this.recentBlocks.shift();
+    if (toLufs(energy) >= ABSOLUTE_GATE_LUFS) {
+      this.blocks.push(energy);
+      if (this.blocks.length > this.maxBlocks) this.blocks.shift();
     }
+    for (let channel = 0; channel < channelCount; channel++) {
+      this.buffers[channel].copyWithin(0, this.stepSamples);
+    }
+    this.bufferIndex = this.samplesPerBlock - this.stepSamples;
   }
 
-  private createChannelFilters(sampleRate: number): ChannelFilterState {
-    return {
-      highShelf: new IIRFilter(
-        'high_shelf', 1681.9744509555319, 0.7071752369554193, 3.99984385397, sampleRate
-      ),
-      highPass: new IIRFilter(
-        'high_pass', 38.13547087613982, 0.5003270373253953, 0, sampleRate
-      )
-    };
+  private weightedEnergy(channelCount: number, length: number): number {
+    let energy = 0;
+    for (let channel = 0; channel < channelCount; channel++) {
+      let sum = 0;
+      const buffer = this.buffers[channel];
+      for (let frame = 0; frame < length; frame++) sum += buffer[frame] ** 2;
+      const weight = channel < 2 ? 1 : Math.pow(10, 1.5 / 10);
+      energy += weight * sum / length;
+    }
+    return energy;
   }
 
-  private ensureChannelCount(channelCount: number): void {
-    while (this.channelFilters.length < channelCount) {
-      this.channelFilters.push(this.createChannelFilters(this.sampleRate));
-      this.blockBuffers.push(new Float32Array(this.samplesPerBlock));
+  private ensureChannels(count: number): void {
+    while (this.filters.length < count) {
+      this.filters.push(createKWeighting(this.sampleRate));
+      this.buffers.push(new Float32Array(this.samplesPerBlock));
     }
   }
 }
 
-/**
- * 响度归一化工具
- */
 export function calculateGainForLoudness(currentLufs: number, targetLufs: number): number {
-  if (!isFinite(currentLufs) || !isFinite(targetLufs)) {
-    return 1.0;
-  }
-
-  const delta = targetLufs - currentLufs;
-  return Math.pow(10, delta / 20);
+  return Number.isFinite(currentLufs) && Number.isFinite(targetLufs)
+    ? Math.pow(10, (targetLufs - currentLufs) / 20)
+    : 1;
 }
 
-/**
- * RMS 转 LUFS (近似，无 K-weighting)
- */
-export function rmsToLufs(rms: number): number {
-  if (rms <= 0) return -Infinity;
-  return 20 * Math.log10(rms) - 0.691;
+function createKWeighting(sampleRate: number): FilterState {
+  return {
+    shelf: coefficients('shelf', 1681.9744509555319, 0.7071752369554193, 3.99984385397, sampleRate),
+    highPass: coefficients('highPass', 38.13547087613982, 0.5003270373253953, 0, sampleRate)
+  };
 }
 
-/**
- * LUFS 转 RMS
- */
-export function lufsToRms(lufs: number): number {
-  return Math.pow(10, (lufs + 0.691) / 20);
+function coefficients(
+  type: 'shelf' | 'highPass',
+  frequency: number,
+  q: number,
+  gain: number,
+  sampleRate: number
+): Biquad {
+  const k = Math.tan(Math.PI * frequency / sampleRate);
+  const a0 = 1 + k / q + k * k;
+  const a1 = 2 * (k * k - 1) / a0;
+  const a2 = (1 - k / q + k * k) / a0;
+  if (type === 'highPass') return new Biquad(1 / a0, -2 / a0, 1 / a0, a1, a2);
+  const high = Math.pow(10, gain / 20);
+  const middle = Math.pow(high, 0.499666774155);
+  return new Biquad(
+    (high + middle * k / q + k * k) / a0,
+    2 * (k * k - high) / a0,
+    (high - middle * k / q + k * k) / a0,
+    a1,
+    a2
+  );
+}
+
+function average(values: number[]): number {
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function toLufs(energy: number): number {
+  return energy > 0 ? -0.691 + 10 * Math.log10(energy) : -Infinity;
 }

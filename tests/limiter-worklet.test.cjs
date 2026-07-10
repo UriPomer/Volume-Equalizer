@@ -143,3 +143,22 @@ test('default limiter constrains 4x cubic interpolated true-peak estimate', () =
 
   assert.ok(maxCubicInterpolatedPeak(output, 4) <= 0.891251);
 });
+
+test('processor reports continuous original and output audio', () => {
+  const ProcessorClass = loadProcessor();
+  const processor = new ProcessorClass({ processorOptions: {} });
+  const messages = [];
+  processor.port = { postMessage: (message) => messages.push(message) };
+
+  for (let block = 0; block < 40; block++) {
+    const processed = new Float32Array(128).fill(0.25);
+    const original = new Float32Array(128).fill(0.5);
+    processor.process([[processed], [original]], [[new Float32Array(128)]]);
+  }
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].type, 'meter');
+  assert.equal(messages[0].original.length, 1);
+  assert.equal(messages[0].original[0].length, 4800);
+  assert.ok(Math.abs(messages[0].original[0][0] - 0.5) < 1e-6);
+});

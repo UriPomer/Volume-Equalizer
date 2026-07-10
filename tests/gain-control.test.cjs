@@ -268,6 +268,7 @@ test('gain stays within a fixed 0.2x corridor after ten seconds', () => {
   }));
   assert.equal(lowerBound.state, 'bounded');
   assert.equal(upperBound.state, 'bounded');
+  assert.equal(agc.isLocked(), false);
   assert.ok(upperBound.nextGain - lowerBound.nextGain <= 0.200001);
 });
 
@@ -285,9 +286,57 @@ test('low gain attenuation is also limited in the decibel domain', () => {
   assert.ok(stepDb <= 0.500001);
 });
 
-test('external full-track result locks gain immediately', () => {
+test('external full-track result approaches fixed gain without an instant jump', () => {
   const agc = new RealtimeAgc();
   agc.lockGain(0.75);
   assert.equal(agc.isLocked(), true);
-  assert.equal(agc.update(agcInput({ desiredGain: 2, sourcePeak: 0.99 })).nextGain, 0.75);
+  const first = agc.update(agcInput({
+    currentGain: 1.5,
+    desiredGain: 2,
+    sourcePeak: 0.99,
+    deltaSec: 0.1
+  }));
+  assert.ok(first.nextGain < 1.5 && first.nextGain > 0.75);
+});
+
+test('leaving full-track mode preserves current gain corridor', () => {
+  const agc = new RealtimeAgc();
+  agc.lockGain(0.75);
+  agc.unlockGain(0.75, 0.25, 2);
+
+  const resumed = agc.update(agcInput({
+    currentGain: 0.75,
+    desiredGain: 1.5,
+    programTimeSeconds: 20,
+    deltaSec: 1
+  }));
+
+  assert.equal(agc.isLocked(), false);
+  assert.ok(resumed.nextGain >= 0.75);
+  assert.ok(resumed.nextGain <= 0.85);
+});
+
+test('new gain bounds cannot create an inverted corridor', () => {
+  const agc = new RealtimeAgc();
+  agc.unlockGain(2, 0.25, 1);
+  const result = agc.update(agcInput({
+    currentGain: 2,
+    desiredGain: 0.5,
+    minGain: 0.25,
+    maxGain: 1,
+    programTimeSeconds: 20
+  }));
+  assert.ok(result.nextGain >= 0.9 && result.nextGain <= 1);
+});
+
+test('late attachment still receives a full observed calibration window', () => {
+  const agc = new RealtimeAgc();
+  const result = agc.update(agcInput({
+    currentGain: 1,
+    desiredGain: 1.5,
+    integrationTime: 1,
+    programTimeSeconds: 120,
+    coldStartSeconds: 10
+  }));
+  assert.equal(result.state, 'cold-start');
 });

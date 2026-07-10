@@ -28,3 +28,11 @@ export function errorFailure(key: string, message: string, error?: unknown): voi
     console.error(`${BRAND} ${message}`);
   }
 }
+
+export function logDiagnostic(message: string, details?: unknown): void {
+  if (details !== undefined) {
+    console.info(`${BRAND} ${message}`, details);
+  } else {
+    console.info(`${BRAND} ${message}`);
+  }
+}
