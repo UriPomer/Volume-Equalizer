@@ -97,11 +97,15 @@ class FakeMedia extends EventTarget {
 }
 
 const rafCallbacks = [];
+const documentListeners = new Map();
 global.window = { AudioContext: FakeContext };
 global.document = {
   hidden: false,
-  addEventListener() {},
-  removeEventListener() {}
+  visibilityState: 'visible',
+  addEventListener(type, listener) { documentListeners.set(type, listener); },
+  removeEventListener(type, listener) {
+    if (documentListeners.get(type) === listener) documentListeners.delete(type);
+  }
 };
 global.chrome = { runtime: { getURL: (path) => `chrome-extension://test/${path}` } };
 global.AudioWorkletNode = FakeWorkletNode;
@@ -144,5 +148,30 @@ test('controller connects continuous stereo meter and drives gain state', async 
 
   assert.ok(state.originalRms > 0);
   assert.ok(Number.isFinite(state.gain));
+  controller.destroy();
+});
+
+test('returning to a tab preserves a completed full-track gain lock', async () => {
+  const media = new FakeMedia();
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.settings.fullAudioAnalysis = true;
+  controller.analysisResult = {
+    integratedLufs: -24,
+    samplePeak: 0.2,
+    estimatedTruePeak: 0.2,
+    duration: 60,
+    sourceUrl: 'https://example.test/audio'
+  };
+  controller.applyFullTrackGain();
+  assert.equal(controller.agc.isLocked(), true);
+
+  global.document.visibilityState = 'hidden';
+  documentListeners.get('visibilitychange')();
+  global.document.visibilityState = 'visible';
+  documentListeners.get('visibilitychange')();
+
+  assert.equal(controller.agc.isLocked(), true);
   controller.destroy();
 });

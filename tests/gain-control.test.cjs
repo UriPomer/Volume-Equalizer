@@ -217,7 +217,7 @@ test('startup predictor attenuates sudden loud content', () => {
   assert.ok(attenuated.nextGain < initial.nextGain);
 });
 
-test('peak headroom only tightens for the current programme', () => {
+test('peak headroom is released after the transient has passed', () => {
   const agc = new RealtimeAgc();
   const peakLimited = agc.update(agcInput({
     currentGain: 1,
@@ -232,10 +232,10 @@ test('peak headroom only tightens for the current programme', () => {
     sourcePeak: 0.1
   }));
 
-  assert.ok(afterQuietBlock.nextGain <= 0.8912509381337456 / 0.8);
+  assert.ok(afterQuietBlock.nextGain > peakLimited.nextGain);
 });
 
-test('gain stays within a fixed 0.2x corridor after ten seconds', () => {
+test('gain keeps converging after the calibration period', () => {
   const agc = new RealtimeAgc();
   let gain = 1;
   let result;
@@ -251,7 +251,8 @@ test('gain stays within a fixed 0.2x corridor after ten seconds', () => {
     gain = result.nextGain;
   }
 
-  assert.equal(result.state, 'bounded');
+  assert.equal(result.state, 'hold');
+  assert.ok(Math.abs(gain - 1.5) < 1e-12);
   const lowerBound = agc.update(agcInput({
     currentGain: gain,
     desiredGain: 0.8,
@@ -266,10 +267,10 @@ test('gain stays within a fixed 0.2x corridor after ten seconds', () => {
     integrationTime: 20,
     sourcePeak: 0.1
   }));
-  assert.equal(lowerBound.state, 'bounded');
-  assert.equal(upperBound.state, 'bounded');
+  assert.equal(lowerBound.state, 'attenuate');
+  assert.equal(upperBound.state, 'boost');
   assert.equal(agc.isLocked(), false);
-  assert.ok(upperBound.nextGain - lowerBound.nextGain <= 0.200001);
+  assert.ok(upperBound.nextGain - lowerBound.nextGain > 0.2);
 });
 
 test('low gain attenuation is also limited in the decibel domain', () => {
@@ -299,10 +300,10 @@ test('external full-track result approaches fixed gain without an instant jump',
   assert.ok(first.nextGain < 1.5 && first.nextGain > 0.75);
 });
 
-test('leaving full-track mode preserves current gain corridor', () => {
+test('leaving full-track mode resumes slew-limited realtime control', () => {
   const agc = new RealtimeAgc();
   agc.lockGain(0.75);
-  agc.unlockGain(0.75, 0.25, 2);
+  agc.unlockGain();
 
   const resumed = agc.update(agcInput({
     currentGain: 0.75,
@@ -312,13 +313,13 @@ test('leaving full-track mode preserves current gain corridor', () => {
   }));
 
   assert.equal(agc.isLocked(), false);
-  assert.ok(resumed.nextGain >= 0.75);
-  assert.ok(resumed.nextGain <= 0.85);
+  assert.ok(resumed.nextGain > 0.75);
+  assert.ok(resumed.nextGain < 1.5);
 });
 
-test('new gain bounds cannot create an inverted corridor', () => {
+test('new gain bounds clamp the current gain before realtime adjustment', () => {
   const agc = new RealtimeAgc();
-  agc.unlockGain(2, 0.25, 1);
+  agc.unlockGain();
   const result = agc.update(agcInput({
     currentGain: 2,
     desiredGain: 0.5,
@@ -326,7 +327,7 @@ test('new gain bounds cannot create an inverted corridor', () => {
     maxGain: 1,
     programTimeSeconds: 20
   }));
-  assert.ok(result.nextGain >= 0.9 && result.nextGain <= 1);
+  assert.ok(result.nextGain >= 0.5 && result.nextGain <= 1);
 });
 
 test('late attachment still receives a full observed calibration window', () => {

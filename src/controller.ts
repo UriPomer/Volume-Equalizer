@@ -65,7 +65,12 @@ export class MediaVolumeController {
   };
 
   private readonly onLoadedMetadata = () => this.startAnalysis();
-  private readonly onVisibility = () => { this.lastTickAt = performance.now(); };
+  private readonly onVisibility = () => {
+    this.lastTickAt = performance.now();
+    if (document.visibilityState === 'visible') {
+      this.resetMeters(!(this.settings.fullAudioAnalysis && this.analysisResult));
+    }
+  };
 
   constructor(
     media: HTMLMediaElement,
@@ -115,13 +120,12 @@ export class MediaVolumeController {
 
     const boundsChanged = changed === 'minGain' || changed === 'maxGain';
     if (changed === 'targetLufs') {
-      this.outputMeter.reset();
+      this.resetMeters();
       if (clean.fullAudioAnalysis && this.analysisResult) this.applyFullTrackGain();
-      else this.agc.reset();
     }
     if (boundsChanged) {
       if (clean.fullAudioAnalysis && this.analysisResult) this.applyFullTrackGain();
-      else this.agc.unlockGain(this.gain.gain.value, clean.minGain, clean.maxGain);
+      else this.agc.unlockGain();
       this.setGain(this.gain.gain.value);
     }
     if (changed !== 'fullAudioAnalysis') return;
@@ -134,7 +138,7 @@ export class MediaVolumeController {
     this.cancelAnalysis();
     this.analysisResult = null;
     if (this.agc.isLocked()) {
-      this.agc.unlockGain(this.gain.gain.value, clean.minGain, clean.maxGain);
+      this.agc.unlockGain();
     }
     this.analysisStatus = 'realtime';
     logDiagnostic('完整音轨模式：关闭，保留实时状态', this.diagnosticState());
@@ -322,10 +326,10 @@ export class MediaVolumeController {
     this.gain.gain.setValueAtTime(gain, this.context.currentTime);
   }
 
-  private resetMeters(): void {
+  private resetMeters(resetAgc = true): void {
     this.originalMeter.reset();
     this.outputMeter.reset();
-    this.agc.reset();
+    if (resetAgc) this.agc.reset();
     this.originalRms = this.outputRms = this.originalPeak = 0;
   }
 

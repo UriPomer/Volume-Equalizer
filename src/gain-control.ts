@@ -26,7 +26,7 @@ export interface AgcUpdateInput {
 export interface AgcUpdateResult {
   nextGain: number;
   gateOpen: boolean;
-  state: 'cold-start' | 'noise-hold' | 'attenuate' | 'boost' | 'hold' | 'locked' | 'bounded';
+  state: 'cold-start' | 'noise-hold' | 'attenuate' | 'boost' | 'hold' | 'locked';
   peakLimitedGain: number;
   riseScale: number;
 }
@@ -49,7 +49,6 @@ const GATE_PEAK_CLOSE = 0.025;
 const GATE_CLOSE_HOLD_SEC = 0.8;
 const MAX_BOOST_DB_PER_SEC = 2;
 const MAX_ATTENUATION_DB_PER_SEC = 5;
-const POST_CALIBRATION_GAIN_RANGE = 0.2;
 
 export function chooseControlLoudness(input: LoudnessSelectionInput): number {
   if (input.integrationTime < input.minIntegrationSeconds) {
@@ -73,21 +72,15 @@ export class RealtimeAgc {
   private gateOpen = false;
   private noiseFloorLufs = NOISE_FLOOR_INITIAL_LUFS;
   private closeHoldSec = 0;
-  private programmePeakLimitedGain = Number.POSITIVE_INFINITY;
   private predictionElapsedSec = 0;
   private lockedProgramGain: number | null = null;
-  private corridorMinGain: number | null = null;
-  private corridorMaxGain: number | null = null;
 
   reset(): void {
     this.gateOpen = false;
     this.noiseFloorLufs = NOISE_FLOOR_INITIAL_LUFS;
     this.closeHoldSec = 0;
-    this.programmePeakLimitedGain = Number.POSITIVE_INFINITY;
     this.predictionElapsedSec = 0;
     this.lockedProgramGain = null;
-    this.corridorMinGain = null;
-    this.corridorMaxGain = null;
   }
 
   isLocked(): boolean {
@@ -98,12 +91,8 @@ export class RealtimeAgc {
     if (Number.isFinite(gain)) this.lockedProgramGain = gain;
   }
 
-  unlockGain(currentGain: number, minGain: number, maxGain: number): void {
+  unlockGain(): void {
     this.lockedProgramGain = null;
-    const halfRange = POST_CALIBRATION_GAIN_RANGE / 2;
-    const center = Math.min(Math.max(currentGain, minGain), maxGain);
-    this.corridorMinGain = Math.max(minGain, center - halfRange);
-    this.corridorMaxGain = Math.min(maxGain, center + halfRange);
   }
 
   update(input: AgcUpdateInput): AgcUpdateResult {
@@ -134,32 +123,6 @@ export class RealtimeAgc {
       : calculateGainForLoudness(input.controlLufs, input.targetLufs);
     const desiredGain = this.computeDesiredGain(input, targetGain, peakLimitedGain, riseScale);
     const currentGain = Math.min(Math.max(input.currentGain, input.minGain), input.maxGain);
-
-    if (!isCalibrating) {
-      if (this.corridorMinGain === null || this.corridorMaxGain === null) {
-        const halfRange = POST_CALIBRATION_GAIN_RANGE / 2;
-        this.corridorMinGain = Math.max(input.minGain, desiredGain - halfRange);
-        this.corridorMaxGain = Math.min(input.maxGain, desiredGain + halfRange);
-      }
-      const boundedDesiredGain = Math.min(
-        Math.max(desiredGain, this.corridorMinGain),
-        this.corridorMaxGain
-      );
-      const boundedNextGain = Math.min(
-        Math.max(
-          this.slewLimitGain(input, currentGain, boundedDesiredGain, riseScale),
-          this.corridorMinGain
-        ),
-        this.corridorMaxGain
-      );
-      return {
-        nextGain: boundedNextGain,
-        gateOpen: this.gateOpen,
-        state: 'bounded',
-        peakLimitedGain,
-        riseScale
-      };
-    }
 
     if (!this.gateOpen && desiredGain > currentGain) {
       return {
@@ -237,12 +200,8 @@ export class RealtimeAgc {
       maxAllowedGain = Math.min(maxAllowedGain, LOW_CONFIDENCE_GAIN_CEILING);
     }
     if (isFinite(input.sourcePeak) && input.sourcePeak > 0) {
-      this.programmePeakLimitedGain = Math.min(
-        this.programmePeakLimitedGain,
-        SAMPLE_PEAK_CEILING / input.sourcePeak
-      );
+      maxAllowedGain = Math.min(maxAllowedGain, SAMPLE_PEAK_CEILING / input.sourcePeak);
     }
-    maxAllowedGain = Math.min(maxAllowedGain, this.programmePeakLimitedGain);
 
     return maxAllowedGain;
   }
