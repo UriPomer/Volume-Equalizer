@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 import {
   DEFAULT_REFERENCE_SETTINGS,
   calculateReferenceTrackGain,
@@ -16,7 +17,11 @@ const fixtures = JSON.parse(readFileSync(join(root, 'tests', 'fixtures', 'audio-
 const fixtureDir = join(root, 'tests', 'fixtures', 'videos');
 const resultsDir = join(root, 'test-results');
 const traceEnabled = process.argv.includes('--trace');
+const enforceEnabled = process.argv.includes('--enforce');
 const compiledDir = join(tmpdir(), `bili-volume-audio-benchmark-${process.pid}`);
+const OUTPUT_TARGET_TOLERANCE_LU = 1;
+const GAIN_ROBUST_SPAN_LIMIT_DB = 1.5;
+const GAIN_MAX_SPAN_LIMIT_DB = 3;
 
 for (const fixture of fixtures) {
   if (!existsSync(join(fixtureDir, fixture.file))) {
@@ -29,6 +34,7 @@ const require = createRequire(import.meta.url);
 const { LoudnessMeter } = require(join(compiledDir, 'loudness-meter.js'));
 const { RealtimeAgc, chooseControlLoudness } = require(join(compiledDir, 'gain-control.js'));
 const { calculateFullAudioGain, TruePeakEstimator } = require(join(compiledDir, 'full-audio-analysis.js'));
+const LimiterProcessor = loadLimiterProcessor();
 
 mkdirSync(resultsDir, { recursive: true });
 const reports = [];
@@ -48,7 +54,8 @@ try {
       RealtimeAgc,
       chooseControlLoudness,
       calculateFullAudioGain,
-      TruePeakEstimator
+      TruePeakEstimator,
+      LimiterProcessor
     });
 
     const report = {
@@ -71,6 +78,10 @@ try {
       },
       realtime: {
         outputIntegratedLufs: round(simulation.outputIntegratedLufs, 3),
+        outputTargetDiffLu: round(
+          simulation.outputIntegratedLufs - DEFAULT_REFERENCE_SETTINGS.targetLufs,
+          3
+        ),
         outputVsOfflineLu: round(simulation.outputIntegratedLufs - reference.predictedOutputLufs, 3),
         finalGainDb: round(linearToDb(simulation.finalGain), 3),
         finalGainDiffDb: round(linearToDb(simulation.finalGain) - reference.gainDb, 3),
@@ -80,15 +91,16 @@ try {
         maxStepDb: round(simulation.maxStepDb, 3),
         gainAt10Seconds: round(simulation.gainAt10Seconds, 6),
         finalGain: round(simulation.finalGain, 6),
-        finalGainDiffDb: round(linearToDb(simulation.finalGain) - reference.gainDb, 3),
-        gainRangeAfter10X: round(simulation.gainRangeAfter10X, 6),
-        gainChangesBefore10: simulation.gainChangesBefore10,
-        gainChangesAfter10: simulation.gainChangesAfter10
+        gainRobustSpanAfter10Db: round(simulation.gainRobustSpanAfter10Db, 3),
+        gainMaxSpanAfter10Db: round(simulation.gainMaxSpanAfter10Db, 3)
       }
     };
-    report.realtime.variationPass = report.realtime.gainRangeAfter10X <= 0.2;
-    report.realtime.gainAccuracyPass = Math.abs(report.realtime.finalGainDiffDb) <= 1;
-    report.realtime.pass = report.realtime.variationPass;
+    report.realtime.loudnessPass = Math.abs(report.realtime.outputTargetDiffLu)
+      <= OUTPUT_TARGET_TOLERANCE_LU;
+    report.realtime.stabilityPass = report.realtime.gainRobustSpanAfter10Db
+      <= GAIN_ROBUST_SPAN_LIMIT_DB
+      && report.realtime.gainMaxSpanAfter10Db <= GAIN_MAX_SPAN_LIMIT_DB;
+    report.realtime.pass = report.realtime.loudnessPass && report.realtime.stabilityPass;
     reports.push(report);
 
     if (traceEnabled) {
@@ -104,6 +116,10 @@ try {
   console.log(renderConsole(reports));
   console.log(`report - ${join(resultsDir, 'audio-benchmark.md')}`);
   console.log(`detailed gain trace - ${traceEnabled ? 'enabled' : 'disabled (use npm run test:audio:trace)'}`);
+  if (enforceEnabled
+    && reports.some((report) => report.includedInEvaluation && !report.realtime.pass)) {
+    process.exitCode = 1;
+  }
 } finally {
   rmSync(compiledDir, { recursive: true, force: true });
 }
@@ -121,6 +137,19 @@ function compileMeasurementModules(outDir) {
     '--lib', 'es2020,dom',
     '--skipLibCheck'
   ], { cwd: root, stdio: 'inherit' });
+}
+
+function loadLimiterProcessor() {
+  let Processor;
+  runInNewContext(
+    readFileSync(join(root, 'public', 'limiter-worklet.js'), 'utf8'),
+    {
+      sampleRate: 48000,
+      AudioWorkletProcessor: class {},
+      registerProcessor(_name, implementation) { Processor = implementation; }
+    }
+  );
+  return Processor;
 }
 
 function decodeStereoPcm(filePath, inputGainDb) {
@@ -152,7 +181,8 @@ function simulateRealtime(pcm, modules) {
     RealtimeAgc,
     chooseControlLoudness,
     calculateFullAudioGain,
-    TruePeakEstimator
+    TruePeakEstimator,
+    LimiterProcessor
   } = modules;
   const inputMeter = new LoudnessMeter(pcm.sampleRate, Number.POSITIVE_INFINITY);
   const outputMeter = new LoudnessMeter(pcm.sampleRate, Number.POSITIVE_INFINITY);
@@ -165,6 +195,16 @@ function simulateRealtime(pcm, modules) {
   let maxStepDb = 0;
   let samplePeak = 0;
   const truePeakEstimator = new TruePeakEstimator();
+  const limiter = new LimiterProcessor({
+    processorOptions: {
+      lookaheadMs: 15,
+      releaseMs: 50,
+      ceiling: 0.8912509381337456,
+      interSampleMargin: 1.03
+    }
+  });
+  limiter.port = { postMessage() {} };
+  const evaluationGainDb = [];
 
   for (let startFrame = 0; startFrame < pcm.samples.length / 2; startFrame += chunkFrames) {
     const frames = Math.min(chunkFrames, pcm.samples.length / 2 - startFrame);
@@ -214,18 +254,23 @@ function simulateRealtime(pcm, modules) {
       state = result.state;
     }
 
+    const gainedLeft = new Float32Array(frames);
+    const gainedRight = new Float32Array(frames);
+    for (let frame = 0; frame < frames; frame++) {
+      gainedLeft[frame] = left[frame] * gain;
+      gainedRight[frame] = right[frame] * gain;
+    }
     const outputLeft = new Float32Array(frames);
     const outputRight = new Float32Array(frames);
-    for (let frame = 0; frame < frames; frame++) {
-      outputLeft[frame] = left[frame] * gain;
-      outputRight[frame] = right[frame] * gain;
-    }
+    limiter.process([[gainedLeft, gainedRight]], [[outputLeft, outputRight]]);
     outputMeter.processChannels([outputLeft, outputRight]);
     minGain = Math.min(minGain, gain);
     maxGain = Math.max(maxGain, gain);
     maxStepDb = Math.max(maxStepDb, Math.abs(linearToDb(gain / previousGain)));
+    const timeSeconds = (startFrame + frames) / pcm.sampleRate;
+    if (timeSeconds >= 10) evaluationGainDb.push(linearToDb(gain));
     trace.push({
-      timeSeconds: round((startFrame + frames) / pcm.sampleRate, 3),
+      timeSeconds: round(timeSeconds, 3),
       integratedLufs: round(integratedLufs, 3),
       controlLufs: round(controlLufs, 3),
       gain: round(gain, 6),
@@ -247,10 +292,9 @@ function simulateRealtime(pcm, modules) {
     2
   );
   const evaluationTrace = trace.filter((entry) => entry.timeSeconds >= 10);
-  const evaluationGains = evaluationTrace.map((entry) => entry.gain);
-  const evaluationMinGain = Math.min(...evaluationGains);
-  const evaluationMaxGain = Math.max(...evaluationGains);
-  const changed = (entry) => Math.abs(entry.stepDb ?? 0) > 0.0001;
+  evaluationGainDb.sort((a, b) => a - b);
+  const evaluationMinGainDb = evaluationGainDb[0] ?? linearToDb(gain);
+  const evaluationMaxGainDb = evaluationGainDb.at(-1) ?? linearToDb(gain);
 
   return {
     fullIntegratedLufs,
@@ -261,38 +305,52 @@ function simulateRealtime(pcm, modules) {
     maxGain,
     maxStepDb,
     gainAt10Seconds: evaluationTrace[0]?.gain ?? gain,
-    gainRangeAfter10X: evaluationMaxGain - evaluationMinGain,
-    gainChangesBefore10: trace.filter((entry) => entry.timeSeconds < 10 && changed(entry)).length,
-    gainChangesAfter10: evaluationTrace.filter(changed).length,
+    gainRobustSpanAfter10Db: percentile(evaluationGainDb, 0.95)
+      - percentile(evaluationGainDb, 0.05),
+    gainMaxSpanAfter10Db: evaluationMaxGainDb - evaluationMinGainDb,
     trace
   };
 }
 
 function renderConsole(reports) {
-  const header = 'fixture                 offline  gain@10s  final gain  final ΔdB  range 10s+  range  accuracy';
+  const header = 'fixture                 output LUFS  target ΔLU  P95-P5 dB  max span dB  loudness  stability  result';
   const rows = reports.map((report) => [
     report.id.padEnd(23),
-    String(report.offlineReference.gain).padStart(7),
-    String(report.realtime.gainAt10Seconds).padStart(8),
-    String(report.realtime.finalGain).padStart(10),
-    String(report.realtime.finalGainDiffDb).padStart(9),
-    String(report.realtime.gainRangeAfter10X).padStart(10),
-    String(report.includedInEvaluation ? (report.realtime.variationPass ? 'PASS' : 'FAIL') : 'INFO').padStart(6),
-    String(report.includedInEvaluation ? (report.realtime.gainAccuracyPass ? 'PASS' : 'FAIL') : 'INFO').padStart(8)
+    String(report.realtime.outputIntegratedLufs).padStart(11),
+    String(report.realtime.outputTargetDiffLu).padStart(10),
+    String(report.realtime.gainRobustSpanAfter10Db).padStart(10),
+    String(report.realtime.gainMaxSpanAfter10Db).padStart(11),
+    resultText(report, 'loudnessPass').padStart(8),
+    resultText(report, 'stabilityPass').padStart(9),
+    resultText(report, 'pass').padStart(6)
   ].join('  '));
   return [header, ...rows].join('\n');
 }
 
 function renderMarkdown(summary) {
   const rows = summary.reports.map((report) =>
-    `| ${report.id} | ${report.includedInEvaluation ? 'Evaluation' : 'Diagnostic only'} | ${report.offlineReference.gain} | ${report.realtime.gainAt10Seconds} | ${report.realtime.finalGain} | ${report.realtime.finalGainDiffDb} | ${report.realtime.gainRangeAfter10X} | ${report.realtime.gainChangesAfter10} | ${report.fullTrackImplementation.gain} | ${report.includedInEvaluation ? (report.realtime.variationPass ? 'PASS' : 'FAIL') : 'INFO'} | ${report.includedInEvaluation ? (report.realtime.gainAccuracyPass ? 'PASS' : 'FAIL') : 'INFO'} |`
+    `| ${report.id} | ${report.includedInEvaluation ? 'Evaluation' : 'Diagnostic only'} | ${report.realtime.outputIntegratedLufs} | ${report.realtime.outputTargetDiffLu} | ${report.realtime.gainRobustSpanAfter10Db} | ${report.realtime.gainMaxSpanAfter10Db} | ${report.realtime.finalGainDiffDb} | ${resultText(report, 'loudnessPass')} | ${resultText(report, 'stabilityPass')} | ${resultText(report, 'pass')} |`
   );
   return `# Audio normalization benchmark\n\n` +
     `Generated: ${summary.generatedAt}\n\n` +
     `Target: ${summary.targetLufs} LUFS; offline reference uses whole-program FFmpeg loudnorm measurement and one fixed, true-peak-safe gain. Detailed trace: ${summary.traceEnabled ? 'enabled' : 'disabled'}.\n\n` +
-    `Primary pass criterion: gain range from 10 seconds to end ≤ 0.2x. Accuracy diagnostic: final gain error ≤ 1 dB. Extreme-peak fixtures are diagnostic only and excluded from conclusions.\n\n` +
-    `| Fixture | Use | Offline fixed gain | Gain at 10s | Final gain | Final diff dB | Range 10s+ | Changes 10s+ | Full-track gain | Range result | Accuracy |\n` +
-    `|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n` + rows.join('\n') + '\n';
+    `Pass criteria: output loudness within ±${OUTPUT_TARGET_TOLERANCE_LU} LU of target, gain P95–P5 after 10 seconds ≤ ${GAIN_ROBUST_SPAN_LIMIT_DB} dB, and maximum gain span after 10 seconds ≤ ${GAIN_MAX_SPAN_LIMIT_DB} dB. Extreme-peak fixtures are diagnostic only.\n\n` +
+    `| Fixture | Use | Output LUFS | Target diff LU | Gain P95–P5 dB | Max gain span dB | Final gain diff dB | Loudness | Stability | Result |\n` +
+    `|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n` + rows.join('\n') + '\n';
+}
+
+function percentile(sortedValues, fraction) {
+  if (!sortedValues.length) return 0;
+  const index = (sortedValues.length - 1) * fraction;
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  const weight = index - lower;
+  return sortedValues[lower] * (1 - weight) + sortedValues[upper] * weight;
+}
+
+function resultText(report, field) {
+  if (!report.includedInEvaluation) return 'INFO';
+  return report.realtime[field] ? 'PASS' : 'FAIL';
 }
 
 function mapRounded(value) {
