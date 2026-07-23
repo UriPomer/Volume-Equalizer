@@ -8,7 +8,9 @@ function loadProcessor() {
   let Processor = null;
   const context = {
     sampleRate: 48000,
-    AudioWorkletProcessor: class {},
+    AudioWorkletProcessor: class {
+      constructor() { this.port = { onmessage: null, postMessage() {} }; }
+    },
     registerProcessor(name, klass) {
       assert.equal(name, 'lookahead-peak-limiter');
       Processor = klass;
@@ -76,11 +78,12 @@ class FakeWorkletNode extends FakeNode {
     this.context = context;
     this.name = name;
     this.options = options;
-    this.port = { onmessage: null };
     this.processor = new ProcessorClass(options);
-    this.processor.port = {
-      postMessage: (data) => this.port.onmessage?.({ data })
+    this.port = {
+      onmessage: null,
+      postMessage: (data) => this.processor.port.onmessage?.({ data })
     };
+    this.processor.port.postMessage = (data) => this.port.onmessage?.({ data });
     global.lastWorklet = this;
   }
 }
@@ -102,9 +105,12 @@ global.window = { AudioContext: FakeContext };
 global.document = {
   hidden: false,
   visibilityState: 'visible',
-  addEventListener(type, listener) { documentListeners.set(type, listener); },
+  addEventListener(type, listener) {
+    if (!documentListeners.has(type)) documentListeners.set(type, new Set());
+    documentListeners.get(type).add(listener);
+  },
   removeEventListener(type, listener) {
-    if (documentListeners.get(type) === listener) documentListeners.delete(type);
+    documentListeners.get(type)?.delete(listener);
   }
 };
 global.chrome = { runtime: { getURL: (path) => `chrome-extension://test/${path}` } };
@@ -122,6 +128,12 @@ const settings = {
   bassBoost: 0,
   gainChangePerSec: 0.2
 };
+
+function setVisibility(state) {
+  global.document.visibilityState = state;
+  global.document.hidden = state === 'hidden';
+  for (const listener of documentListeners.get('visibilitychange') || []) listener();
+}
 
 test('controller connects continuous stereo meter and drives gain state', async () => {
   const media = new FakeMedia();
@@ -151,12 +163,90 @@ test('controller connects continuous stereo meter and drives gain state', async 
   controller.destroy();
 });
 
+test('background ticks do not run realtime gain control', async (t) => {
+  const media = new FakeMedia();
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  t.after(() => {
+    setVisibility('visible');
+    controller.destroy();
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.gain.gain.value = 0.6;
+  controller.updateGain = () => controller.setGain(1.5);
+  setVisibility('hidden');
+  controller.tick();
+
+  assert.equal(controller.gain.gain.value, 0.6);
+});
+
+test('background automatic resets cannot raise the frozen gain', async (t) => {
+  const media = new FakeMedia();
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  t.after(() => {
+    setVisibility('visible');
+    controller.destroy();
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.gain.gain.value = 0.6;
+  setVisibility('hidden');
+  media.dispatchEvent(new Event('emptied'));
+
+  assert.equal(controller.gain.gain.value, 0.6);
+});
+
+test('reenabling starts from unity with empty realtime measurements', async () => {
+  const media = new FakeMedia();
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.gain.gain.value = 1.8;
+  controller.originalMeter.processBlock(new Float32Array(48000).fill(0.1));
+  controller.updateSettings({ ...settings, enabled: false });
+  controller.updateSettings({ ...settings, enabled: true });
+
+  assert.equal(controller.gain.gain.value, 1);
+  assert.equal(controller.originalMeter.getIntegrationTime(), 0);
+  controller.destroy();
+});
+
+test('stale worklet meter epochs are ignored after a lifecycle transition', async () => {
+  const media = new FakeMedia();
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const staleEpoch = controller.meterEpoch - 1;
+  controller.consumeAudio({
+    type: 'meter',
+    epoch: staleEpoch,
+    original: [new Float32Array(4800).fill(0.2)],
+    output: [new Float32Array(4800).fill(0.2)]
+  });
+
+  assert.equal(controller.originalMeter.getIntegrationTime(), 0);
+  controller.destroy();
+});
+
+test('a failed full-track source is not retried on every play', async () => {
+  const media = new FakeMedia();
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.settings = { ...controller.settings, fullAudioAnalysis: true };
+  controller.analysisAttemptKey = controller.analysisKey();
+  controller.startAnalysis();
+
+  assert.equal(controller.analysisAbort, null);
+  controller.destroy();
+});
+
 test('returning to a tab preserves a completed full-track gain lock', async () => {
   const media = new FakeMedia();
   const controller = new MediaVolumeController(media, settings, () => {}, () => {});
   await new Promise((resolve) => setImmediate(resolve));
 
-  controller.settings.fullAudioAnalysis = true;
+  controller.settings = { ...controller.settings, fullAudioAnalysis: true };
   controller.analysisResult = {
     integratedLufs: -24,
     samplePeak: 0.2,
@@ -167,10 +257,8 @@ test('returning to a tab preserves a completed full-track gain lock', async () =
   controller.applyFullTrackGain();
   assert.equal(controller.agc.isLocked(), true);
 
-  global.document.visibilityState = 'hidden';
-  documentListeners.get('visibilitychange')();
-  global.document.visibilityState = 'visible';
-  documentListeners.get('visibilitychange')();
+  setVisibility('hidden');
+  setVisibility('visible');
 
   assert.equal(controller.agc.isLocked(), true);
   controller.destroy();

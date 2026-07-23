@@ -9,6 +9,7 @@ import { AnalysisStatus, MeterState } from './types';
 
 type MeterMessage = {
   type: 'meter';
+  epoch: number;
   original: Float32Array[];
   output: Float32Array[];
 };
@@ -32,28 +33,30 @@ export class MediaVolumeController {
   private readonly gain: GainNode;
   private readonly bass: BiquadFilterNode;
   private readonly fallbackLimiter: DynamicsCompressorNode;
-  private readonly fallbackAnalyser: AnalyserNode;
-  private readonly fallbackBuffer: Float32Array<ArrayBuffer>;
   private processor: AudioWorkletNode | null = null;
   private originalMeter: LoudnessMeter;
   private outputMeter: LoudnessMeter;
   private agc = new RealtimeAgc();
   private analysisStatus: AnalysisStatus = 'realtime';
   private analysisAbort: AbortController | null = null;
+  private analysisAttemptKey: string | null = null;
   private analysisResult: FullAudioAnalysisResult | null = null;
+  private meterEpoch = 0;
   private originalRms = 0;
   private outputRms = 0;
   private originalPeak = 0;
   private rafId = 0;
   private lastTickAt = performance.now();
+  private backgroundGainCeiling: number | null = null;
   private destroyed = false;
 
   private readonly onEmptied = () => {
     this.cancelAnalysis();
+    this.analysisAttemptKey = null;
     this.analysisResult = null;
     this.analysisStatus = this.settings.fullAudioAnalysis ? 'waiting-metadata' : 'realtime';
     this.setGain(1);
-    this.resetMeters();
+    this.invalidateMeasurements();
   };
 
   private readonly onPlay = () => {
@@ -67,9 +70,18 @@ export class MediaVolumeController {
   private readonly onLoadedMetadata = () => this.startAnalysis();
   private readonly onVisibility = () => {
     this.lastTickAt = performance.now();
-    if (document.visibilityState === 'visible') {
-      this.resetMeters(!(this.settings.fullAudioAnalysis && this.analysisResult));
+    if (document.hidden) {
+      this.backgroundGainCeiling = clamp(
+        this.gain.gain.value,
+        this.settings.minGain,
+        this.settings.maxGain
+      );
+      this.setGain(this.backgroundGainCeiling);
+      this.invalidateMeasurements(!(this.settings.fullAudioAnalysis && this.analysisResult));
+      return;
     }
+    this.backgroundGainCeiling = null;
+    this.invalidateMeasurements(!(this.settings.fullAudioAnalysis && this.analysisResult));
   };
 
   constructor(
@@ -95,9 +107,6 @@ export class MediaVolumeController {
     this.fallbackLimiter.ratio.value = 20;
     this.fallbackLimiter.attack.value = 0.001;
     this.fallbackLimiter.release.value = 0.05;
-    this.fallbackAnalyser = this.context.createAnalyser();
-    this.fallbackAnalyser.fftSize = 2048;
-    this.fallbackBuffer = new Float32Array(this.fallbackAnalyser.fftSize);
     this.originalMeter = new LoudnessMeter(this.context.sampleRate);
     this.outputMeter = new LoudnessMeter(this.context.sampleRate);
 
@@ -111,31 +120,38 @@ export class MediaVolumeController {
   }
 
   updateSettings(next: Settings): void {
-    const changed = next._changedField;
-    const wasEnabled = this.settings.enabled;
-    const { _changedField: _, ...clean } = next;
-    this.settings = clean;
-    this.bass.gain.value = clean.bassBoost;
-    if (wasEnabled !== clean.enabled) this.connectGraph();
+    const previous = this.settings;
+    this.settings = next;
+    this.bass.gain.value = next.bassBoost;
 
-    const boundsChanged = changed === 'minGain' || changed === 'maxGain';
-    if (changed === 'targetLufs') {
-      this.resetMeters();
-      if (clean.fullAudioAnalysis && this.analysisResult) this.applyFullTrackGain();
+    if (previous.enabled !== next.enabled) {
+      this.setGain(1);
+      this.invalidateMeasurements();
+      if (next.enabled && next.fullAudioAnalysis && this.analysisResult) {
+        this.applyFullTrackGain();
+      }
+      this.connectGraph();
     }
-    if (boundsChanged) {
-      if (clean.fullAudioAnalysis && this.analysisResult) this.applyFullTrackGain();
+
+    if (previous.targetRms !== next.targetRms) {
+      this.invalidateMeasurements();
+      if (next.fullAudioAnalysis && this.analysisResult) this.applyFullTrackGain();
+    }
+    if (previous.minGain !== next.minGain || previous.maxGain !== next.maxGain) {
+      if (next.fullAudioAnalysis && this.analysisResult) this.applyFullTrackGain();
       else this.agc.unlockGain();
       this.setGain(this.gain.gain.value);
     }
-    if (changed !== 'fullAudioAnalysis') return;
+    if (previous.fullAudioAnalysis === next.fullAudioAnalysis) return;
 
-    if (clean.fullAudioAnalysis) {
+    if (next.fullAudioAnalysis) {
       logDiagnostic('完整音轨模式：开启', this.diagnosticState());
+      this.analysisAttemptKey = null;
       this.startAnalysis();
       return;
     }
     this.cancelAnalysis();
+    this.analysisAttemptKey = null;
     this.analysisResult = null;
     if (this.agc.isLocked()) {
       this.agc.unlockGain();
@@ -191,13 +207,28 @@ export class MediaVolumeController {
           node.port.onmessage = null;
           try { node.disconnect(); } catch { /* already disconnected */ }
           this.processor = null;
+          if (this.analysisStatus === 'realtime') {
+            this.analysisStatus = 'processor-unavailable';
+          }
+          this.invalidateMeasurements();
           this.connectGraph();
         }
       };
       this.processor = node;
+      if (this.analysisStatus === 'processor-unavailable') {
+        this.analysisStatus = 'realtime';
+      }
+      this.invalidateMeasurements(!(this.settings.fullAudioAnalysis && this.analysisResult));
       this.connectGraph();
     }).catch((error) => {
-      warnFailure('audio-processor-load', 'AudioWorklet load failed; using snapshot fallback', error);
+      if (this.analysisStatus === 'realtime') {
+        this.analysisStatus = 'processor-unavailable';
+      }
+      warnFailure(
+        'audio-processor-load',
+        'AudioWorklet load failed; keeping safe fixed gain',
+        error
+      );
     });
   }
 
@@ -215,8 +246,7 @@ export class MediaVolumeController {
       this.processor.connect(this.context.destination);
       return;
     }
-    this.source.connect(this.fallbackAnalyser);
-    this.fallbackAnalyser.connect(this.gain);
+    this.source.connect(this.gain);
     this.gain.connect(this.bass);
     this.bass.connect(this.fallbackLimiter);
     this.fallbackLimiter.connect(this.context.destination);
@@ -228,7 +258,6 @@ export class MediaVolumeController {
       this.gain,
       this.bass,
       this.fallbackLimiter,
-      this.fallbackAnalyser,
       this.processor
     ]) {
       try { node?.disconnect(); } catch { /* already disconnected */ }
@@ -236,24 +265,18 @@ export class MediaVolumeController {
   }
 
   private consumeAudio(message: MeterMessage): void {
-    if (this.destroyed || !message.original.length) return;
+    if (
+      this.destroyed
+      || document.hidden
+      || !this.settings.enabled
+      || message.epoch !== this.meterEpoch
+      || !message.original.length
+    ) return;
     this.originalMeter.processChannels(message.original);
     this.outputMeter.processChannels(message.output);
     this.originalRms = channelRms(message.original);
     this.outputRms = channelRms(message.output);
     this.originalPeak = channelPeak(message.original);
-  }
-
-  private sampleFallback(): void {
-    this.fallbackAnalyser.getFloatTimeDomainData(this.fallbackBuffer);
-    this.originalMeter.processBlock(this.fallbackBuffer);
-    this.originalRms = channelRms([this.fallbackBuffer]);
-    this.outputRms = this.originalRms * this.gain.gain.value;
-    this.originalPeak = channelPeak([this.fallbackBuffer]);
-    for (let index = 0; index < this.fallbackBuffer.length; index++) {
-      this.fallbackBuffer[index] *= this.gain.gain.value;
-    }
-    this.outputMeter.processBlock(this.fallbackBuffer);
   }
 
   private tick(): void {
@@ -262,8 +285,17 @@ export class MediaVolumeController {
     const deltaSec = clamp((now - this.lastTickAt) / 1000, 0.001, 0.25);
     this.lastTickAt = now;
 
-    if (!document.hidden && this.settings.enabled && !this.processor) this.sampleFallback();
-    if (this.settings.enabled && !this.media.muted && !this.media.paused && !this.media.ended) {
+    if (document.hidden) {
+      this.rafId = requestAnimationFrame(this.tick);
+      return;
+    }
+    if (
+      this.settings.enabled
+      && this.processor
+      && !this.media.muted
+      && !this.media.paused
+      && !this.media.ended
+    ) {
       this.updateGain(deltaSec);
     }
     this.emitMeter();
@@ -275,19 +307,23 @@ export class MediaVolumeController {
     const integrationTime = this.originalMeter.getIntegrationTime();
     const momentaryLufs = this.originalMeter.getMomentaryLoudness();
     const shortTermLufs = this.originalMeter.getShortTermLoudness();
+    const targetLufs = rmsToLufs(this.settings.targetRms);
     const controlLufs = chooseControlLoudness({
       integratedLufs,
       shortTermLufs,
       momentaryLufs,
       integrationTime,
-      minIntegrationSeconds: INTEGRATION_PARAMS.minIntegrationSeconds
+      minIntegrationSeconds: INTEGRATION_PARAMS.minIntegrationSeconds,
+      calibrationSeconds: INTEGRATION_PARAMS.coldStartSeconds,
+      calibrationSafetyThresholdLufs: targetLufs + 3
     });
     if (!Number.isFinite(controlLufs)) return;
 
-    const targetLufs = rmsToLufs(this.settings.targetRms);
+    const calibrationGain = calculateGainForLoudness(controlLufs, targetLufs);
     const result = this.agc.update({
       currentGain: this.gain.gain.value,
-      desiredGain: calculateGainForLoudness(controlLufs, targetLufs),
+      desiredGain: calibrationGain,
+      calibrationGain,
       minGain: this.settings.minGain,
       maxGain: this.settings.maxGain,
       deltaSec,
@@ -299,6 +335,9 @@ export class MediaVolumeController {
       momentaryLufs,
       shortTermLufs,
       gainChangePerSec: this.settings.gainChangePerSec,
+      calibrationBoostStartSeconds: INTEGRATION_PARAMS.calibrationBoostStartSeconds,
+      postCalibrationCorridor: INTEGRATION_PARAMS.postCalibrationCorridor,
+      postCalibrationDbCorridor: INTEGRATION_PARAMS.postCalibrationDbCorridor,
       programTimeSeconds: this.media.currentTime
     });
     this.setGain(result.nextGain);
@@ -321,7 +360,10 @@ export class MediaVolumeController {
   }
 
   private setGain(value: number): void {
-    const gain = clamp(value, this.settings.minGain, this.settings.maxGain);
+    const bounded = clamp(value, this.settings.minGain, this.settings.maxGain);
+    const gain = this.backgroundGainCeiling === null
+      ? bounded
+      : Math.min(bounded, this.backgroundGainCeiling);
     this.gain.gain.cancelScheduledValues(this.context.currentTime);
     this.gain.gain.setValueAtTime(gain, this.context.currentTime);
   }
@@ -333,18 +375,35 @@ export class MediaVolumeController {
     this.originalRms = this.outputRms = this.originalPeak = 0;
   }
 
+  private invalidateMeasurements(resetAgc = true): void {
+    this.meterEpoch++;
+    this.processor?.port.postMessage({ type: 'reset-meter', epoch: this.meterEpoch });
+    this.resetMeters(resetAgc);
+  }
+
   private startAnalysis(): void {
-    if (!this.settings.fullAudioAnalysis || this.destroyed || this.analysisAbort || this.analysisResult) return;
+    if (!this.settings.fullAudioAnalysis || this.destroyed) return;
     const durationStatus = classifyMediaDuration(this.media.duration);
     if (durationStatus !== 'ready') {
       this.analysisStatus = durationStatus === 'waiting' ? 'waiting-metadata' : 'unsupported';
       return;
     }
+    const attemptKey = this.analysisKey();
+    if (this.analysisAttemptKey === attemptKey) return;
+    if (this.analysisAttemptKey !== null) {
+      this.cancelAnalysis();
+      this.analysisResult = null;
+    }
+    this.analysisAttemptKey = attemptKey;
     const abort = new AbortController();
     this.analysisAbort = abort;
     this.analysisStatus = 'analyzing';
     analyzeFullAudio(this.media, this.context, abort.signal).then((result) => {
-      if (this.destroyed || abort.signal.aborted) return;
+      if (
+        this.destroyed
+        || abort.signal.aborted
+        || this.analysisAttemptKey !== attemptKey
+      ) return;
       this.analysisResult = result;
       this.applyFullTrackGain();
     }).catch((error) => {
@@ -385,6 +444,11 @@ export class MediaVolumeController {
   private cancelAnalysis(): void {
     this.analysisAbort?.abort();
     this.analysisAbort = null;
+  }
+
+  private analysisKey(): string {
+    const source = this.media.currentSrc || this.media.src || 'inline-media';
+    return `${source}|${this.media.duration}`;
   }
 
   private diagnosticState(): Record<string, number> {

@@ -21,6 +21,14 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
     this.meterIndex = 0;
     this.originalMeter = [];
     this.outputMeter = [];
+    this.meterEpoch = 0;
+    this.port.onmessage = (event) => {
+      if (event.data?.type !== 'reset-meter') return;
+      this.meterEpoch = Number.isFinite(event.data.epoch) ? event.data.epoch : 0;
+      this.meterIndex = 0;
+      this.originalMeter.forEach((channel) => channel.fill(0));
+      this.outputMeter.forEach((channel) => channel.fill(0));
+    };
   }
 
   process(inputs, outputs) {
@@ -110,7 +118,12 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
       const original = this.originalMeter.map((channel) => channel.slice());
       const output = this.outputMeter.map((channel) => channel.slice());
       const transfers = [...original, ...output].map((channel) => channel.buffer);
-      this.port.postMessage({ type: 'meter', original, output }, transfers);
+      this.port.postMessage({
+        type: 'meter',
+        epoch: this.meterEpoch,
+        original,
+        output
+      }, transfers);
     }
     this.meterIndex = 0;
   }

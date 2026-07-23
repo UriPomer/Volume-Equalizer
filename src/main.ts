@@ -3,8 +3,13 @@ import { DEFAULT_SETTINGS, Settings } from './config';
 import { MediaVolumeController } from './controller';
 import { errorFailure, warnFailure } from './logger';
 import { observeMutations, scanForMedia } from './media-scanner';
-import { loadSettings, persistSettings } from './settings';
-import { EMPTY_METER_STATE, MeterState } from './types';
+import {
+  loadSettings,
+  normalizeSettings,
+  persistSettings,
+  subscribeSettings
+} from './settings';
+import { EMPTY_METER_STATE } from './types';
 import { ensurePanel, updatePanelVisibility } from './ui-panel';
 
 if (!isAudioContextSupported()) {
@@ -19,11 +24,13 @@ const controllers = new Map<HTMLMediaElement, MediaVolumeController>();
 
 installGlobalResumeHandlers();
 loadSettings().then((loaded) => {
-  settings = { ...DEFAULT_SETTINGS, ...loaded };
+  settings = normalizeSettings(loaded);
   start();
+  subscribeSettings(applyExternalSettings);
 }).catch((error) => {
   errorFailure('settings-load', '设置加载失败，使用默认设置', error);
   start();
+  subscribeSettings(applyExternalSettings);
 });
 
 function start(): void {
@@ -64,13 +71,26 @@ function cleanupControllers(): void {
 }
 
 function updateSettings(next: Settings): Settings {
-  const changedField = next._changedField;
-  const { _changedField: _, ...clean } = next;
-  settings = clean;
-  persistSettings(settings);
-  controllers.forEach((controller) => {
-    controller.updateSettings({ ...settings, _changedField: changedField });
+  applySettings(normalizeSettings(next));
+  persistSettings(settings).catch((error) => {
+    errorFailure('settings-save', '设置保存失败', error);
   });
-  if (!settings.enabled) meterState = { ...EMPTY_METER_STATE };
   return settings;
+}
+
+function applyExternalSettings(next: Settings): void {
+  const normalized = normalizeSettings(next);
+  if (sameSettings(settings, normalized)) return;
+  applySettings(normalized);
+}
+
+function applySettings(next: Settings): void {
+  settings = next;
+  controllers.forEach((controller) => controller.updateSettings(settings));
+  if (!settings.enabled) meterState = { ...EMPTY_METER_STATE };
+}
+
+function sameSettings(left: Settings, right: Settings): boolean {
+  return (Object.keys(DEFAULT_SETTINGS) as Array<keyof Settings>)
+    .every((key) => left[key] === right[key]);
 }

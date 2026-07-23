@@ -145,7 +145,9 @@ function loadLimiterProcessor() {
     readFileSync(join(root, 'public', 'limiter-worklet.js'), 'utf8'),
     {
       sampleRate: 48000,
-      AudioWorkletProcessor: class {},
+      AudioWorkletProcessor: class {
+        constructor() { this.port = { onmessage: null, postMessage() {} }; }
+      },
       registerProcessor(_name, implementation) { Processor = implementation; }
     }
   );
@@ -229,14 +231,21 @@ function simulateRealtime(pcm, modules) {
       shortTermLufs,
       momentaryLufs,
       integrationTime,
-      minIntegrationSeconds: 1
+      minIntegrationSeconds: 1,
+      calibrationSeconds: 10,
+      calibrationSafetyThresholdLufs: DEFAULT_REFERENCE_SETTINGS.targetLufs + 3
     });
     const previousGain = gain;
     let state = 'waiting';
     if (Number.isFinite(controlLufs)) {
+      const calibrationGain = Math.pow(
+        10,
+        (DEFAULT_REFERENCE_SETTINGS.targetLufs - controlLufs) / 20
+      );
       const result = agc.update({
         currentGain: gain,
-        desiredGain: Math.pow(10, (DEFAULT_REFERENCE_SETTINGS.targetLufs - controlLufs) / 20),
+        desiredGain: calibrationGain,
+        calibrationGain,
         minGain: DEFAULT_REFERENCE_SETTINGS.minGain,
         maxGain: 2,
         deltaSec: frames / pcm.sampleRate,
@@ -248,6 +257,9 @@ function simulateRealtime(pcm, modules) {
         momentaryLufs,
         shortTermLufs,
         gainChangePerSec: 0.2,
+        calibrationBoostStartSeconds: 6,
+        postCalibrationCorridor: 0.2,
+        postCalibrationDbCorridor: 0.75,
         programTimeSeconds: (startFrame + frames) / pcm.sampleRate
       });
       gain = result.nextGain;

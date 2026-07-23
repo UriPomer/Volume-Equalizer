@@ -4,11 +4,15 @@ Chrome 音量均衡扩展，目标响度默认 `-21 LUFS`。
 
 ## 工作模式
 
-- 实时：前 10 秒校准，之后继续以受限速率收敛到目标响度。
+- 实时：前 10 秒校准，之后限制在校准 gain 的 `±0.2x` 与 `±0.75 dB` 交集内，并继续以受限速率收敛。
 - 完整音轨：可选拉取并分析整段音轨，成功后全程使用一个固定 gain。
 - 峰值保护：末端 true-peak lookahead limiter；不会在 gain 前压缩节目动态。
 
 完整音轨分析失败或长度不完整时，面板会明确显示状态并继续实时算法。页面 Console 可用 `[Universal Volume EQ]` 过滤诊断信息。
+Worklet 尚未就绪或运行失败时，扩展会保持安全 gain，不使用不连续快照继续抬升音量。
+
+行为契约见 [`PRODUCT_BEHAVIOR.md`](PRODUCT_BEHAVIOR.md)，系统流程见
+[`ARCHITECTURE.md`](ARCHITECTURE.md)。
 
 ## 开发
 
@@ -37,11 +41,11 @@ npm run build
 
 ## 发布
 
-更新 `public/manifest.json` 版本，提交后推送同名 tag：
+更新 `public/manifest.json` 与 `package.json` 版本，完成全部验证后推送同名 tag：
 
 ```powershell
-git tag v0.4.4
-git push origin main v0.4.4
+git tag v0.5.3
+git push origin main v0.5.3
 ```
 
 GitHub Actions 会构建 ZIP 并创建 Release。

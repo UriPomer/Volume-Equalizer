@@ -1,6 +1,6 @@
 {
   "name": "bili-volume-equalizer",
-  "version": "1.0.0",
+  "version": "0.5.3",
   "description": "浏览器视频音量均衡器，默认目标 -21 LUFS",
   "scripts": {
     "build": "vite build",

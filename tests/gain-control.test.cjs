@@ -29,6 +29,9 @@ function agcInput(overrides) {
     momentaryLufs: -18,
     shortTermLufs: -18,
     gainChangePerSec: 0.2,
+    calibrationBoostStartSeconds: 2,
+    postCalibrationCorridor: 0.2,
+    postCalibrationDbCorridor: 0.75,
     ...overrides
   };
 }
@@ -72,6 +75,30 @@ test('program control falls back to short-term loudness when integrated is unava
   );
 });
 
+test('calibration uses the loudest window to react to sudden loud content', () => {
+  assert.equal(chooseControlLoudness({
+    integratedLufs: -24,
+    shortTermLufs: -18,
+    momentaryLufs: -12,
+    integrationTime: 6,
+    minIntegrationSeconds: 1,
+    calibrationSeconds: 10,
+    calibrationSafetyThresholdLufs: -18
+  }), -12);
+});
+
+test('calibration ignores near-target short windows when integrated content is quiet', () => {
+  assert.equal(chooseControlLoudness({
+    integratedLufs: -30,
+    shortTermLufs: -24,
+    momentaryLufs: -20,
+    integrationTime: 6,
+    minIntegrationSeconds: 1,
+    calibrationSeconds: 10,
+    calibrationSafetyThresholdLufs: -18
+  }), -30);
+});
+
 test('very quiet background cannot climb through the adaptive noise gate', () => {
   const agc = new RealtimeAgc();
 
@@ -89,26 +116,43 @@ test('very quiet background cannot climb through the adaptive noise gate', () =>
   assert.ok(held.nextGain <= 1.3);
 });
 
-test('startup calibration may boost quiet content', () => {
+test('startup calibration delays boosts until the final four seconds', () => {
   const agc = new RealtimeAgc();
 
-  assert.ok(
-    agc.update(agcInput({
-      currentGain: 1,
-      desiredGain: 2,
-      controlLufs: -35,
-      deltaSec: 1,
-      integrationTime: 1,
-      momentaryLufs: -35,
-      shortTermLufs: -35,
-      sourcePeak: 0.2
-    })).nextGain > 1
-  );
+  const early = agc.update(agcInput({
+    currentGain: 0.7,
+    desiredGain: 2,
+    controlLufs: -35,
+    deltaSec: 1,
+    integrationTime: 1,
+    coldStartSeconds: 10,
+    calibrationBoostStartSeconds: 6,
+    momentaryLufs: -35,
+    shortTermLufs: -35,
+    sourcePeak: 0.2
+  }));
+  const finishing = agc.update(agcInput({
+    currentGain: early.nextGain,
+    desiredGain: 2,
+    controlLufs: -35,
+    deltaSec: 1,
+    integrationTime: 6,
+    coldStartSeconds: 10,
+    calibrationBoostStartSeconds: 6,
+    momentaryLufs: -35,
+    shortTermLufs: -35,
+    sourcePeak: 0.2
+  }));
+
+  assert.ok(early.nextGain > 0.7);
+  assert.ok(early.nextGain <= 1);
+  assert.ok(finishing.nextGain > early.nextGain);
 });
 
-test('source peak headroom limits gain before the limiter has to work', () => {
-  const agc = new RealtimeAgc();
-  const nextGain = agc.update(agcInput({
+test('transient peaks do not rewrite programme gain before the limiter', () => {
+  const loudPeakAgc = new RealtimeAgc();
+  const quietPeakAgc = new RealtimeAgc();
+  const loudPeak = loudPeakAgc.update(agcInput({
     currentGain: 1.1,
     desiredGain: 2,
     deltaSec: 1,
@@ -117,8 +161,17 @@ test('source peak headroom limits gain before the limiter has to work', () => {
     shortTermLufs: -24,
     sourcePeak: 0.95
   })).nextGain;
+  const quietPeak = quietPeakAgc.update(agcInput({
+    currentGain: 1.1,
+    desiredGain: 2,
+    deltaSec: 1,
+    controlLufs: -24,
+    momentaryLufs: -24,
+    shortTermLufs: -24,
+    sourcePeak: 0.1
+  })).nextGain;
 
-  assert.ok(Math.abs(nextGain - 0.8912509381337456 / 0.95) < 1e-12);
+  assert.equal(loudPeak, quietPeak);
 });
 
 test('agc reset closes the gate so foreground recovery cannot inherit stale boost state', () => {
@@ -217,25 +270,7 @@ test('startup predictor attenuates sudden loud content', () => {
   assert.ok(attenuated.nextGain < initial.nextGain);
 });
 
-test('peak headroom is released after the transient has passed', () => {
-  const agc = new RealtimeAgc();
-  const peakLimited = agc.update(agcInput({
-    currentGain: 1,
-    desiredGain: 2,
-    deltaSec: 0.5,
-    sourcePeak: 0.8
-  }));
-  const afterQuietBlock = agc.update(agcInput({
-    currentGain: peakLimited.nextGain,
-    desiredGain: 2,
-    deltaSec: 0.5,
-    sourcePeak: 0.1
-  }));
-
-  assert.ok(afterQuietBlock.nextGain > peakLimited.nextGain);
-});
-
-test('gain keeps converging after the calibration period', () => {
+test('gain stays within the calibration anchor plus or minus 0.2x', () => {
   const agc = new RealtimeAgc();
   let gain = 1;
   let result;
@@ -246,6 +281,8 @@ test('gain keeps converging after the calibration period', () => {
       desiredGain: 1.5,
       deltaSec: 1,
       integrationTime: time,
+      coldStartSeconds: 10,
+      programTimeSeconds: time,
       sourcePeak: 0.1
     }));
     gain = result.nextGain;
@@ -253,24 +290,58 @@ test('gain keeps converging after the calibration period', () => {
 
   assert.equal(result.state, 'hold');
   assert.ok(Math.abs(gain - 1.5) < 1e-12);
-  const lowerBound = agc.update(agcInput({
+  const anchored = agc.update(agcInput({
     currentGain: gain,
     desiredGain: 0.8,
-    deltaSec: 5,
+    deltaSec: 0.1,
     integrationTime: 15,
-    sourcePeak: 0.95
-  }));
-  const upperBound = agc.update(agcInput({
-    currentGain: lowerBound.nextGain,
-    desiredGain: 2,
-    deltaSec: 5,
-    integrationTime: 20,
     sourcePeak: 0.1
   }));
-  assert.equal(lowerBound.state, 'attenuate');
-  assert.equal(upperBound.state, 'boost');
+  let lowerGain = anchored.nextGain;
+  for (let index = 0; index < 20; index++) {
+    lowerGain = agc.update(agcInput({
+      currentGain: lowerGain,
+      desiredGain: 0.2,
+      deltaSec: 1,
+      integrationTime: 16 + index,
+      sourcePeak: 0.1
+    })).nextGain;
+  }
+  let upperGain = lowerGain;
+  for (let index = 0; index < 20; index++) {
+    upperGain = agc.update(agcInput({
+      currentGain: upperGain,
+      desiredGain: 3,
+      deltaSec: 1,
+      integrationTime: 40 + index,
+      sourcePeak: 0.1
+    })).nextGain;
+  }
+  assert.ok(lowerGain >= 1.3 - 1e-12);
+  assert.ok(upperGain <= 1.7 + 1e-12);
+  assert.ok(20 * Math.log10(upperGain / lowerGain) <= 1.500001);
   assert.equal(agc.isLocked(), false);
-  assert.ok(upperBound.nextGain - lowerBound.nextGain > 0.2);
+});
+
+test('reset starts a new calibration corridor', () => {
+  const agc = new RealtimeAgc();
+  agc.update(agcInput({
+    currentGain: 1,
+    desiredGain: 2,
+    integrationTime: 20,
+    programTimeSeconds: 20,
+    sourcePeak: 0.1
+  }));
+  agc.reset();
+  const recalibrating = agc.update(agcInput({
+    currentGain: 0.5,
+    desiredGain: 1.5,
+    integrationTime: 1,
+    programTimeSeconds: 1
+  }));
+  assert.equal(recalibrating.state, 'cold-start');
+  assert.ok(recalibrating.nextGain > 0.5);
+  assert.ok(recalibrating.nextGain <= 1);
 });
 
 test('low gain attenuation is also limited in the decibel domain', () => {
@@ -281,6 +352,7 @@ test('low gain attenuation is also limited in the decibel domain', () => {
     minGain: 0.2,
     deltaSec: 0.1,
     integrationTime: 10,
+    programTimeSeconds: 10,
     sourcePeak: 0.1
   }));
   const stepDb = Math.abs(20 * Math.log10(result.nextGain / 0.4));

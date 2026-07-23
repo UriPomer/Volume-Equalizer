@@ -4,11 +4,14 @@ export interface LoudnessSelectionInput {
   momentaryLufs: number;
   integrationTime: number;
   minIntegrationSeconds: number;
+  calibrationSeconds?: number;
+  calibrationSafetyThresholdLufs?: number;
 }
 
 export interface AgcUpdateInput {
   currentGain: number;
   desiredGain?: number;
+  calibrationGain?: number;
   minGain: number;
   maxGain: number;
   deltaSec: number;
@@ -20,6 +23,9 @@ export interface AgcUpdateInput {
   momentaryLufs: number;
   shortTermLufs: number;
   gainChangePerSec: number;
+  calibrationBoostStartSeconds: number;
+  postCalibrationCorridor: number;
+  postCalibrationDbCorridor: number;
   programTimeSeconds?: number;
 }
 
@@ -36,7 +42,6 @@ const SOFT_CONFIDENCE_LU = 10;
 const LOW_CONFIDENCE_RISE_SCALE = 0.1;
 const SOFT_CONFIDENCE_RISE_SCALE = 0.35;
 const LOW_CONFIDENCE_GAIN_CEILING = 1.3;
-const SAMPLE_PEAK_CEILING = 0.8912509381337456;
 const NOISE_FLOOR_INITIAL_LUFS = -62;
 const NOISE_FLOOR_MIN_LUFS = -80;
 const NOISE_FLOOR_MAX_LUFS = -30;
@@ -53,6 +58,25 @@ const MAX_ATTENUATION_DB_PER_SEC = 5;
 export function chooseControlLoudness(input: LoudnessSelectionInput): number {
   if (input.integrationTime < input.minIntegrationSeconds) {
     return isFinite(input.momentaryLufs) ? input.momentaryLufs : NaN;
+  }
+
+  if (
+    input.calibrationSeconds !== undefined
+    && input.integrationTime < input.calibrationSeconds
+  ) {
+    const candidates = [
+      input.integratedLufs,
+      input.shortTermLufs,
+      input.momentaryLufs
+    ].filter((value) => isFinite(value));
+    if (!candidates.length) return NaN;
+    const loudest = Math.max(...candidates);
+    if (
+      input.calibrationSafetyThresholdLufs === undefined
+      || loudest >= input.calibrationSafetyThresholdLufs
+    ) {
+      return loudest;
+    }
   }
 
   if (isFinite(input.integratedLufs)) return input.integratedLufs;
@@ -74,6 +98,7 @@ export class RealtimeAgc {
   private closeHoldSec = 0;
   private predictionElapsedSec = 0;
   private lockedProgramGain: number | null = null;
+  private calibrationAnchorGain: number | null = null;
 
   reset(): void {
     this.gateOpen = false;
@@ -81,6 +106,7 @@ export class RealtimeAgc {
     this.closeHoldSec = 0;
     this.predictionElapsedSec = 0;
     this.lockedProgramGain = null;
+    this.calibrationAnchorGain = null;
   }
 
   isLocked(): boolean {
@@ -93,6 +119,7 @@ export class RealtimeAgc {
 
   unlockGain(): void {
     this.lockedProgramGain = null;
+    this.calibrationAnchorGain = null;
   }
 
   update(input: AgcUpdateInput): AgcUpdateResult {
@@ -111,18 +138,31 @@ export class RealtimeAgc {
     this.updateGate(input);
     this.predictionElapsedSec += Math.max(0, input.deltaSec);
 
-    const riseScale = computeGainRiseScale(input.controlLufs, input.targetLufs);
-    const peakLimitedGain = this.computePeakLimitedMaxGain(input);
     const programTimeSeconds = Number.isFinite(input.programTimeSeconds)
       ? input.programTimeSeconds as number
       : this.predictionElapsedSec;
     const isCalibrating = programTimeSeconds < input.coldStartSeconds
       || input.integrationTime < input.coldStartSeconds;
+    const calibrationBoostReady = input.integrationTime
+      >= input.calibrationBoostStartSeconds;
+    const riseScale = isCalibrating
+      ? 1
+      : computeGainRiseScale(input.controlLufs, input.targetLufs);
+    const peakLimitedGain = this.computePeakLimitedMaxGain(input, riseScale);
     const targetGain = isFinite(input.desiredGain ?? NaN)
       ? input.desiredGain as number
       : calculateGainForLoudness(input.controlLufs, input.targetLufs);
-    const desiredGain = this.computeDesiredGain(input, targetGain, peakLimitedGain, riseScale);
     const currentGain = Math.min(Math.max(input.currentGain, input.minGain), input.maxGain);
+    let desiredGain = this.computeDesiredGain(
+      input,
+      targetGain,
+      peakLimitedGain,
+      riseScale,
+      isCalibrating
+    );
+    if (isCalibrating && !calibrationBoostReady && desiredGain > currentGain) {
+      desiredGain = Math.min(desiredGain, 1);
+    }
 
     if (!this.gateOpen && desiredGain > currentGain) {
       return {
@@ -134,7 +174,13 @@ export class RealtimeAgc {
       };
     }
 
-    const nextGain = this.slewLimitGain(input, currentGain, desiredGain, riseScale);
+    const nextGain = this.slewLimitGain(
+      input,
+      currentGain,
+      desiredGain,
+      riseScale,
+      isCalibrating
+    );
 
     return {
       nextGain,
@@ -192,15 +238,11 @@ export class RealtimeAgc {
     this.noiseFloorLufs += (bounded - this.noiseFloorLufs) * alpha;
   }
 
-  private computePeakLimitedMaxGain(input: AgcUpdateInput): number {
+  private computePeakLimitedMaxGain(input: AgcUpdateInput, riseScale: number): number {
     let maxAllowedGain = input.maxGain;
-    const riseScale = computeGainRiseScale(input.controlLufs, input.targetLufs);
 
     if (riseScale === LOW_CONFIDENCE_RISE_SCALE) {
       maxAllowedGain = Math.min(maxAllowedGain, LOW_CONFIDENCE_GAIN_CEILING);
-    }
-    if (isFinite(input.sourcePeak) && input.sourcePeak > 0) {
-      maxAllowedGain = Math.min(maxAllowedGain, SAMPLE_PEAK_CEILING / input.sourcePeak);
     }
 
     return maxAllowedGain;
@@ -210,20 +252,61 @@ export class RealtimeAgc {
     input: AgcUpdateInput,
     targetGain: number,
     peakLimitedGain: number,
-    riseScale: number
+    riseScale: number,
+    isCalibrating: boolean
   ): number {
     let maxAllowedGain = peakLimitedGain;
     if (riseScale === LOW_CONFIDENCE_RISE_SCALE) {
       maxAllowedGain = Math.min(maxAllowedGain, LOW_CONFIDENCE_GAIN_CEILING);
     }
-    return Math.min(Math.max(targetGain, input.minGain), maxAllowedGain);
+    let desiredGain = Math.min(Math.max(targetGain, input.minGain), maxAllowedGain);
+    const corridor = Math.max(0, input.postCalibrationCorridor);
+    const dbCorridor = Math.max(0, input.postCalibrationDbCorridor);
+    const dbLowerRatio = Math.pow(10, -dbCorridor / 20);
+    const dbUpperRatio = Math.pow(10, dbCorridor / 20);
+    if (!isCalibrating && this.calibrationAnchorGain === null) {
+      const calibrationGain = isFinite(input.calibrationGain ?? NaN)
+        ? input.calibrationGain as number
+        : targetGain;
+      const currentGain = Math.min(
+        Math.max(input.currentGain, input.minGain),
+        input.maxGain
+      );
+      const minimumAnchor = Math.max(
+        input.minGain,
+        currentGain - corridor,
+        currentGain / dbUpperRatio
+      );
+      const maximumAnchor = Math.min(
+        input.maxGain,
+        currentGain + corridor,
+        currentGain / dbLowerRatio
+      );
+      this.calibrationAnchorGain = Math.min(
+        Math.max(calibrationGain, minimumAnchor),
+        Math.max(minimumAnchor, maximumAnchor)
+      );
+    }
+    if (!isCalibrating && this.calibrationAnchorGain !== null) {
+      const dbLower = this.calibrationAnchorGain * dbLowerRatio;
+      const dbUpper = this.calibrationAnchorGain * dbUpperRatio;
+      const lower = Math.max(this.calibrationAnchorGain - corridor, dbLower);
+      const upper = Math.min(this.calibrationAnchorGain + corridor, dbUpper);
+      desiredGain = Math.min(
+        Math.max(desiredGain, lower),
+        upper
+      );
+      desiredGain = Math.min(desiredGain, maxAllowedGain);
+    }
+    return desiredGain;
   }
 
   private slewLimitGain(
     input: AgcUpdateInput,
     currentGain: number,
     desiredGain: number,
-    riseScale: number
+    riseScale: number,
+    isCalibrating = false
   ): number {
     const deltaLimit = Math.max(0, input.gainChangePerSec * input.deltaSec);
     if (desiredGain > currentGain) {
@@ -233,9 +316,12 @@ export class RealtimeAgc {
       );
       return Math.min(desiredGain, currentGain + deltaLimit * riseScale, dbLimitedGain);
     }
+    const maxAttenuationDbPerSec = isCalibrating
+      ? 8
+      : MAX_ATTENUATION_DB_PER_SEC;
     const dbLimitedGain = currentGain * Math.pow(
       10,
-      -MAX_ATTENUATION_DB_PER_SEC * input.deltaSec / 20
+      -maxAttenuationDbPerSec * input.deltaSec / 20
     );
     return Math.max(desiredGain, currentGain - deltaLimit * 3, dbLimitedGain);
   }

@@ -14,7 +14,6 @@ export interface Settings {
   maxGain: number;
   bassBoost: number;
   gainChangePerSec: number;
-  _changedField?: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -30,14 +29,18 @@ export const DEFAULT_SETTINGS: Settings = {
 export interface IntegrationParams {
   minIntegrationSeconds: number;
   coldStartSeconds: number;
-  silenceThreshold: number;
+  calibrationBoostStartSeconds: number;
+  postCalibrationCorridor: number;
+  postCalibrationDbCorridor: number;
 }
 
 // 积分响度参数 (ITU-R BS.1770-4 标准)
 export const INTEGRATION_PARAMS: IntegrationParams = {
   // 标准算法使用 400ms 块 + 75% 重叠，由 LoudnessMeter 内部处理
   minIntegrationSeconds: 1,           // 启动增益控制前的最小积分时长（1秒 = ~10个块）
-  coldStartSeconds: 10,               // 前 10 秒校准，之后限制在固定 0.2x 走廊
-  silenceThreshold: 0.001             // 静音阈值 (低于此值不送入响度测量)
+  coldStartSeconds: 10,
+  calibrationBoostStartSeconds: 6,    // 前 6 秒最多恢复到 1x，避免安静片头触发放大
+  postCalibrationCorridor: 0.2,       // 校准完成后限制在锚点 gain ±0.2x
+  postCalibrationDbCorridor: 0.75     // 同时限制为 ±0.75 dB，保证常态总跨度不超过 1.5 dB
 };
 

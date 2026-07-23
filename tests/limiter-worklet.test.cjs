@@ -9,7 +9,9 @@ function loadProcessor() {
   const context = {
     sampleRate: 48000,
     console,
-    AudioWorkletProcessor: class {},
+    AudioWorkletProcessor: class {
+      constructor() { this.port = { onmessage: null, postMessage() {} }; }
+    },
     registerProcessor(name, klass) {
       assert.equal(name, 'lookahead-peak-limiter');
       ProcessorClass = klass;
@@ -158,6 +160,7 @@ test('processor reports continuous original and output audio', () => {
 
   assert.equal(messages.length, 1);
   assert.equal(messages[0].type, 'meter');
+  assert.equal(messages[0].epoch, 0);
   assert.equal(messages[0].original.length, 1);
   assert.equal(messages[0].original[0].length, 4800);
   assert.ok(Math.abs(messages[0].original[0][0] - 0.5) < 1e-6);

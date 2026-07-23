@@ -12,6 +12,7 @@ const STATUS_TEXT: Record<AnalysisStatus, string> = {
   'full-track': '完整音轨已锁定',
   incomplete: '音轨不完整 · 实时继续',
   unsupported: '直播不支持完整分析',
+  'processor-unavailable': '处理器不可用 · 安全保持',
   failed: '分析失败 · 实时继续'
 };
 
@@ -106,8 +107,7 @@ function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings
   full.onclick = () => {
     settings = change({
       ...settings,
-      fullAudioAnalysis: !settings.fullAudioAnalysis,
-      _changedField: 'fullAudioAnalysis'
+      fullAudioAnalysis: !settings.fullAudioAnalysis
     });
     render();
   };
@@ -117,8 +117,7 @@ function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings
       const value = Number(input.value);
       settings = change({
         ...settings,
-        ...(role === 'targetLufs' ? { targetRms: lufsToRms(value) } : { [role]: value }),
-        _changedField: role
+        ...(role === 'targetLufs' ? { targetRms: lufsToRms(value) } : { [role]: value })
       });
       setText(shadow, `[data-value="${role}"]`, formatValue(role, value));
     };

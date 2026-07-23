@@ -5,6 +5,7 @@ export type AnalysisStatus =
   | 'full-track'
   | 'incomplete'
   | 'unsupported'
+  | 'processor-unavailable'
   | 'failed';
 
 export interface MeterState {

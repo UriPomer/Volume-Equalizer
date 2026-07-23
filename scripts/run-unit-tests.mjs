@@ -13,6 +13,7 @@ try {
     'src/loudness-meter.ts',
     'src/full-audio-analysis.ts',
     'src/controller.ts',
+    'src/settings.ts',
     '--outDir', output,
     '--module', 'commonjs',
     '--target', 'es2020',
@@ -26,7 +27,8 @@ try {
     'tests/full-audio-analysis.test.cjs',
     'tests/gain-control.test.cjs',
     'tests/limiter-worklet.test.cjs',
-    'tests/loudness-meter.test.cjs'
+    'tests/loudness-meter.test.cjs',
+    'tests/settings.test.cjs'
   ], { cwd: root, stdio: 'inherit' });
 } finally {
   rmSync(output, { recursive: true, force: true });
