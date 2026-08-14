@@ -105,6 +105,7 @@ global.window = { AudioContext: FakeContext };
 global.document = {
   hidden: false,
   visibilityState: 'visible',
+  scripts: [],
   addEventListener(type, listener) {
     if (!documentListeners.has(type)) documentListeners.set(type, new Set());
     documentListeners.get(type).add(listener);
@@ -143,8 +144,7 @@ test('controller connects continuous stereo meter and drives gain state', async 
 
   const worklet = global.lastWorklet;
   assert.equal(worklet.options.numberOfInputs, 2);
-  assert.equal(worklet.channelCountMode, 'explicit');
-  assert.equal(worklet.channelCount, 2);
+  assert.equal(worklet.channelCountMode, 'max');
   assert.ok(worklet.context.source.connections.some((item) => item.destination === worklet && item.input === 1));
 
   for (let index = 0; index < 200; index++) {
@@ -225,6 +225,82 @@ test('stale worklet meter epochs are ignored after a lifecycle transition', asyn
   });
 
   assert.equal(controller.originalMeter.getIntegrationTime(), 0);
+  controller.destroy();
+});
+
+test('seeking resets realtime measurements and the calibration anchor', async () => {
+  const media = new FakeMedia();
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.originalMeter.processBlock(new Float32Array(48000).fill(0.1));
+  assert.ok(controller.originalMeter.getIntegrationTime() > 0);
+  controller.agc.lockGain(1.3);
+
+  media.dispatchEvent(new Event('seeked'));
+
+  assert.equal(controller.originalMeter.getIntegrationTime(), 0);
+  assert.equal(controller.agc.isLocked(), false);
+  controller.destroy();
+});
+
+test('full-track analysis waits for playback before fetching', async () => {
+  const media = new FakeMedia();
+  media.paused = true;
+  const controller = new MediaVolumeController(
+    media,
+    { ...settings, fullAudioAnalysis: true },
+    () => {},
+    () => {}
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(controller.analysisStatus, 'waiting-play');
+  assert.equal(controller.analysisAbort, null);
+  assert.equal(controller.analysisAttemptKey, null);
+
+  media.paused = false;
+  media.dispatchEvent(new Event('play'));
+  assert.equal(controller.analysisAttemptKey, controller.analysisKey());
+  controller.destroy();
+});
+
+test('destroyed controller detaches processor handlers and never reconnects', async () => {
+  const media = new FakeMedia();
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const worklet = global.lastWorklet;
+  controller.destroy();
+
+  assert.equal(worklet.port.onmessage, null);
+  assert.equal(worklet.onprocessorerror, null);
+  assert.equal(worklet.context.source.connections.length, 0);
+
+  // 迟到的处理器错误不应复活音频图
+  worklet.onprocessorerror?.({});
+  assert.equal(worklet.context.source.connections.length, 0);
+  controller.destroy();
+});
+
+test('disabled controller emits an empty meter state', async () => {
+  const media = new FakeMedia();
+  let state = null;
+  const controller = new MediaVolumeController(
+    media,
+    settings,
+    (next) => { state = next; },
+    () => {}
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.originalRms = 0.4;
+  controller.updateSettings({ ...settings, enabled: false });
+  controller.emitMeter();
+
+  assert.equal(state.rms, 0);
+  assert.equal(state.originalRms, 0);
+  assert.equal(state.gain, 1);
   controller.destroy();
 });
 

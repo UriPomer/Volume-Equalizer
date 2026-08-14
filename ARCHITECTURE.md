@@ -29,15 +29,15 @@ flowchart LR
     FullMeter --> AGC
 
     Visibility[页面可见性] --> Controller
-    Lifecycle[play / emptied / metadata] --> Controller
+    Lifecycle[play / emptied / metadata / seeked] --> Controller
 ```
 
 ## 状态修改边界
 
-- `main.ts`：控制器集合、当前 UI 媒体、规范化后的全局设置。
+- `main.ts`：控制器集合、当前 UI 媒体、规范化后的全局设置、绑定失败重试与面板提示。
 - `controller.ts`：媒体生命周期、测量 epoch、分析尝试代际和唯一 gain 写入。
 - `gain-control.ts`：纯增益决策状态，不直接访问 DOM 或 Web Audio 节点。
-- `limiter-worklet.js`：实时限峰和带 epoch 的连续测量，不决定节目 gain。
+- `limiter-worklet.js`：按输入声道数逐声道实时限峰和带 epoch 的连续测量，不决定节目 gain，不做立体声降混。
 - `settings.ts`：所有持久化设置的运行时校验与跨标签同步。
 
 ## 安全降级

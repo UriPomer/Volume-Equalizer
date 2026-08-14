@@ -213,7 +213,10 @@ export class RealtimeAgc {
     );
 
     if (!this.gateOpen) {
-      this.gateOpen = gateLufs >= openThreshold || input.sourcePeak >= GATE_PEAK_OPEN;
+      // 峰值开门的先决条件是节目响度不低于关门阈值：单次瞬态峰值（咳嗽/爆音）出现在
+      // 安静片段中时不应开门爬升增益，否则长静音会被重复瞬态缓慢放大。
+      this.gateOpen = gateLufs >= openThreshold
+        || (input.sourcePeak >= GATE_PEAK_OPEN && gateLufs >= closeThreshold);
       this.closeHoldSec = 0;
       return;
     }
@@ -310,9 +313,10 @@ export class RealtimeAgc {
   ): number {
     const deltaLimit = Math.max(0, input.gainChangePerSec * input.deltaSec);
     if (desiredGain > currentGain) {
+      // dB 限速同样应用 riseScale，与线性限速保持一致（低置信度时两种限速都要收紧）。
       const dbLimitedGain = currentGain * Math.pow(
         10,
-        MAX_BOOST_DB_PER_SEC * input.deltaSec / 20
+        MAX_BOOST_DB_PER_SEC * input.deltaSec * riseScale / 20
       );
       return Math.min(desiredGain, currentGain + deltaLimit * riseScale, dbLimitedGain);
     }

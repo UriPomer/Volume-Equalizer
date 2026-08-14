@@ -5,7 +5,7 @@ import { RealtimeAgc, chooseControlLoudness } from './gain-control';
 import { logDiagnostic, warnFailure } from './logger';
 import { LoudnessMeter, calculateGainForLoudness } from './loudness-meter';
 import { clamp, lufsToRms, rmsToLufs } from './lufs-calculator';
-import { AnalysisStatus, MeterState } from './types';
+import { AnalysisStatus, EMPTY_METER_STATE, MeterState } from './types';
 
 type MeterMessage = {
   type: 'meter';
@@ -68,6 +68,10 @@ export class MediaVolumeController {
   };
 
   private readonly onLoadedMetadata = () => this.startAnalysis();
+  private readonly onSeeked = () => {
+    // seek 后旧积分窗口与校准锚点失效：重置测量并重新校准（完整音轨锁定时保留固定 gain）。
+    this.invalidateMeasurements(!(this.settings.fullAudioAnalysis && this.analysisResult));
+  };
   private readonly onVisibility = () => {
     this.lastTickAt = performance.now();
     if (document.hidden) {
@@ -114,7 +118,13 @@ export class MediaVolumeController {
     this.connectGraph();
     this.loadProcessor();
     this.startAnalysis();
-    if (!media.paused) this.onActivate();
+    if (!media.paused) {
+      this.onActivate();
+      // 迟到挂载且已在播放：与 onPlay 一样恢复 AudioContext，避免注入后无声。
+      this.context.resume().catch((error) => {
+        warnFailure('media-play-resume', 'AudioContext play resume failed', error);
+      });
+    }
     this.tick = this.tick.bind(this);
     this.rafId = requestAnimationFrame(this.tick);
   }
@@ -169,7 +179,12 @@ export class MediaVolumeController {
     this.media.removeEventListener('play', this.onPlay);
     this.media.removeEventListener('loadedmetadata', this.onLoadedMetadata);
     document.removeEventListener('visibilitychange', this.onVisibility);
-    if (this.processor) this.processor.port.onmessage = null;
+    this.media.removeEventListener('seeked', this.onSeeked);
+    if (this.processor) {
+      this.processor.port.onmessage = null;
+      this.processor.onprocessorerror = null;
+      this.processor = null;
+    }
     this.disconnectGraph();
   }
 
@@ -177,6 +192,7 @@ export class MediaVolumeController {
     this.media.addEventListener('emptied', this.onEmptied);
     this.media.addEventListener('play', this.onPlay);
     this.media.addEventListener('loadedmetadata', this.onLoadedMetadata);
+    this.media.addEventListener('seeked', this.onSeeked);
     document.addEventListener('visibilitychange', this.onVisibility);
   }
 
@@ -187,7 +203,6 @@ export class MediaVolumeController {
       const node = new AudioWorkletNode(this.context, 'lookahead-peak-limiter', {
         numberOfInputs: 2,
         numberOfOutputs: 1,
-        outputChannelCount: [2],
         processorOptions: {
           lookaheadMs: 15,
           releaseMs: 50,
@@ -195,15 +210,16 @@ export class MediaVolumeController {
           interSampleMargin: 1.03
         }
       });
-      node.channelCount = 2;
-      node.channelCountMode = 'explicit';
+      // 保持与输入相同的声道数（5.1/7.1 不做立体声降混），worklet 按声道独立限峰；
+      // 实时响度按 BS.1770 多声道加权，与完整音轨分析口径一致。
+      node.channelCountMode = 'max';
       node.channelInterpretation = 'speakers';
       node.port.onmessage = (event: MessageEvent<MeterMessage>) => {
         if (event.data?.type === 'meter') this.consumeAudio(event.data);
       };
       node.onprocessorerror = (error) => {
         warnFailure('audio-processor', 'Audio processor failed', error);
-        if (this.processor === node) {
+        if (!this.destroyed && this.processor === node) {
           node.port.onmessage = null;
           try { node.disconnect(); } catch { /* already disconnected */ }
           this.processor = null;
@@ -233,6 +249,7 @@ export class MediaVolumeController {
   }
 
   private connectGraph(): void {
+    if (this.destroyed) return;
     this.disconnectGraph();
     if (!this.settings.enabled) {
       this.source.connect(this.context.destination);
@@ -344,6 +361,10 @@ export class MediaVolumeController {
   }
 
   private emitMeter(): void {
+    if (!this.settings.enabled) {
+      this.onMeter({ ...EMPTY_METER_STATE, analysisStatus: this.analysisStatus });
+      return;
+    }
     const originalLufs = this.originalMeter.getIntegratedLoudness();
     const outputLufs = this.outputMeter.getIntegratedLoudness();
     this.onMeter({
@@ -386,6 +407,12 @@ export class MediaVolumeController {
     const durationStatus = classifyMediaDuration(this.media.duration);
     if (durationStatus !== 'ready') {
       this.analysisStatus = durationStatus === 'waiting' ? 'waiting-metadata' : 'unsupported';
+      return;
+    }
+    // 未播放的媒体不发起全量拉取（避免 feed 页几十个视频同时下载+解码+分析）；
+    // 等 play 事件触发 startAnalysis 后再真正拉取。
+    if (this.media.paused) {
+      this.analysisStatus = 'waiting-play';
       return;
     }
     const attemptKey = this.analysisKey();

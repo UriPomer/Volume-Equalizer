@@ -10,7 +10,7 @@ import {
   subscribeSettings
 } from './settings';
 import { EMPTY_METER_STATE } from './types';
-import { ensurePanel, updatePanelVisibility } from './ui-panel';
+import { ensurePanel, refreshPanel, updatePanelVisibility } from './ui-panel';
 
 if (!isAudioContextSupported()) {
   warnFailure('audio-context-unsupported', '当前浏览器不支持 AudioContext，扩展已停用');
@@ -42,22 +42,47 @@ function start(): void {
   observeMutations(scan);
 }
 
+const MAX_ATTACH_RETRIES = 3;
+const attachRetries = new WeakMap<HTMLMediaElement, number>();
+
 function attachController(media: HTMLMediaElement): void {
   if (controllers.has(media)) return;
-  const controller = new MediaVolumeController(
-    media,
-    settings,
-    (state) => {
-      if (activeMedia === media || !activeMedia) {
-        activeMedia = media;
-        meterState = state;
-      }
-    },
-    () => { activeMedia = media; }
-  );
-  controllers.set(media, controller);
-  ensurePanel(settings, updateSettings, () => meterState);
-  updatePanelVisibility(controllers.size);
+  try {
+    const controller = new MediaVolumeController(
+      media,
+      settings,
+      (state) => {
+        if (activeMedia === media || !activeMedia) {
+          activeMedia = media;
+          meterState = state;
+        }
+      },
+      () => { activeMedia = media; }
+    );
+    attachRetries.delete(media);
+    controllers.set(media, controller);
+    ensurePanel(settings, updateSettings, () => meterState);
+    updatePanelVisibility(controllers.size);
+  } catch (error) {
+    // 站点可能已用 createMediaElementSource 占用该元素（YouTube/Twitch 等），
+    // 此时绑定必然失败：在面板上给出提示，并在该元素下一次 play 时重试。
+    warnFailure('media-attach-retry', '媒体绑定失败，将在播放时重试', error);
+    meterState = { ...EMPTY_METER_STATE, analysisStatus: 'attach-failed' };
+    ensurePanel(settings, updateSettings, () => meterState);
+    updatePanelVisibility(1);
+    scheduleAttachRetry(media);
+  }
+}
+
+function scheduleAttachRetry(media: HTMLMediaElement): void {
+  const attempts = attachRetries.get(media) ?? 0;
+  if (attempts >= MAX_ATTACH_RETRIES) return;
+  attachRetries.set(media, attempts + 1);
+  const retry = () => {
+    media.removeEventListener('play', retry);
+    attachController(media);
+  };
+  media.addEventListener('play', retry, { once: true });
 }
 
 function cleanupControllers(): void {
@@ -88,6 +113,7 @@ function applySettings(next: Settings): void {
   settings = next;
   controllers.forEach((controller) => controller.updateSettings(settings));
   if (!settings.enabled) meterState = { ...EMPTY_METER_STATE };
+  refreshPanel(settings);
 }
 
 function sameSettings(left: Settings, right: Settings): boolean {

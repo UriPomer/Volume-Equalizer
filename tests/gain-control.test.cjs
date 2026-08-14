@@ -99,6 +99,23 @@ test('calibration ignores near-target short windows when integrated content is q
   }), -30);
 });
 
+test('a transient peak in quiet content does not open the noise gate', () => {
+  const agc = new RealtimeAgc();
+
+  const result = agc.update(agcInput({
+    currentGain: 1,
+    desiredGain: 2,
+    controlLufs: -60,
+    momentaryLufs: -60,
+    shortTermLufs: -60,
+    sourcePeak: 0.9,
+    deltaSec: 0.1
+  }));
+
+  assert.equal(result.gateOpen, false);
+  assert.ok(result.nextGain <= 1);
+});
+
 test('very quiet background cannot climb through the adaptive noise gate', () => {
   const agc = new RealtimeAgc();
 

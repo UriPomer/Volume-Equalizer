@@ -8,6 +8,8 @@ type ChangeSettings = (settings: Settings) => Settings;
 const STATUS_TEXT: Record<AnalysisStatus, string> = {
   realtime: '实时',
   'waiting-metadata': '等待视频元数据',
+  'waiting-play': '等待播放后分析',
+  'attach-failed': '媒体被页面占用',
   analyzing: '完整音轨分析中',
   'full-track': '完整音轨已锁定',
   incomplete: '音轨不完整 · 实时继续',
@@ -18,6 +20,18 @@ const STATUS_TEXT: Record<AnalysisStatus, string> = {
 
 let host: HTMLElement | null = null;
 let meterTimer: number | null = null;
+let currentSettings: Settings | null = null;
+let renderPanel: (() => void) | null = null;
+
+/**
+ * 外部（其他标签页/设置加载）修改设置后刷新面板 UI，
+ * 避免开关与滑条停留在旧值直到用户手动交互。
+ */
+export function refreshPanel(next: Settings): void {
+  if (!host?.isConnected || !renderPanel) return;
+  currentSettings = next;
+  renderPanel();
+}
 
 export function ensurePanel(
   settings: Settings,
@@ -84,12 +98,13 @@ function meterRow(label: string, field: string, suffix = ''): string {
 }
 
 function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings): void {
-  let settings = initial;
+  currentSettings = initial;
   const enabled = query<HTMLButtonElement>(shadow, '[data-action="enabled"]');
   const full = query<HTMLButtonElement>(shadow, '[data-action="fullAudioAnalysis"]');
   const sliders = [...shadow.querySelectorAll<HTMLInputElement>('input[data-role]')];
 
   const render = () => {
+    const settings = currentSettings as Settings;
     enabled.textContent = settings.enabled ? '已开启' : '已关闭';
     enabled.classList.toggle('on', settings.enabled);
     full.textContent = settings.fullAudioAnalysis ? '已开启' : '实时模式';
@@ -103,11 +118,16 @@ function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings
     }
   };
 
-  enabled.onclick = () => { settings = change({ ...settings, enabled: !settings.enabled }); render(); };
+  enabled.onclick = () => {
+    const base = currentSettings as Settings;
+    currentSettings = change({ ...base, enabled: !base.enabled });
+    render();
+  };
   full.onclick = () => {
-    settings = change({
-      ...settings,
-      fullAudioAnalysis: !settings.fullAudioAnalysis
+    const base = currentSettings as Settings;
+    currentSettings = change({
+      ...base,
+      fullAudioAnalysis: !base.fullAudioAnalysis
     });
     render();
   };
@@ -115,13 +135,15 @@ function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings
     input.oninput = () => {
       const role = input.dataset.role as SliderRole;
       const value = Number(input.value);
-      settings = change({
-        ...settings,
+      const base = currentSettings as Settings;
+      currentSettings = change({
+        ...base,
         ...(role === 'targetLufs' ? { targetRms: lufsToRms(value) } : { [role]: value })
       });
       setText(shadow, `[data-value="${role}"]`, formatValue(role, value));
     };
   }
+  renderPanel = render;
 
   const wrapper = query<HTMLElement>(shadow, '.wrap');
   let closeTimer = 0;

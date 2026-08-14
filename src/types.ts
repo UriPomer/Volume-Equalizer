@@ -1,6 +1,8 @@
 export type AnalysisStatus =
   | 'realtime'
   | 'waiting-metadata'
+  | 'waiting-play'
+  | 'attach-failed'
   | 'analyzing'
   | 'full-track'
   | 'incomplete'
