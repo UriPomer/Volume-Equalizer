@@ -228,7 +228,7 @@ test('stale worklet meter epochs are ignored after a lifecycle transition', asyn
   controller.destroy();
 });
 
-test('seeking resets realtime measurements and the calibration anchor', async () => {
+test('seeking resets measurements but keeps the calibration anchor', async () => {
   const media = new FakeMedia();
   const controller = new MediaVolumeController(media, settings, () => {}, () => {});
   await new Promise((resolve) => setImmediate(resolve));
@@ -239,8 +239,9 @@ test('seeking resets realtime measurements and the calibration anchor', async ()
 
   media.dispatchEvent(new Event('seeked'));
 
+  // 测量窗口重置，但 AGC 状态（锚点/锁定）保留，gain 不会重新快速校准
   assert.equal(controller.originalMeter.getIntegrationTime(), 0);
-  assert.equal(controller.agc.isLocked(), false);
+  assert.equal(controller.agc.isLocked(), true);
   controller.destroy();
 });
 

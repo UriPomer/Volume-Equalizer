@@ -74,7 +74,9 @@ This writes `test-results/*-gain-trace.jsonl`. No trace logger is enabled in the
 
 Evaluated fixtures must satisfy all three conditions:
 
-- actual output integrated loudness is within `±1 LU` of the target;
+- actual output integrated loudness is within `±1.5 LU` of the target (stable-first
+  contract: steady-state gain moves at most `0.1x/min`, so dynamic programmes trade
+  some output precision for gain stability; the calibration phase still converges fast);
 - gain `P95–P5` from 10 seconds to the end is no greater than `1.5 dB`;
 - maximum gain span from 10 seconds to the end is no greater than `3 dB`.
 

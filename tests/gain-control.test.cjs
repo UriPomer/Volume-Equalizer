@@ -166,6 +166,75 @@ test('startup calibration delays boosts until the final four seconds', () => {
   assert.ok(finishing.nextGain > early.nextGain);
 });
 
+test('steady-state gain never changes faster than 0.1x per minute', () => {
+  const agc = new RealtimeAgc();
+  let gain = 1;
+  // 校准期（前 10 秒）以配置速率收敛到目标
+  for (let time = 1; time <= 10; time += 1) {
+    gain = agc.update(agcInput({
+      currentGain: gain,
+      desiredGain: 1.2,
+      deltaSec: 1,
+      integrationTime: time,
+      coldStartSeconds: 10,
+      programTimeSeconds: time,
+      sourcePeak: 0.1
+    })).nextGain;
+  }
+  assert.ok(Math.abs(gain - 1.2) < 1e-12);
+
+  // 稳态：交替升高/降低目标，观察 60 秒
+  const start = gain;
+  let maxStep = 0;
+  for (let time = 11; time <= 70; time += 1) {
+    const desiredGain = time % 2 === 0 ? 3 : 0.2;
+    const next = agc.update(agcInput({
+      currentGain: gain,
+      desiredGain,
+      deltaSec: 1,
+      integrationTime: time,
+      coldStartSeconds: 10,
+      programTimeSeconds: time,
+      sourcePeak: 0.1
+    })).nextGain;
+    maxStep = Math.max(maxStep, Math.abs(next - gain));
+    gain = next;
+  }
+
+  // 单步（1 秒）不超过 0.1x/60，60 秒累计不超过 0.1x
+  assert.ok(maxStep <= 0.1 / 60 + 1e-9, `max step ${maxStep}`);
+  assert.ok(Math.abs(gain - start) <= 0.1 + 1e-9, `60s drift ${Math.abs(gain - start)}`);
+  assert.equal(agc.isLocked(), false);
+});
+
+test('a calibration anchor prevents re-entering fast calibration after a seek', () => {
+  const agc = new RealtimeAgc();
+  let gain = 1;
+  for (let time = 1; time <= 10; time += 1) {
+    gain = agc.update(agcInput({
+      currentGain: gain,
+      desiredGain: 1.2,
+      deltaSec: 1,
+      integrationTime: time,
+      coldStartSeconds: 10,
+      programTimeSeconds: time,
+      sourcePeak: 0.1
+    })).nextGain;
+  }
+  // seek 后：积分时间归零但锚点仍在 -> 不进入快速校准期，gain 只受稳态速率约束
+  const afterSeek = agc.update(agcInput({
+    currentGain: gain,
+    desiredGain: 3,
+    deltaSec: 1,
+    integrationTime: 0.1,
+    coldStartSeconds: 10,
+    programTimeSeconds: 42,
+    sourcePeak: 0.1
+  }));
+  assert.ok(Math.abs(afterSeek.nextGain - gain) <= 0.1 / 60 + 1e-9);
+  assert.notEqual(afterSeek.state, 'cold-start');
+});
+
 test('transient peaks do not rewrite programme gain before the limiter', () => {
   const loudPeakAgc = new RealtimeAgc();
   const quietPeakAgc = new RealtimeAgc();

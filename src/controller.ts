@@ -69,8 +69,9 @@ export class MediaVolumeController {
 
   private readonly onLoadedMetadata = () => this.startAnalysis();
   private readonly onSeeked = () => {
-    // seek 后旧积分窗口与校准锚点失效：重置测量并重新校准（完整音轨锁定时保留固定 gain）。
-    this.invalidateMeasurements(!(this.settings.fullAudioAnalysis && this.analysisResult));
+    // seek 只重置测量窗口，保留校准锚点与 AGC 状态：同一媒体内拖动进度条
+    // 不触发重新校准，gain 保持稳定（受稳态速率约束）。
+    this.invalidateMeasurements(false);
   };
   private readonly onVisibility = () => {
     this.lastTickAt = performance.now();
@@ -81,11 +82,12 @@ export class MediaVolumeController {
         this.settings.maxGain
       );
       this.setGain(this.backgroundGainCeiling);
-      this.invalidateMeasurements(!(this.settings.fullAudioAnalysis && this.analysisResult));
+      this.invalidateMeasurements(false);
       return;
     }
     this.backgroundGainCeiling = null;
-    this.invalidateMeasurements(!(this.settings.fullAudioAnalysis && this.analysisResult));
+    // 恢复前台只重置测量窗口，保留校准锚点：不重新快速校准，避免切换标签造成 gain 抽动。
+    this.invalidateMeasurements(false);
   };
 
   constructor(

@@ -4,7 +4,7 @@ Chrome 音量均衡扩展，目标响度默认 `-21 LUFS`。
 
 ## 工作模式
 
-- 实时：前 10 秒校准，之后限制在校准 gain 的 `±0.2x` 与 `±0.75 dB` 交集内，并继续以受限速率收敛；seek 后重新校准。
+- 实时：前 10 秒校准，之后限制在校准 gain 的 `±0.2x` 与 `±0.75 dB` 交集内，且任意方向变化不超过 `0.1x/分钟`；seek 与切换标签页不会触发重新校准，播放中 gain 几乎恒定。
 - 完整音轨：可选拉取并分析整段音轨（仅在媒体开始播放后拉取），成功后全程使用一个固定 gain。
 - 峰值保护：末端 true-peak lookahead limiter；不会在 gain 前压缩节目动态。5.1/7.1 多声道按原声道数独立限峰，不降混为立体声。
 
@@ -36,7 +36,7 @@ npm run test:audio:enforce
 npm run build
 ```
 
-音频基准以 FFmpeg whole-program `loudnorm` 测量为离线参考，目标为 `-21 LUFS`。正式素材必须满足：实际输出在目标 `±1 LU` 内，且第 10 秒后 gain 的 `P95–P5 ≤ 1.5 dB`、最大跨度 `≤ 3 dB`。
+音频基准以 FFmpeg whole-program `loudnorm` 测量为离线参考，目标为 `-21 LUFS`。正式素材必须满足：实际输出在目标 `±1.5 LU` 内（稳定优先：稳态 gain 变化 ≤ 0.1x/分钟），且第 10 秒后 gain 的 `P95–P5 ≤ 1.5 dB`、最大跨度 `≤ 3 dB`。
 
 详细说明见 [`tests/AUDIO_BENCHMARK.md`](tests/AUDIO_BENCHMARK.md)。
 

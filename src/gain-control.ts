@@ -53,7 +53,10 @@ const GATE_PEAK_OPEN = 0.04;
 const GATE_PEAK_CLOSE = 0.025;
 const GATE_CLOSE_HOLD_SEC = 0.8;
 const MAX_BOOST_DB_PER_SEC = 2;
-const MAX_ATTENUATION_DB_PER_SEC = 5;
+const CALIBRATION_ATTENUATION_DB_PER_SEC = 8;
+// 稳态稳定性约束：校准完成后，gain 任意方向变化不超过 0.1x/分钟（≈0.87 dB @ 1x）。
+// 突发动态不再快速改写节目 gain，峰值由末端 lookahead limiter 处理。
+const MAX_GAIN_CHANGE_PER_SEC = 0.1 / 60;
 
 export function chooseControlLoudness(input: LoudnessSelectionInput): number {
   if (input.integrationTime < input.minIntegrationSeconds) {
@@ -141,8 +144,10 @@ export class RealtimeAgc {
     const programTimeSeconds = Number.isFinite(input.programTimeSeconds)
       ? input.programTimeSeconds as number
       : this.predictionElapsedSec;
-    const isCalibrating = programTimeSeconds < input.coldStartSeconds
-      || input.integrationTime < input.coldStartSeconds;
+    // 校准期只在尚未建立校准锚点时进入：seek/切标签后锚点仍在，不应重新快速校准。
+    const isCalibrating = this.calibrationAnchorGain === null
+      && (programTimeSeconds < input.coldStartSeconds
+        || input.integrationTime < input.coldStartSeconds);
     const calibrationBoostReady = input.integrationTime
       >= input.calibrationBoostStartSeconds;
     const riseScale = isCalibrating
@@ -311,21 +316,28 @@ export class RealtimeAgc {
     riseScale: number,
     isCalibrating = false
   ): number {
-    const deltaLimit = Math.max(0, input.gainChangePerSec * input.deltaSec);
+    // 校准期以用户设置的速率快速收敛；校准完成后受 MAX_GAIN_CHANGE_PER_SEC 硬上限约束，
+    // 升压与衰减均不超过 0.1x/分钟（升压仍按置信度 riseScale 进一步降速）。
+    const maxRate = isCalibrating
+      ? Math.max(0, input.gainChangePerSec)
+      : Math.max(0, Math.min(input.gainChangePerSec, MAX_GAIN_CHANGE_PER_SEC));
+    const deltaLimit = maxRate * input.deltaSec;
     if (desiredGain > currentGain) {
-      // dB 限速同样应用 riseScale，与线性限速保持一致（低置信度时两种限速都要收紧）。
+      if (!isCalibrating) {
+        return Math.min(desiredGain, currentGain + deltaLimit * riseScale);
+      }
       const dbLimitedGain = currentGain * Math.pow(
         10,
         MAX_BOOST_DB_PER_SEC * input.deltaSec * riseScale / 20
       );
       return Math.min(desiredGain, currentGain + deltaLimit * riseScale, dbLimitedGain);
     }
-    const maxAttenuationDbPerSec = isCalibrating
-      ? 8
-      : MAX_ATTENUATION_DB_PER_SEC;
+    if (!isCalibrating) {
+      return Math.max(desiredGain, currentGain - deltaLimit);
+    }
     const dbLimitedGain = currentGain * Math.pow(
       10,
-      -maxAttenuationDbPerSec * input.deltaSec / 20
+      -CALIBRATION_ATTENUATION_DB_PER_SEC * input.deltaSec / 20
     );
     return Math.max(desiredGain, currentGain - deltaLimit * 3, dbLimitedGain);
   }

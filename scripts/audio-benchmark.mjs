@@ -19,7 +19,9 @@ const resultsDir = join(root, 'test-results');
 const traceEnabled = process.argv.includes('--trace');
 const enforceEnabled = process.argv.includes('--enforce');
 const compiledDir = join(tmpdir(), `bili-volume-audio-benchmark-${process.pid}`);
-const OUTPUT_TARGET_TOLERANCE_LU = 1;
+// 稳定优先：稳态 gain 变化 ≤ 0.1x/分钟，动态节目输出精度让位于稳定性。
+// 输出精度门禁放宽到 ±1.5 LU；稳定性门禁（P95-P5、跨度）保持严格。
+const OUTPUT_TARGET_TOLERANCE_LU = 1.5;
 const GAIN_ROBUST_SPAN_LIMIT_DB = 1.5;
 const GAIN_MAX_SPAN_LIMIT_DB = 3;
 
