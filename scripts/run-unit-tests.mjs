@@ -27,6 +27,7 @@ try {
     'tests/full-audio-analysis.test.cjs',
     'tests/gain-control.test.cjs',
     'tests/limiter-worklet.test.cjs',
+    'tests/output-safety.test.cjs',
     'tests/loudness-meter.test.cjs',
     'tests/settings.test.cjs'
   ], { cwd: root, stdio: 'inherit' });

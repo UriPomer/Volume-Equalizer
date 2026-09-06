@@ -31,6 +31,7 @@ export interface AgcUpdateInput {
 
 export interface AgcUpdateResult {
   nextGain: number;
+  allowBelowMin: boolean;
   gateOpen: boolean;
   state: 'cold-start' | 'noise-hold' | 'attenuate' | 'boost' | 'hold' | 'locked';
   peakLimitedGain: number;
@@ -126,11 +127,17 @@ export class RealtimeAgc {
   }
 
   update(input: AgcUpdateInput): AgcUpdateResult {
+    const currentGain = Math.min(Math.max(input.currentGain, 0), input.maxGain);
+    // Final post-EQ DSP owns output safety; programme gain remains slew-limited.
     if (this.lockedProgramGain !== null) {
-      const currentGain = Math.min(Math.max(input.currentGain, input.minGain), input.maxGain);
       const targetGain = Math.min(Math.max(this.lockedProgramGain, input.minGain), input.maxGain);
+      const candidateGain = this.slewLimitGain(input, currentGain, targetGain, 1);
       return {
-        nextGain: this.slewLimitGain(input, currentGain, targetGain, 1),
+        nextGain: candidateGain,
+        allowBelowMin: this.isBelowMinimum(
+          candidateGain,
+          input.minGain
+        ),
         gateOpen: this.gateOpen,
         state: 'locked',
         peakLimitedGain: targetGain,
@@ -157,7 +164,6 @@ export class RealtimeAgc {
     const targetGain = isFinite(input.desiredGain ?? NaN)
       ? input.desiredGain as number
       : calculateGainForLoudness(input.controlLufs, input.targetLufs);
-    const currentGain = Math.min(Math.max(input.currentGain, input.minGain), input.maxGain);
     let desiredGain = this.computeDesiredGain(
       input,
       targetGain,
@@ -170,25 +176,29 @@ export class RealtimeAgc {
     }
 
     if (!this.gateOpen && desiredGain > currentGain) {
+      const nextGain = currentGain;
       return {
-        nextGain: currentGain,
+        nextGain,
+        allowBelowMin: this.isBelowMinimum(nextGain, input.minGain),
         gateOpen: this.gateOpen,
-        state: 'noise-hold',
+        state: nextGain < currentGain ? 'attenuate' : 'noise-hold',
         peakLimitedGain,
         riseScale
       };
     }
 
-    const nextGain = this.slewLimitGain(
+    const candidateGain = this.slewLimitGain(
       input,
       currentGain,
       desiredGain,
       riseScale,
       isCalibrating
     );
+    const nextGain = candidateGain;
 
     return {
       nextGain,
+      allowBelowMin: this.isBelowMinimum(nextGain, input.minGain),
       gateOpen: this.gateOpen,
       state: this.classifyState(isCalibrating, nextGain, currentGain),
       peakLimitedGain,
@@ -197,8 +207,10 @@ export class RealtimeAgc {
   }
 
   private updateGate(input: AgcUpdateInput): void {
-    const gateCandidates = [input.momentaryLufs, input.shortTermLufs, input.controlLufs]
-      .filter((value) => isFinite(value));
+    // Silence (-Infinity) is a valid current observation. Programme history
+    // must never keep the gate open after current audio has disappeared.
+    const gateCandidates = [input.momentaryLufs]
+      .filter((value) => !Number.isNaN(value) && value !== Infinity);
     const gateLufs = gateCandidates.length > 0 ? Math.max(...gateCandidates) : NaN;
     if (!isFinite(gateLufs)) {
       this.gateOpen = false;
@@ -254,6 +266,10 @@ export class RealtimeAgc {
     }
 
     return maxAllowedGain;
+  }
+
+  private isBelowMinimum(gain: number, minGain: number): boolean {
+    return gain < minGain;
   }
 
   private computeDesiredGain(

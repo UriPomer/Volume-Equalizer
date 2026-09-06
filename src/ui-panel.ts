@@ -14,7 +14,7 @@ const STATUS_TEXT: Record<AnalysisStatus, string> = {
   'full-track': '完整音轨已锁定',
   incomplete: '音轨不完整 · 实时继续',
   unsupported: '直播不支持完整分析',
-  'processor-unavailable': '处理器不可用 · 安全保持',
+  'processor-unavailable': '保护不可用 · 已静音',
   failed: '分析失败 · 实时继续'
 };
 
@@ -75,6 +75,7 @@ function panelHtml(settings: Settings): string {
         <small>输出</small>
         ${meterRow('积分', 'outputIntegrated', ' LUFS')} ${meterRow('瞬时', 'output', ' LUFS')}
         ${meterRow('增益', 'gain')} ${meterRow('算法', 'status')}
+        ${meterRow('安全衰减', 'safety')}
       </div>
     </section>
   </div>`;
@@ -163,12 +164,15 @@ function updateMeter(shadow: ShadowRoot, getMeter: () => MeterState): void {
     const lufs = rmsToLufs(rms);
     return `${lufs > -70 ? lufs.toFixed(1) : '-∞'} LUFS`;
   };
+  const showMomentary = (lufs: number) => Number.isNaN(lufs)
+    ? '测量中' : `${Number.isFinite(lufs) ? lufs.toFixed(1) : '-∞'} LUFS`;
   meterTimer = window.setInterval(() => {
     if (!host?.isConnected) return;
     const meter = getMeter();
-    setText(shadow, '[data-meter="original"]', showLufs(meter.originalRms));
+    setText(shadow, '[data-meter="original"]', showMomentary(meter.originalMomentaryLufs));
     setText(shadow, '[data-meter="originalIntegrated"]', `${showLufs(meter.originalIntegratedRms)} · ${meter.sampleCount}s`);
-    setText(shadow, '[data-meter="output"]', showLufs(meter.rms));
+    setText(shadow, '[data-meter="output"]', showMomentary(meter.momentaryLufs));
+    setText(shadow, '[data-meter="safety"]', `${meter.safetyGain.toFixed(2)}x`);
     setText(shadow, '[data-meter="outputIntegrated"]', showLufs(meter.integratedRms || meter.rms));
     setText(shadow, '[data-meter="gain"]', `${meter.gain.toFixed(2)}x`);
     setText(shadow, '[data-meter="status"]', STATUS_TEXT[meter.analysisStatus]);

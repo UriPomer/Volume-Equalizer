@@ -11,6 +11,9 @@ export type AnalysisStatus =
   | 'failed';
 
 export interface MeterState {
+  originalMomentaryLufs: number;
+  momentaryLufs: number;
+  safetyGain: number;
   rms: number;
   integratedRms: number;
   originalRms: number;
@@ -21,6 +24,9 @@ export interface MeterState {
 }
 
 export const EMPTY_METER_STATE: MeterState = {
+  originalMomentaryLufs: NaN,
+  momentaryLufs: NaN,
+  safetyGain: 1,
   rms: 0,
   integratedRms: 0,
   originalRms: 0,

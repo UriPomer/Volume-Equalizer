@@ -28,6 +28,24 @@ export function ensureMediaSource(media: HTMLMediaElement): MediaElementAudioSou
   return source;
 }
 
+/** Match the destination before measuring/limiting, so a later up/downmix
+ * cannot increase loudness after the safety guard. */
+export function createAudioProcessor(context: BaseAudioContext, targetLufs: number): AudioWorkletNode {
+  const channels = context.destination.channelCount;
+  return new AudioWorkletNode(context, 'lookahead-peak-limiter', {
+    numberOfInputs: 2,
+    numberOfOutputs: 1,
+    outputChannelCount: [channels],
+    channelCount: channels,
+    channelCountMode: 'explicit',
+    channelInterpretation: 'speakers',
+    processorOptions: {
+      targetLufs, lookaheadMs: 15, releaseMs: 50,
+      ceiling: 0.8912509381337456, interSampleMargin: 1.03
+    }
+  });
+}
+
 /**
  * 安装全局 AudioContext resume 处理器
  * 在用户交互时自动恢复 AudioContext

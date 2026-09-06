@@ -1,11 +1,9 @@
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
-const fs = require('node:fs');
-const path = require('node:path');
 
 function loadProcessor() {
   let ProcessorClass = null;
-  const code = fs.readFileSync(path.join(__dirname, '..', 'public', 'limiter-worklet.js'), 'utf8');
+  const code = require('./worklet-source.cjs')();
   const context = {
     sampleRate: 48000,
     console,
@@ -34,13 +32,14 @@ function renderMono(inputSamples, options = {}) {
   });
 
   const outputSamples = [];
-  for (let offset = 0; offset < inputSamples.length; offset += 128) {
+  for (let offset = 0; offset < inputSamples.length + 12000; offset += 128) {
     const inputBlock = new Float32Array(128);
     inputBlock.set(inputSamples.slice(offset, offset + 128));
     const outputBlock = new Float32Array(128);
     processor.process([[inputBlock]], [[outputBlock]]);
     outputSamples.push(...outputBlock);
   }
+  assert.ok(outputSamples.some((sample) => sample !== 0), 'must render audio, not only buffered silence');
   return outputSamples;
 }
 
@@ -49,7 +48,7 @@ function renderStereo(leftSamples, rightSamples, options = {}) {
   const processor = new ProcessorClass({ processorOptions: options });
 
   const outputSamples = [];
-  for (let offset = 0; offset < leftSamples.length; offset += 128) {
+  for (let offset = 0; offset < leftSamples.length + 12000; offset += 128) {
     const leftInput = new Float32Array(128);
     const rightInput = new Float32Array(128);
     leftInput.set(leftSamples.slice(offset, offset + 128));

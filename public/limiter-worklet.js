@@ -1,8 +1,12 @@
+import { LoudnessSafety } from '../src/loudness-safety.ts';
+
 class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
 
     const processorOptions = options.processorOptions || {};
+    this.targetLufs = clampNumber(processorOptions.targetLufs, -23, -10, -21);
+    this.safety = new LoudnessSafety(sampleRate, this.targetLufs);
     this.ceiling = clampNumber(processorOptions.ceiling, 0.1, 1, 0.8912509381337456);
     this.interSampleMargin = clampNumber(processorOptions.interSampleMargin, 1, 1.1, 1.03);
     this.releaseMs = clampNumber(processorOptions.releaseMs, 5, 1000, 50);
@@ -23,6 +27,14 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
     this.outputMeter = [];
     this.meterEpoch = 0;
     this.port.onmessage = (event) => {
+      if (event.data?.type === 'set-target') {
+        const target = clampNumber(event.data.targetLufs, -23, -10, this.targetLufs);
+        if (target !== this.targetLufs) {
+          this.targetLufs = target;
+          this.safety = new LoudnessSafety(sampleRate, target);
+        }
+        return;
+      }
       if (event.data?.type !== 'reset-meter') return;
       this.meterEpoch = Number.isFinite(event.data.epoch) ? event.data.epoch : 0;
       this.meterIndex = 0;
@@ -79,6 +91,7 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
       for (let channel = 0; channel < channelCount; channel++) {
         output[channel][frame] = this.delayLines[channel][readIndex] * delayedGain;
       }
+      this.safety.processFrame(output, frame);
 
       for (let channel = 0; channel < this.originalMeter.length; channel++) {
         const originalChannel = original[channel];
@@ -105,12 +118,12 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
   }
 
   ensureMeterBuffers(originalChannels, outputChannels) {
-    while (this.originalMeter.length < originalChannels) {
-      this.originalMeter.push(new Float32Array(this.meterSize));
-    }
-    while (this.outputMeter.length < outputChannels) {
-      this.outputMeter.push(new Float32Array(this.meterSize));
-    }
+    if (this.originalMeter.length === originalChannels
+      && this.outputMeter.length === outputChannels) return;
+    // A layout change must not leave phantom surround/LFE channels in meters.
+    this.originalMeter = Array.from({ length: originalChannels }, () => new Float32Array(this.meterSize));
+    this.outputMeter = Array.from({ length: outputChannels }, () => new Float32Array(this.meterSize));
+    this.meterIndex = 0;
   }
 
   flushMeter() {
@@ -121,6 +134,7 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
       this.port.postMessage({
         type: 'meter',
         epoch: this.meterEpoch,
+        safetyGain: this.safety.gain,
         original,
         output
       }, transfers);

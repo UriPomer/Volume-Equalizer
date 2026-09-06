@@ -1,10 +1,10 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import { buildSync } from 'esbuild';
 import { createRequire } from 'node:module';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runInNewContext } from 'node:vm';
 import {
   DEFAULT_REFERENCE_SETTINGS,
   calculateReferenceTrackGain,
@@ -18,12 +18,16 @@ const fixtureDir = join(root, 'tests', 'fixtures', 'videos');
 const resultsDir = join(root, 'test-results');
 const traceEnabled = process.argv.includes('--trace');
 const enforceEnabled = process.argv.includes('--enforce');
-const compiledDir = join(tmpdir(), `bili-volume-audio-benchmark-${process.pid}`);
+const compiledDir = mkdtempSync(join(tmpdir(), 'bili-volume-audio-benchmark-'));
 // 稳定优先：稳态 gain 变化 ≤ 0.1x/分钟，动态节目输出精度让位于稳定性。
-// 输出精度门禁放宽到 ±1.5 LU；稳定性门禁（P95-P5、跨度）保持严格。
+// 节目校准与经过相同保护的固定增益参考比较，另保留原目标误差。
 const OUTPUT_TARGET_TOLERANCE_LU = 1.5;
 const GAIN_ROBUST_SPAN_LIMIT_DB = 1.5;
 const GAIN_MAX_SPAN_LIMIT_DB = 3;
+const FULL_TRACK_MEASUREMENT_TOLERANCE_LU = 0.5;
+const FULL_TRACK_GAIN_TOLERANCE_DB = 0.5;
+const OUTPUT_MOMENTARY_CEILING_TOLERANCE_LU = 0.01;
+const OUTPUT_FLUSH_SECONDS = 0.6;
 
 for (const fixture of fixtures) {
   if (!existsSync(join(fixtureDir, fixture.file))) {
@@ -51,14 +55,18 @@ try {
     );
     const reference = calculateReferenceTrackGain(referenceMeasurement, DEFAULT_REFERENCE_SETTINGS);
     const pcm = decodeStereoPcm(filePath, fixture.inputGainDb);
-    const simulation = simulateRealtime(pcm, {
+    const modules = {
       LoudnessMeter,
       RealtimeAgc,
       chooseControlLoudness,
       calculateFullAudioGain,
       TruePeakEstimator,
       LimiterProcessor
-    });
+    };
+    const simulation = simulateRealtime(pcm, modules);
+    // Compare programme calibration against FFmpeg's fixed gain through the
+    // same mandatory output protection; retain the target deviation separately.
+    const protectedReference = simulateRealtime(pcm, modules, reference.gain);
 
     const report = {
       id: fixture.id,
@@ -69,7 +77,8 @@ try {
       durationSeconds: round(pcm.durationSeconds, 3),
       offlineReference: {
         ...mapRounded(referenceMeasurement),
-        ...mapRounded(reference)
+        ...mapRounded(reference),
+        protectedOutputIntegratedLufs: round(protectedReference.outputIntegratedLufs, 3)
       },
       fullTrackImplementation: {
         integratedLufs: round(simulation.fullIntegratedLufs, 3),
@@ -85,6 +94,11 @@ try {
           3
         ),
         outputVsOfflineLu: round(simulation.outputIntegratedLufs - reference.predictedOutputLufs, 3),
+        outputVsProtectedReferenceLu: round(simulation.outputIntegratedLufs
+          - protectedReference.outputIntegratedLufs, 3),
+        maxActualOutputMomentaryLufs: round(simulation.maxActualOutputMomentaryLufs, 3),
+        outputMomentaryCeilingDiffLu: round(simulation.outputMomentaryCeilingDiffLu, 3),
+        minSafetyGain: round(simulation.minSafetyGain, 6),
         finalGainDb: round(linearToDb(simulation.finalGain), 3),
         finalGainDiffDb: round(linearToDb(simulation.finalGain) - reference.gainDb, 3),
         minGainDb: round(linearToDb(simulation.minGain), 3),
@@ -97,12 +111,27 @@ try {
         gainMaxSpanAfter10Db: round(simulation.gainMaxSpanAfter10Db, 3)
       }
     };
-    report.realtime.loudnessPass = Math.abs(report.realtime.outputTargetDiffLu)
+    report.fullTrackImplementation.measurementPass = Math.abs(
+      simulation.fullIntegratedLufs - referenceMeasurement.integratedLufs
+    ) <= FULL_TRACK_MEASUREMENT_TOLERANCE_LU;
+    report.fullTrackImplementation.gainPass = Math.abs(
+      linearToDb(simulation.fullGain) - reference.gainDb
+    ) <= FULL_TRACK_GAIN_TOLERANCE_DB;
+    report.fullTrackImplementation.pass = report.fullTrackImplementation.measurementPass
+      && report.fullTrackImplementation.gainPass;
+    report.realtime.targetMeanPass = Math.abs(report.realtime.outputTargetDiffLu)
       <= OUTPUT_TARGET_TOLERANCE_LU;
+    report.realtime.loudnessPass = Math.abs(report.realtime.outputVsProtectedReferenceLu)
+      <= OUTPUT_TARGET_TOLERANCE_LU;
+    report.realtime.outputSafetyPass = simulation.outputMomentaryCeilingDiffLu
+      <= OUTPUT_MOMENTARY_CEILING_TOLERANCE_LU;
     report.realtime.stabilityPass = report.realtime.gainRobustSpanAfter10Db
       <= GAIN_ROBUST_SPAN_LIMIT_DB
       && report.realtime.gainMaxSpanAfter10Db <= GAIN_MAX_SPAN_LIMIT_DB;
-    report.realtime.pass = report.realtime.loudnessPass && report.realtime.stabilityPass;
+    report.realtime.pass = report.realtime.loudnessPass
+      && report.realtime.outputSafetyPass
+      && report.realtime.stabilityPass;
+    report.pass = report.fullTrackImplementation.pass && report.realtime.pass;
     reports.push(report);
 
     if (traceEnabled) {
@@ -119,7 +148,7 @@ try {
   console.log(`report - ${join(resultsDir, 'audio-benchmark.md')}`);
   console.log(`detailed gain trace - ${traceEnabled ? 'enabled' : 'disabled (use npm run test:audio:trace)'}`);
   if (enforceEnabled
-    && reports.some((report) => report.includedInEvaluation && !report.realtime.pass)) {
+    && reports.some((report) => report.includedInEvaluation && !report.pass)) {
     process.exitCode = 1;
   }
 } finally {
@@ -127,6 +156,7 @@ try {
 }
 
 function compileMeasurementModules(outDir) {
+  mkdirSync(outDir, { recursive: true });
   const tsc = join(root, 'node_modules', 'typescript', 'bin', 'tsc');
   execFileSync(process.execPath, [
     tsc, '--ignoreConfig',
@@ -143,15 +173,19 @@ function compileMeasurementModules(outDir) {
 
 function loadLimiterProcessor() {
   let Processor;
-  runInNewContext(
-    readFileSync(join(root, 'public', 'limiter-worklet.js'), 'utf8'),
-    {
-      sampleRate: 48000,
-      AudioWorkletProcessor: class {
-        constructor() { this.port = { onmessage: null, postMessage() {} }; }
-      },
-      registerProcessor(_name, implementation) { Processor = implementation; }
-    }
+  const workletBundle = buildSync({
+    entryPoints: [join(root, 'public', 'limiter-worklet.js')],
+    bundle: true,
+    write: false,
+    format: 'iife',
+    target: 'es2020'
+  }).outputFiles[0].text;
+  // Execute trusted, locally built DSP in this realm; VM proxy access in the
+  // per-sample hot loop otherwise dominates the audio benchmark runtime.
+  new Function('AudioWorkletProcessor', 'registerProcessor', 'sampleRate', workletBundle)(
+    class { constructor() { this.port = { onmessage: null, postMessage() {} }; } },
+    (_name, implementation) => { Processor = implementation; },
+    48000
   );
   return Processor;
 }
@@ -179,7 +213,7 @@ function decodeStereoPcm(filePath, inputGainDb) {
   return { samples, sampleRate: 48000, channels: 2, durationSeconds: samples.length / 2 / 48000 };
 }
 
-function simulateRealtime(pcm, modules) {
+function simulateRealtime(pcm, modules, fixedGain) {
   const {
     LoudnessMeter,
     RealtimeAgc,
@@ -189,11 +223,12 @@ function simulateRealtime(pcm, modules) {
     LimiterProcessor
   } = modules;
   const inputMeter = new LoudnessMeter(pcm.sampleRate, Number.POSITIVE_INFINITY);
+  const fullInputMeter = new LoudnessMeter(pcm.sampleRate, Number.POSITIVE_INFINITY);
   const outputMeter = new LoudnessMeter(pcm.sampleRate, Number.POSITIVE_INFINITY);
   const agc = new RealtimeAgc();
   const chunkFrames = Math.floor(pcm.sampleRate * 0.1);
   const trace = [];
-  let gain = 1;
+  let gain = fixedGain ?? 1;
   let minGain = gain;
   let maxGain = gain;
   let maxStepDb = 0;
@@ -201,14 +236,18 @@ function simulateRealtime(pcm, modules) {
   const truePeakEstimator = new TruePeakEstimator();
   const limiter = new LimiterProcessor({
     processorOptions: {
+      targetLufs: DEFAULT_REFERENCE_SETTINGS.targetLufs,
       lookaheadMs: 15,
       releaseMs: 50,
       ceiling: 0.8912509381337456,
       interSampleMargin: 1.03
     }
   });
-  limiter.port = { postMessage() {} };
+  const meterMessages = [];
+  limiter.port = { postMessage(message) { meterMessages.push(message); } };
   const evaluationGainDb = [];
+  let maxActualOutputMomentaryLufs = Number.NEGATIVE_INFINITY;
+  let minSafetyGain = 1;
 
   for (let startFrame = 0; startFrame < pcm.samples.length / 2; startFrame += chunkFrames) {
     const frames = Math.min(chunkFrames, pcm.samples.length / 2 - startFrame);
@@ -222,8 +261,23 @@ function simulateRealtime(pcm, modules) {
     }
     samplePeak = Math.max(samplePeak, chunkPeak);
     truePeakEstimator.processChannels([left, right]);
-    inputMeter.processChannels([left, right]);
-
+    fullInputMeter.processChannels([left, right]);
+    const previousGain = gain;
+    const gainedLeft = new Float32Array(frames);
+    const gainedRight = new Float32Array(frames);
+    for (let frame = 0; frame < frames; frame++) {
+      gainedLeft[frame] = left[frame] * gain;
+      gainedRight[frame] = right[frame] * gain;
+    }
+    const outputLeft = new Float32Array(frames);
+    const outputRight = new Float32Array(frames);
+    limiter.process([[gainedLeft, gainedRight], [left, right]], [[outputLeft, outputRight]]);
+    const meters = consumeMeterMessages(meterMessages, inputMeter);
+    for (const meter of meters) minSafetyGain = Math.min(minSafetyGain, meter.safetyGain);
+    maxActualOutputMomentaryLufs = Math.max(
+      maxActualOutputMomentaryLufs,
+      processActualOutputMeters(meters, outputMeter)
+    );
     const integratedLufs = inputMeter.getIntegratedLoudness();
     const shortTermLufs = inputMeter.getShortTermLoudness();
     const momentaryLufs = inputMeter.getMomentaryLoudness();
@@ -237,9 +291,8 @@ function simulateRealtime(pcm, modules) {
       calibrationSeconds: 10,
       calibrationSafetyThresholdLufs: DEFAULT_REFERENCE_SETTINGS.targetLufs + 3
     });
-    const previousGain = gain;
     let state = 'waiting';
-    if (Number.isFinite(controlLufs)) {
+    if (fixedGain === undefined && meters.length && Number.isFinite(controlLufs)) {
       const calibrationGain = Math.pow(
         10,
         (DEFAULT_REFERENCE_SETTINGS.targetLufs - controlLufs) / 20
@@ -267,17 +320,6 @@ function simulateRealtime(pcm, modules) {
       gain = result.nextGain;
       state = result.state;
     }
-
-    const gainedLeft = new Float32Array(frames);
-    const gainedRight = new Float32Array(frames);
-    for (let frame = 0; frame < frames; frame++) {
-      gainedLeft[frame] = left[frame] * gain;
-      gainedRight[frame] = right[frame] * gain;
-    }
-    const outputLeft = new Float32Array(frames);
-    const outputRight = new Float32Array(frames);
-    limiter.process([[gainedLeft, gainedRight]], [[outputLeft, outputRight]]);
-    outputMeter.processChannels([outputLeft, outputRight]);
     minGain = Math.min(minGain, gain);
     maxGain = Math.max(maxGain, gain);
     maxStepDb = Math.max(maxStepDb, Math.abs(linearToDb(gain / previousGain)));
@@ -294,7 +336,19 @@ function simulateRealtime(pcm, modules) {
     });
   }
 
-  const fullIntegratedLufs = inputMeter.getIntegratedLoudness();
+  for (let flushed = 0; flushed < OUTPUT_FLUSH_SECONDS * pcm.sampleRate; flushed += chunkFrames) {
+    const frames = Math.min(chunkFrames, OUTPUT_FLUSH_SECONDS * pcm.sampleRate - flushed);
+    const silence = [new Float32Array(frames), new Float32Array(frames)];
+    limiter.process([silence, silence], [[new Float32Array(frames), new Float32Array(frames)]]);
+    const meters = consumeMeterMessages(meterMessages, null);
+    for (const meter of meters) minSafetyGain = Math.min(minSafetyGain, meter.safetyGain);
+    maxActualOutputMomentaryLufs = Math.max(
+      maxActualOutputMomentaryLufs,
+      processActualOutputMeters(meters, outputMeter)
+    );
+  }
+
+  const fullIntegratedLufs = fullInputMeter.getIntegratedLoudness();
   const fullGain = calculateFullAudioGain(
     {
       integratedLufs: fullIntegratedLufs,
@@ -314,6 +368,9 @@ function simulateRealtime(pcm, modules) {
     fullIntegratedLufs,
     fullGain,
     outputIntegratedLufs: outputMeter.getIntegratedLoudness(),
+    maxActualOutputMomentaryLufs,
+    outputMomentaryCeilingDiffLu: maxActualOutputMomentaryLufs
+      - (DEFAULT_REFERENCE_SETTINGS.targetLufs + 2),
     finalGain: gain,
     minGain,
     maxGain,
@@ -322,19 +379,48 @@ function simulateRealtime(pcm, modules) {
     gainRobustSpanAfter10Db: percentile(evaluationGainDb, 0.95)
       - percentile(evaluationGainDb, 0.05),
     gainMaxSpanAfter10Db: evaluationMaxGainDb - evaluationMinGainDb,
+    minSafetyGain,
     trace
   };
 }
 
+function consumeMeterMessages(messages, inputMeter) {
+  return messages.splice(0).map((meter) => {
+    if (meter.type !== 'meter' || !Array.isArray(meter.original) || !Array.isArray(meter.output)) {
+      throw new Error('Limiter meter message is incomplete');
+    }
+    if (inputMeter) inputMeter.processChannels(meter.original);
+    return {
+      output: meter.output,
+      safetyGain: Number.isFinite(meter.safetyGain) ? meter.safetyGain : 1
+    };
+  });
+}
+
+function processActualOutputMeters(meters, outputMeter) {
+  let maximum = Number.NEGATIVE_INFINITY;
+  for (const meter of meters) {
+    for (let offset = 0; offset < meter.output[0].length; offset += 128) {
+      const end = Math.min(offset + 128, meter.output[0].length);
+      outputMeter.processChannels(meter.output.map((channel) => channel.subarray(offset, end)));
+      const momentaryLufs = outputMeter.getMomentaryLoudness();
+      if (Number.isFinite(momentaryLufs)) maximum = Math.max(maximum, momentaryLufs);
+    }
+  }
+  return maximum;
+}
+
 function renderConsole(reports) {
-  const header = 'fixture                 output LUFS  target ΔLU  P95-P5 dB  max span dB  loudness  stability  result';
+  const header = 'fixture                 output LUFS  max momentary  P95-P5 dB  max span dB  full track  loudness  safety  stability  result';
   const rows = reports.map((report) => [
     report.id.padEnd(23),
     String(report.realtime.outputIntegratedLufs).padStart(11),
-    String(report.realtime.outputTargetDiffLu).padStart(10),
+    String(report.realtime.maxActualOutputMomentaryLufs).padStart(14),
     String(report.realtime.gainRobustSpanAfter10Db).padStart(10),
     String(report.realtime.gainMaxSpanAfter10Db).padStart(11),
+    resultText(report, 'fullTrackPass').padStart(10),
     resultText(report, 'loudnessPass').padStart(8),
+    resultText(report, 'outputSafetyPass').padStart(6),
     resultText(report, 'stabilityPass').padStart(9),
     resultText(report, 'pass').padStart(6)
   ].join('  '));
@@ -343,14 +429,14 @@ function renderConsole(reports) {
 
 function renderMarkdown(summary) {
   const rows = summary.reports.map((report) =>
-    `| ${report.id} | ${report.includedInEvaluation ? 'Evaluation' : 'Diagnostic only'} | ${report.realtime.outputIntegratedLufs} | ${report.realtime.outputTargetDiffLu} | ${report.realtime.gainRobustSpanAfter10Db} | ${report.realtime.gainMaxSpanAfter10Db} | ${report.realtime.finalGainDiffDb} | ${resultText(report, 'loudnessPass')} | ${resultText(report, 'stabilityPass')} | ${resultText(report, 'pass')} |`
+    `| ${report.id} | ${report.includedInEvaluation ? 'Evaluation' : 'Diagnostic only'} | ${report.fullTrackImplementation.measurementDiffLu} | ${report.fullTrackImplementation.gainDiffDb} | ${report.realtime.outputIntegratedLufs} | ${report.realtime.outputTargetDiffLu} | ${report.realtime.outputVsProtectedReferenceLu} | ${report.realtime.maxActualOutputMomentaryLufs} | ${report.realtime.outputMomentaryCeilingDiffLu} | ${report.realtime.gainRobustSpanAfter10Db} | ${report.realtime.gainMaxSpanAfter10Db} | ${resultText(report, 'fullTrackPass')} | ${resultText(report, 'loudnessPass')} | ${resultText(report, 'outputSafetyPass')} | ${resultText(report, 'stabilityPass')} | ${resultText(report, 'pass')} |`
   );
   return `# Audio normalization benchmark\n\n` +
     `Generated: ${summary.generatedAt}\n\n` +
     `Target: ${summary.targetLufs} LUFS; offline reference uses whole-program FFmpeg loudnorm measurement and one fixed, true-peak-safe gain. Detailed trace: ${summary.traceEnabled ? 'enabled' : 'disabled'}.\n\n` +
-    `Pass criteria: output loudness within ±${OUTPUT_TARGET_TOLERANCE_LU} LU of target, gain P95–P5 after 10 seconds ≤ ${GAIN_ROBUST_SPAN_LIMIT_DB} dB, and maximum gain span after 10 seconds ≤ ${GAIN_MAX_SPAN_LIMIT_DB} dB. Extreme-peak fixtures are diagnostic only.\n\n` +
-    `| Fixture | Use | Output LUFS | Target diff LU | Gain P95–P5 dB | Max gain span dB | Final gain diff dB | Loudness | Stability | Result |\n` +
-    `|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n` + rows.join('\n') + '\n';
+    `Pass criteria: full-track measurement/reference gain each within their stated tolerance; actual output integrated loudness within ±${OUTPUT_TARGET_TOLERANCE_LU} LU of the safety-constrained fixed-gain reference (raw target deviation remains diagnostic); actual output momentary loudness no more than ${OUTPUT_MOMENTARY_CEILING_TOLERANCE_LU} LU above target +2; gain P95–P5 after 10 seconds ≤ ${GAIN_ROBUST_SPAN_LIMIT_DB} dB; and maximum programme gain span after 10 seconds ≤ ${GAIN_MAX_SPAN_LIMIT_DB} dB. Extreme-peak fixtures are diagnostic only.\n\n` +
+    `| Fixture | Use | Full measurement diff LU | Full gain diff dB | Output LUFS | Target diff LU | Protected reference diff LU | Max actual momentary LUFS | Ceiling diff LU | Gain P95–P5 dB | Max programme gain span dB | Full track | Loudness | Safety | Stability | Result |\n` +
+    `|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n` + rows.join('\n') + '\n';
 }
 
 function percentile(sortedValues, fraction) {
@@ -364,6 +450,8 @@ function percentile(sortedValues, fraction) {
 
 function resultText(report, field) {
   if (!report.includedInEvaluation) return 'INFO';
+  if (field === 'fullTrackPass') return report.fullTrackImplementation.pass ? 'PASS' : 'FAIL';
+  if (field === 'pass') return report.pass ? 'PASS' : 'FAIL';
   return report.realtime[field] ? 'PASS' : 'FAIL';
 }
 

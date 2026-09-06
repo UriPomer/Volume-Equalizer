@@ -72,20 +72,39 @@ This writes `test-results/*-gain-trace.jsonl`. No trace logger is enabled in the
 
 ## Pass criteria
 
-Evaluated fixtures must satisfy all three conditions:
+Evaluated fixtures must satisfy all five conditions:
 
-- actual output integrated loudness is within `±1.5 LU` of the target (stable-first
-  contract: steady-state gain moves at most `0.1x/min`, so dynamic programmes trade
-  some output precision for gain stability; the calibration phase still converges fast);
+- the full-track TypeScript measurement differs from FFmpeg whole-program measurement by no more than `0.5 LU`, and its fixed gain differs by no more than `0.5 dB`;
+- actual output integrated loudness is within `±1.5 LU` of the safety-constrained
+  reference: FFmpeg's whole-programme fixed gain rendered through the same final
+  protection. The original target deviation remains reported separately as
+  `outputTargetDiffLu` and `targetMeanPass`; it is not presented as passing when it
+  fails. A maximum-window cap plus reserved block budgets reduces integrated
+  loudness, especially on dynamic material, so a bare fixed-gain prediction is no
+  longer the attainable output reference. This comparison tests calibration, not
+  the correctness of the shared guard; independent final-PCM ceiling tests do that;
+- maximum actual output momentary loudness, including the limiter/safety-buffer tail,
+  is no more than `0.01 LU` above `target + 2 LUFS`;
 - gain `P95–P5` from 10 seconds to the end is no greater than `1.5 dB`;
 - maximum gain span from 10 seconds to the end is no greater than `3 dB`.
 
 `P95–P5` measures typical audible movement without letting one sample dominate the result. The maximum span remains a hard guard against large excursions. Both use dB because a coefficient difference such as `0.2x` has different perceptual meaning at different gain levels.
 
+The benchmark renders each 100 ms block with the previous programme gain, then consumes
+the worklet's continuous 100 ms meter message (`original`, actual `output`, and
+`safetyGain`) before calculating the next block's programme gain. At programme end it
+feeds at least 0.6 seconds of silence to flush the lookahead and output-safety buffers.
+That flush is included only in actual-output measurements; full-track, input, and
+offline-reference measurements cover the original programme only.
+
 ## Diagnostic metrics
 
 - `Final gain diff dB`: final realtime coefficient minus the offline fixed coefficient.
 - `Output vs offline LU`: actual realtime output minus the peak-safe offline prediction.
+- `Output vs protected reference LU`: actual realtime output minus the output of
+  the fixed FFmpeg gain through protection; this is the integrated-quality gate.
 - `Max step dB`: largest 100 ms gain step.
+- `Safety gain`: final-output safety attenuation reported by the worklet. It may move
+  independently of programme gain, so it is not subject to the programme-gain 3 dB span gate.
 
 Output loudness is measured after running the gained PCM through the same lookahead limiter used by the extension. Final gain agreement is not a pass criterion: a correct final coefficient can still follow an audibly wrong programme-level trajectory. Gain-rate limits, true-peak safety, and page visibility behavior are covered by their focused unit and integration tests instead of being duplicated here.

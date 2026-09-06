@@ -356,8 +356,84 @@ test('startup predictor attenuates sudden loud content', () => {
   assert.ok(attenuated.nextGain < initial.nextGain);
 });
 
+test('loud windows leave programme stability intact while final DSP owns safety', () => {
+  const agc = new RealtimeAgc();
+  let gain = 1;
+  for (let time = 1; time <= 10; time += 1) {
+    gain = agc.update(agcInput({
+      currentGain: gain,
+      desiredGain: 1.4,
+      controlLufs: -30,
+      momentaryLufs: -30,
+      shortTermLufs: -30,
+      integrationTime: time,
+      coldStartSeconds: 10,
+      calibrationBoostStartSeconds: 6,
+      programTimeSeconds: time,
+      sourcePeak: 0.1
+    })).nextGain;
+  }
+  assert.ok(Math.abs(gain - 1.4) < 1e-12);
+
+  const targetLufs = -19;
+  const programmeLufs = -12;
+  const result = agc.update(agcInput({
+    currentGain: gain,
+    desiredGain: 1.4,
+    controlLufs: -30,
+    momentaryLufs: -14,
+    shortTermLufs: programmeLufs,
+    targetLufs,
+    integrationTime: 10.1,
+    coldStartSeconds: 10,
+    programTimeSeconds: 10.1,
+    sourcePeak: 0.1
+  }));
+
+  assert.ok(Math.abs(result.nextGain - gain) <= 0.1 / 60 + 1e-12);
+});
+
+test('silent current audio never opens the gate using retained programme history', () => {
+  const agc = new RealtimeAgc();
+  let gain = 1;
+  for (let tick = 0; tick < 150; tick++) {
+    gain = agc.update(agcInput({
+      currentGain: gain, desiredGain: 2, controlLufs: -29,
+      momentaryLufs: -Infinity, shortTermLufs: -Infinity, sourcePeak: 0,
+      deltaSec: 0.1, coldStartSeconds: 10, calibrationBoostStartSeconds: 6,
+      integrationTime: 1 + tick / 10, programTimeSeconds: 1 + tick / 10
+    })).nextGain;
+  }
+  assert.equal(gain, 1);
+});
+
+test('programme bounds remain independent of final output safety attenuation', () => {
+  const agc = new RealtimeAgc();
+  const targetLufs = -19;
+  const programmeLufs = -3;
+  const safeGain = Math.pow(10, (targetLufs + 2 - programmeLufs) / 20);
+  const result = agc.update(agcInput({
+    currentGain: 1,
+    desiredGain: 1,
+    minGain: 0.5,
+    maxGain: 2,
+    controlLufs: programmeLufs,
+    momentaryLufs: programmeLufs,
+    shortTermLufs: programmeLufs,
+    targetLufs,
+    integrationTime: 10,
+    coldStartSeconds: 10,
+    programTimeSeconds: 10
+  }));
+
+  assert.ok(safeGain < 0.5);
+  assert.equal(result.allowBelowMin, false);
+  assert.ok(result.nextGain >= 0.5);
+});
+
 test('gain stays within the calibration anchor plus or minus 0.2x', () => {
   const agc = new RealtimeAgc();
+  const steadyProgrammeLufs = -24;
   let gain = 1;
   let result;
 
@@ -369,6 +445,8 @@ test('gain stays within the calibration anchor plus or minus 0.2x', () => {
       integrationTime: time,
       coldStartSeconds: 10,
       programTimeSeconds: time,
+      momentaryLufs: steadyProgrammeLufs,
+      shortTermLufs: steadyProgrammeLufs,
       sourcePeak: 0.1
     }));
     gain = result.nextGain;
@@ -381,6 +459,8 @@ test('gain stays within the calibration anchor plus or minus 0.2x', () => {
     desiredGain: 0.8,
     deltaSec: 0.1,
     integrationTime: 15,
+    momentaryLufs: steadyProgrammeLufs,
+    shortTermLufs: steadyProgrammeLufs,
     sourcePeak: 0.1
   }));
   let lowerGain = anchored.nextGain;
@@ -390,6 +470,8 @@ test('gain stays within the calibration anchor plus or minus 0.2x', () => {
       desiredGain: 0.2,
       deltaSec: 1,
       integrationTime: 16 + index,
+      momentaryLufs: steadyProgrammeLufs,
+      shortTermLufs: steadyProgrammeLufs,
       sourcePeak: 0.1
     })).nextGain;
   }
@@ -400,6 +482,8 @@ test('gain stays within the calibration anchor plus or minus 0.2x', () => {
       desiredGain: 3,
       deltaSec: 1,
       integrationTime: 40 + index,
+      momentaryLufs: steadyProgrammeLufs,
+      shortTermLufs: steadyProgrammeLufs,
       sourcePeak: 0.1
     })).nextGain;
   }

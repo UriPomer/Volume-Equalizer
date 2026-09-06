@@ -1,6 +1,4 @@
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
@@ -18,7 +16,7 @@ function loadProcessor() {
   };
   vm.createContext(context);
   vm.runInContext(
-    fs.readFileSync(path.join(__dirname, '..', 'public', 'limiter-worklet.js'), 'utf8'),
+    require('./worklet-source.cjs')(),
     context
   );
   return Processor;
@@ -52,6 +50,7 @@ class FakeContext {
     this.currentTime = 0;
     this.state = 'running';
     this.destination = new FakeNode();
+    this.destination.channelCount = 2;
     this.source = new FakeNode();
     this.audioWorklet = { addModule: async () => {} };
   }
@@ -144,7 +143,8 @@ test('controller connects continuous stereo meter and drives gain state', async 
 
   const worklet = global.lastWorklet;
   assert.equal(worklet.options.numberOfInputs, 2);
-  assert.equal(worklet.channelCountMode, 'max');
+  assert.equal(worklet.options.channelCountMode, 'explicit');
+  assert.deepEqual(worklet.options.outputChannelCount, [2]);
   assert.ok(worklet.context.source.connections.some((item) => item.destination === worklet && item.input === 1));
 
   for (let index = 0; index < 200; index++) {
@@ -194,6 +194,58 @@ test('background automatic resets cannot raise the frozen gain', async (t) => {
   media.dispatchEvent(new Event('emptied'));
 
   assert.equal(controller.gain.gain.value, 0.6);
+});
+
+test('background freeze preserves the final DSP safety budget and attenuation', async (t) => {
+  const media = new FakeMedia();
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  t.after(() => {
+    setVisibility('visible');
+    controller.destroy();
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const processor = global.lastWorklet.processor;
+  for (let start = 0; start < 48000; start += 128) {
+    const tone = Float32Array.from({ length: 128 }, (_, i) =>
+      .8 * Math.sin(2 * Math.PI * 1000 * (start + i) / 48000));
+    processor.process([[tone, tone]], [[new Float32Array(128), new Float32Array(128)]]);
+  }
+  const safety = processor.safety;
+  const gain = safety.gain;
+  assert.ok(gain < settings.minGain);
+  setVisibility('hidden');
+  assert.equal(processor.safety, safety);
+  assert.equal(processor.safety.gain, gain);
+});
+
+test('reducing the configured maximum cannot raise a safety-attenuated gain', async () => {
+  const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.gain.gain.value = 0.158;
+  controller.allowBelowMinGain = true;
+  controller.updateSettings({ ...settings, maxGain: 1 });
+  assert.equal(controller.gain.gain.value, 0.158);
+  controller.destroy();
+});
+
+test('processor failure mutes protected output rather than retaining a boost', async () => {
+  const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.gain.gain.value = 1.8;
+  global.lastWorklet.onprocessorerror({ message: 'test failure' });
+  assert.equal(controller.gain.gain.value, 0);
+  controller.updateSettings({ ...settings, maxGain: 3 });
+  assert.equal(controller.gain.gain.value, 0);
+  controller.destroy();
+});
+
+test('worklet receives target changes independently of animation frames', async () => {
+  const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.updateSettings({ ...settings, targetRms: Math.pow(10, (-23 + 0.691) / 20) });
+  assert.ok(Math.abs(global.lastWorklet.processor.targetLufs + 23) < 1e-8);
+  controller.destroy();
 });
 
 test('reenabling starts from unity with empty realtime measurements', async () => {

@@ -2,46 +2,32 @@
 
 权威行为定义见 [PRODUCT_BEHAVIOR.md](PRODUCT_BEHAVIOR.md)。
 
-## 系统流程
+## 音频与控制链
 
-```mermaid
-flowchart LR
-    DOM[DOM 与媒体事件] --> Scan[Media Scanner]
-    Scan --> Controller[MediaVolumeController]
-    Storage[chrome.storage] --> Normalize[normalizeSettings]
-    Normalize --> Controller
+媒体源经节目 GainNode、低频 BiquadFilter 后进入 AudioWorklet。
+Worklet 的输入/输出显式匹配 destination 声道数，浏览器先按 speakers 布局混音再保护，
+防止保护之后的单声道复制增加响度。
+Worklet 先执行关联峰值限幅，再执行 LoudnessSafety，最后把实际输出送到 destination。
+原始信号通过 Worklet 的第二输入独立采集，用于节目响度测量。
+原始及实际输出 PCM 每 100 ms 以带 epoch 的消息送回控制器。
 
-    Media[HTMLMediaElement] --> Source[MediaElementAudioSourceNode]
-    Source --> Gain[唯一 gain 写入边界]
-    Gain --> Bass[Low-shelf]
-    Bass --> Worklet[Lookahead limiter Worklet]
-    Worklet --> Output[AudioContext destination]
+节目 AGC 在新的音频消息到达时更新；requestAnimationFrame 只负责面板刷新。
+页面隐藏时冻结节目增益，但 Worklet 的输出安全保护持续执行。
+处理器不可用时控制器静音受控音频，用户主动关闭扩展才旁路到原始信号。
 
-    Source -->|原始信号| Worklet
-    Worklet -->|带 epoch 的 100 ms 测量| Epoch{代际/可见性校验}
-    Epoch --> Meter[LoudnessMeter]
-    Meter --> AGC[RealtimeAgc]
-    AGC -->|受速率、峰值、噪声门、±0.2x/±0.75 dB 走廊约束| Gain
+## 职责与状态所有权
 
-    Controller -->|可选| Fetch[完整音轨拉取]
-    Fetch --> Decode[decodeAudioData]
-    Decode --> FullMeter[完整响度与 true peak]
-    FullMeter --> AGC
+- main.ts：扫描和控制器集合、当前媒体、全局设置。
+- controller.ts：生命周期、消息 epoch、音轨分析协调、节目 gain 唯一写入边界。
+- gain-control.ts：纯节目增益状态机；噪声门只使用当前音频证据。
+- k-weighting.ts：共享滤波系数、可复制的滤波状态和声道布局权重。
+- loudness-meter.ts：400 ms 瞬时、精确 3 秒短时与门限积分测量。
+- loudness-safety.ts：音频线程中的预读、最终输出滑动窗口预算和安全倍率。
+- public/limiter-worklet.js：处理量子块、关联限峰、调用输出保护并发送实际 PCM。
+- settings.ts/ui-panel.ts：设置规范化及单向呈现，UI 不实现响度规则。
 
-    Visibility[页面可见性] --> Controller
-    Lifecycle[play / emptied / metadata / seeked] --> Controller
-```
+## 构建与验证
 
-## 状态修改边界
-
-- `main.ts`：控制器集合、当前 UI 媒体、规范化后的全局设置、绑定失败重试与面板提示。
-- `controller.ts`：媒体生命周期、测量 epoch、分析尝试代际和唯一 gain 写入。
-- `gain-control.ts`：纯增益决策状态，不直接访问 DOM 或 Web Audio 节点。
-- `limiter-worklet.js`：按输入声道数逐声道实时限峰和带 epoch 的连续测量，不决定节目 gain，不做立体声降混。
-- `settings.ts`：所有持久化设置的运行时校验与跨标签同步。
-
-## 安全降级
-
-Worklet 未就绪或失败时，信号仍经过当前安全 gain、bass 和
-`DynamicsCompressorNode` limiter，但实时 AGC 暂停。系统不使用 rAF 读取的重叠
-Analyser 快照更新 gain，因为其时间轴不是连续 PCM。
+Vite 构建内容脚本，并用 esbuild 把 Worklet 与共享 TypeScript DSP 打包为独立 IIFE。
+dist 是唯一运行产物。测试和音频基准使用相同的 Worklet 源码打包方式，
+按先播放当前块、再以该块测量改变未来 gain 的顺序验证输出。

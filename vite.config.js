@@ -1,6 +1,25 @@
 import { defineConfig } from 'vite';
+import { build } from 'esbuild';
+import { resolve } from 'node:path';
+
+let outputDirectory = 'dist';
 
 export default defineConfig({
+  plugins: [{
+    name: 'bundle-audio-worklet',
+    configResolved(config) { outputDirectory = config.build.outDir; },
+    buildStart() {
+      this.addWatchFile(resolve('public/limiter-worklet.js'));
+      this.addWatchFile(resolve('src/loudness-safety.ts'));
+    },
+    async writeBundle() {
+      await build({
+        entryPoints: ['public/limiter-worklet.js'],
+        outfile: resolve(outputDirectory, 'limiter-worklet.js'),
+        bundle: true, format: 'iife', target: 'es2020', minify: true
+      });
+    }
+  }],
   build: {
     lib: {
       entry: 'src/main.ts',

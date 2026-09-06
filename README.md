@@ -4,12 +4,13 @@ Chrome 音量均衡扩展，目标响度默认 `-21 LUFS`。
 
 ## 工作模式
 
-- 实时：前 10 秒校准，之后限制在校准 gain 的 `±0.2x` 与 `±0.75 dB` 交集内，且任意方向变化不超过 `0.1x/分钟`；seek 与切换标签页不会触发重新校准，播放中 gain 几乎恒定。
-- 完整音轨：可选拉取并分析整段音轨（仅在媒体开始播放后拉取），成功后全程使用一个固定 gain。
-- 峰值保护：末端 true-peak lookahead limiter；不会在 gain 前压缩节目动态。5.1/7.1 多声道按原声道数独立限峰，不降混为立体声。
+- 实时：前 10 秒校准节目增益，随后缓慢调节；静音不升压，seek 和切换标签不会重新快速校准。
+- 完整音轨：播放后拉取完整音轨，分析成功后以固定节目增益为目标。
+- 输出保护：两种模式均在低频增强和峰值限幅后执行响度保护，前台与后台持续生效。缓冲 100 ms 音频并用后续 100 ms 分摊计算，限制最终输出的 400 ms 瞬时响度不超过目标 `+2 LU`；另有约 15 ms 峰值预读，总音频延迟约 215 ms。
+- 多声道：保护前按浏览器输出布局混音（默认立体声），保留左右差异；避免保护后声道复制再次增加响度。
 
 完整音轨分析失败或长度不完整时，面板会明确显示状态并继续实时算法。页面 Console 可用 `[Universal Volume EQ]` 过滤诊断信息。
-Worklet 尚未就绪或运行失败时，扩展会保持安全 gain，不使用不连续快照继续抬升音量。
+扩展开启但 Worklet 尚未就绪或运行失败时，受控媒体静音，面板显示保护不可用；关闭扩展可恢复原始音频。修改目标时会重新缓冲，已经播放的旧窗口不能追溯改变，新目标在旧的 400 ms 输出窗口退出后验收。
 媒体元素已被站点自身 Web Audio 占用时（如 YouTube），面板会显示“媒体被页面占用”，并在该元素播放时自动重试绑定。
 
 行为契约见 [`PRODUCT_BEHAVIOR.md`](PRODUCT_BEHAVIOR.md)，系统流程见
@@ -33,23 +34,24 @@ npm run test:unit
 npm run test:audio:download
 npm run test:audio:benchmark
 npm run test:audio:enforce
-npm run build
+npm run test:browser
 ```
 
-音频基准以 FFmpeg whole-program `loudnorm` 测量为离线参考，目标为 `-21 LUFS`。正式素材必须满足：实际输出在目标 `±1.5 LU` 内（稳定优先：稳态 gain 变化 ≤ 0.1x/分钟），且第 10 秒后 gain 的 `P95–P5 ≤ 1.5 dB`、最大跨度 `≤ 3 dB`。
+音频基准使用 FFmpeg 离线参考，按真实“先输出、后测量”顺序执行。验收包含实际输出最大瞬时响度、节目响度与增益稳定性，以及完整音轨测量误差。安全衰减不受普通增益下限和稳定走廊限制。
+
+硬响度上限优先，节目平均响度可能低于目标。基准保留原目标偏差，节目校准精度与经过相同保护的固定增益参考比较。浏览器测试使用独立临时配置运行 Chrome，覆盖单声道、立体声及 5.1 到播放布局的混音；找不到 Chrome 时可设置 `CHROME_PATH`。
 
 详细说明见 [`tests/AUDIO_BENCHMARK.md`](tests/AUDIO_BENCHMARK.md)。
 
 ## 发布
 
-更新 `public/manifest.json` 与 `package.json` 版本，完成全部验证后推送同名 tag：
+保持 `public/manifest.json`、`package.json` 与锁文件版本一致，完成验证后生成本地 ZIP：
 
 ```powershell
-git tag v0.6.0
-git push origin main v0.6.0
+npm run pack
 ```
 
-GitHub Actions 会构建 ZIP 并创建 Release。
+安装时解压 ZIP，在扩展管理页加载该目录。已有安装需要重新加载扩展并刷新媒体页面。发布到 GitHub 时使用与版本一致的 tag，Actions 构建 ZIP 并创建 Release。
 
 ## License
 
