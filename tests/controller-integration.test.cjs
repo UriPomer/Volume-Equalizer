@@ -145,7 +145,7 @@ test('controller connects continuous stereo meter and drives gain state', async 
   assert.equal(worklet.options.numberOfInputs, 2);
   assert.equal(worklet.options.channelCountMode, 'explicit');
   assert.deepEqual(worklet.options.outputChannelCount, [2]);
-  assert.ok(worklet.context.source.connections.some((item) => item.destination === worklet && item.input === 1));
+  assert.ok(controller.bass.connections.some((item) => item.destination === worklet && item.input === 1));
 
   for (let index = 0; index < 200; index++) {
     const original = new Float32Array(128).fill(0.1);
@@ -180,7 +180,92 @@ test('background ticks do not run realtime gain control', async (t) => {
   assert.equal(controller.gain.gain.value, 0.6);
 });
 
-test('background automatic resets cannot raise the frozen gain', async (t) => {
+test('source changes without emptied reset gain and histories on play or meter', async () => {
+  const media = new FakeMedia();
+  media.currentSrc = 'blob:original';
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.gain.gain.value = 0.8;
+  controller.originalMeter.processBlock(new Float32Array(48000).fill(0.1));
+  controller.agc.lockGain(1.3);
+  media.currentSrc = 'blob:replacement';
+  media.dispatchEvent(new Event('play'));
+
+  assert.equal(controller.gain.gain.value, .5);
+  assert.equal(controller.originalMeter.getIntegrationTime(), 0);
+  assert.equal(controller.agc.isLocked(), false);
+
+  controller.gain.gain.value = 0.8;
+  controller.originalMeter.processBlock(new Float32Array(48000).fill(0.1));
+  controller.agc.lockGain(1.3);
+  media.currentSrc = 'blob:replacement-again';
+  controller.consumeAudio({
+    type: 'meter',
+    epoch: controller.meterEpoch,
+    original: [new Float32Array(4800).fill(0.2)],
+    output: [new Float32Array(4800).fill(0.2)]
+  });
+
+  assert.equal(controller.gain.gain.value, .5);
+  assert.equal(controller.originalMeter.getIntegrationTime(), 0);
+  assert.equal(controller.agc.isLocked(), false);
+  controller.destroy();
+});
+
+test('Bilibili SPA route changes reset same-blob media identity', async (t) => {
+  const previousLocation = global.location;
+  global.location = { hostname: 'www.bilibili.com', pathname: '/video/BV1', search: '?p=1' };
+  const media = new FakeMedia();
+  media.currentSrc = 'blob:shared';
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  t.after(() => {
+    if (previousLocation === undefined) delete global.location;
+    else global.location = previousLocation;
+    controller.destroy();
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.gain.gain.value = 0.8;
+  global.location.search = '?p=2';
+  media.dispatchEvent(new Event('play'));
+  assert.equal(controller.gain.gain.value, .5);
+
+  controller.gain.gain.value = 0.8;
+  global.location.pathname = '/video/BV2';
+  controller.consumeAudio({
+    type: 'meter',
+    epoch: controller.meterEpoch,
+    original: [new Float32Array(4800).fill(0.2)],
+    output: [new Float32Array(4800).fill(0.2)]
+  });
+  assert.equal(controller.gain.gain.value, .5);
+});
+
+test('background real meter messages advance AGC while animation frames do not', async (t) => {
+  const media = new FakeMedia();
+  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
+  t.after(() => {
+    setVisibility('visible');
+    controller.destroy();
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const updates = [];
+  controller.updateGain = (duration) => updates.push(duration);
+  setVisibility('hidden');
+  controller.tick();
+  controller.consumeAudio({
+    type: 'meter',
+    epoch: controller.meterEpoch,
+    original: [new Float32Array(19200).fill(0.2)],
+    output: [new Float32Array(19200).fill(0.2)]
+  });
+
+  assert.deepEqual(updates, [0.4]);
+});
+
+test('a new video resets programme gain even when the page is hidden', async (t) => {
   const media = new FakeMedia();
   const controller = new MediaVolumeController(media, settings, () => {}, () => {});
   t.after(() => {
@@ -193,10 +278,10 @@ test('background automatic resets cannot raise the frozen gain', async (t) => {
   setVisibility('hidden');
   media.dispatchEvent(new Event('emptied'));
 
-  assert.equal(controller.gain.gain.value, 0.6);
+  assert.equal(controller.gain.gain.value, .5);
 });
 
-test('background freeze preserves the final DSP safety budget and attenuation', async (t) => {
+test('visibility changes preserve measurements, epoch and programme gain', async (t) => {
   const media = new FakeMedia();
   const controller = new MediaVolumeController(media, settings, () => {}, () => {});
   t.after(() => {
@@ -211,12 +296,14 @@ test('background freeze preserves the final DSP safety budget and attenuation', 
       .8 * Math.sin(2 * Math.PI * 1000 * (start + i) / 48000));
     processor.process([[tone, tone]], [[new Float32Array(128), new Float32Array(128)]]);
   }
-  const safety = processor.safety;
-  const gain = safety.gain;
-  assert.ok(gain < settings.minGain);
+  const epoch = controller.meterEpoch;
+  const measuredSeconds = controller.originalMeter.getIntegrationTime();
+  const gain = controller.gain.gain.value;
   setVisibility('hidden');
-  assert.equal(processor.safety, safety);
-  assert.equal(processor.safety.gain, gain);
+  setVisibility('visible');
+  assert.equal(controller.meterEpoch, epoch);
+  assert.equal(controller.originalMeter.getIntegrationTime(), measuredSeconds);
+  assert.equal(controller.gain.gain.value, gain);
 });
 
 test('reducing the configured maximum cannot raise a safety-attenuated gain', async () => {
@@ -240,15 +327,44 @@ test('processor failure mutes protected output rather than retaining a boost', a
   controller.destroy();
 });
 
-test('worklet receives target changes independently of animation frames', async () => {
+test('target changes reopen programme calibration without replacing the processor', async () => {
   const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
   await new Promise((resolve) => setImmediate(resolve));
+  const processor = global.lastWorklet.processor;
+  controller.agc.lockGain(.8);
   controller.updateSettings({ ...settings, targetRms: Math.pow(10, (-23 + 0.691) / 20) });
-  assert.ok(Math.abs(global.lastWorklet.processor.targetLufs + 23) < 1e-8);
+  assert.equal(global.lastWorklet.processor, processor);
+  assert.equal(controller.agc.isLocked(), false);
   controller.destroy();
 });
 
-test('reenabling starts from unity with empty realtime measurements', async () => {
+test('target changes clear output programme history but preserve input AGC history', async () => {
+  const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.consumeAudio({
+    type: 'meter',
+    epoch: controller.meterEpoch,
+    original: [new Float32Array(19200).fill(0.2)],
+    output: [new Float32Array(19200).fill(0.2)]
+  });
+  const inputSeconds = controller.originalMeter.getIntegrationTime();
+  const inputReference = controller.gainState.referenceLufs;
+  const activeSeconds = controller.agc.history.getActiveSeconds();
+  assert.ok(Number.isFinite(controller.outputProgramme.getLoudness()));
+  assert.ok(Number.isFinite(inputReference));
+
+  controller.updateSettings({ ...settings, targetRms: Math.pow(10, (-23 + 0.691) / 20) });
+
+  assert.equal(controller.outputProgramme.getLoudness(), Number.NaN);
+  assert.equal(controller.originalMeter.getIntegrationTime(), inputSeconds);
+  assert.equal(controller.gainState.referenceLufs, inputReference);
+  assert.equal(controller.agc.history.getActiveSeconds(), activeSeconds);
+  assert.equal(controller.agc.history.getLoudness(), inputReference);
+  controller.destroy();
+});
+
+test('reenabling starts conservatively with empty realtime measurements', async () => {
   const media = new FakeMedia();
   const controller = new MediaVolumeController(media, settings, () => {}, () => {});
   await new Promise((resolve) => setImmediate(resolve));
@@ -258,7 +374,7 @@ test('reenabling starts from unity with empty realtime measurements', async () =
   controller.updateSettings({ ...settings, enabled: false });
   controller.updateSettings({ ...settings, enabled: true });
 
-  assert.equal(controller.gain.gain.value, 1);
+  assert.equal(controller.gain.gain.value, .5);
   assert.equal(controller.originalMeter.getIntegrationTime(), 0);
   controller.destroy();
 });

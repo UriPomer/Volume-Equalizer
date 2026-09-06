@@ -10,17 +10,24 @@ export class LoudnessMeter {
   private readonly stepSamples: number;
   private readonly shortTermSamples: number;
   private readonly maxBlocks: number;
+  private readonly momentaryFrameEnergies: Float64Array;
+  private readonly momentaryInvalidFrames: Uint8Array;
   private filters: KWeighting[] = [];
   private buffers: Float64Array[] = [];
   private shortTermBuffers: Float64Array[] = [];
+  private shortTermInvalidFrames: Uint8Array;
   private blocks: number[] = [];
   private bufferIndex = 0;
   private processedFrames = 0;
-  private momentaryEnergy = NaN;
   private channelCount = 0;
+  private momentaryIndex = 0;
+  private momentaryFrameCount = 0;
+  private momentaryEnergySum = 0;
+  private momentaryInvalidFrameCount = 0;
   private shortTermIndex = 0;
   private shortTermFrameCount = 0;
   private shortTermEnergy = 0;
+  private shortTermInvalidFrameCount = 0;
 
   constructor(
     private readonly sampleRate = 48000,
@@ -29,6 +36,9 @@ export class LoudnessMeter {
     this.samplesPerBlock = Math.ceil(BLOCK_SECONDS * sampleRate);
     this.stepSamples = Math.ceil(STEP_SECONDS * sampleRate);
     this.shortTermSamples = Math.ceil(3 * sampleRate);
+    this.momentaryFrameEnergies = new Float64Array(this.samplesPerBlock);
+    this.momentaryInvalidFrames = new Uint8Array(this.samplesPerBlock);
+    this.shortTermInvalidFrames = new Uint8Array(this.shortTermSamples);
     this.maxBlocks = Number.isFinite(maxIntegrationSeconds)
       ? Math.ceil(maxIntegrationSeconds / STEP_SECONDS)
       : Number.POSITIVE_INFINITY;
@@ -46,11 +56,21 @@ export class LoudnessMeter {
     this.processedFrames += frames;
 
     for (let frame = 0; frame < frames; frame++) {
+      let frameInvalid = false;
+      let frameEnergy = 0;
       for (let channel = 0; channel < channels.length; channel++) {
-        const sample = this.filters[channel].process(channels[channel][frame] ?? 0);
+        // A non-finite sample would poison the recursive IIR state forever.
+        // Treat it as a missing/silent sample at the measurement boundary.
+        const input = channels[channel][frame] ?? 0;
+        const valid = Number.isFinite(input);
+        frameInvalid ||= !valid;
+        const sample = this.filters[channel].process(valid ? input : 0);
         this.buffers[channel][this.bufferIndex] = sample;
+        frameEnergy += channelWeight(channel, channels.length) * sample ** 2;
         this.addShortTermSample(channel, sample, channels.length);
       }
+      this.addMomentarySample(frameEnergy, frameInvalid);
+      this.addShortTermValidity(frameInvalid);
       this.bufferIndex++;
       this.advanceShortTermWindow();
       if (this.bufferIndex === this.samplesPerBlock) this.commitBlock(channels.length);
@@ -66,12 +86,13 @@ export class LoudnessMeter {
   }
 
   getMomentaryLoudness(): number {
-    return Number.isFinite(this.momentaryEnergy) ? toLufs(this.momentaryEnergy) : NaN;
+    return this.momentaryFrameCount === this.samplesPerBlock && this.momentaryInvalidFrameCount === 0
+      ? toLufs(this.momentaryEnergySum / this.samplesPerBlock) : NaN;
   }
 
   getShortTermLoudness(): number {
-    return this.shortTermFrameCount === this.shortTermSamples
-      ? toLufs(this.shortTermEnergy / this.shortTermSamples)
+    return this.shortTermFrameCount === this.shortTermSamples && this.shortTermInvalidFrameCount === 0
+      ? toLufs(this.shortTermEnergy > 0 ? this.shortTermEnergy / this.shortTermSamples : 0)
       : NaN;
   }
 
@@ -83,19 +104,24 @@ export class LoudnessMeter {
     this.blocks = [];
     this.bufferIndex = 0;
     this.processedFrames = 0;
-    this.momentaryEnergy = NaN;
+    this.momentaryIndex = this.momentaryFrameCount = this.momentaryInvalidFrameCount = 0;
+    this.momentaryEnergySum = 0;
     this.shortTermIndex = 0;
     this.shortTermFrameCount = 0;
     this.shortTermEnergy = 0;
+    this.shortTermInvalidFrameCount = 0;
     this.buffers.forEach((buffer) => buffer.fill(0));
+    this.momentaryFrameEnergies.fill(0);
+    this.momentaryInvalidFrames.fill(0);
     this.shortTermBuffers.forEach((buffer) => buffer.fill(0));
+    this.shortTermInvalidFrames.fill(0);
     this.filters.forEach((filter) => filter.reset());
   }
 
   private commitBlock(channelCount: number): void {
-    const energy = this.weightedEnergy(channelCount, this.samplesPerBlock);
-    this.momentaryEnergy = energy;
-    if (toLufs(energy) >= ABSOLUTE_GATE_LUFS) {
+    const energy = this.momentaryEnergySum / this.samplesPerBlock;
+    const valid = this.momentaryInvalidFrameCount === 0;
+    if (valid && toLufs(energy) >= ABSOLUTE_GATE_LUFS) {
       this.blocks.push(energy);
       if (this.blocks.length > this.maxBlocks) this.blocks.shift();
     }
@@ -105,23 +131,31 @@ export class LoudnessMeter {
     this.bufferIndex = this.samplesPerBlock - this.stepSamples;
   }
 
-  private weightedEnergy(channelCount: number, length: number): number {
-    let energy = 0;
-    for (let channel = 0; channel < channelCount; channel++) {
-      let sum = 0;
-      const buffer = this.buffers[channel];
-      for (let frame = 0; frame < length; frame++) sum += buffer[frame] ** 2;
-      energy += channelWeight(channel, channelCount) * sum / length;
-    }
-    return energy;
-  }
-
   private addShortTermSample(channel: number, sample: number, channelCount: number): void {
     const buffer = this.shortTermBuffers[channel];
     const oldEnergy = buffer[this.shortTermIndex];
     const newEnergy = sample * sample;
     buffer[this.shortTermIndex] = newEnergy;
     this.shortTermEnergy += channelWeight(channel, channelCount) * (newEnergy - oldEnergy);
+  }
+
+  private addShortTermValidity(invalid: boolean): void {
+    const oldInvalid = this.shortTermInvalidFrames[this.shortTermIndex];
+    const nextInvalid = invalid ? 1 : 0;
+    this.shortTermInvalidFrames[this.shortTermIndex] = nextInvalid;
+    this.shortTermInvalidFrameCount += nextInvalid - oldInvalid;
+  }
+
+  private addMomentarySample(energy: number, invalid: boolean): void {
+    const oldEnergy = this.momentaryFrameEnergies[this.momentaryIndex];
+    const oldInvalid = this.momentaryInvalidFrames[this.momentaryIndex];
+    const nextInvalid = invalid ? 1 : 0;
+    this.momentaryFrameEnergies[this.momentaryIndex] = energy;
+    this.momentaryInvalidFrames[this.momentaryIndex] = nextInvalid;
+    this.momentaryEnergySum += energy - oldEnergy;
+    this.momentaryInvalidFrameCount += nextInvalid - oldInvalid;
+    if (this.momentaryFrameCount < this.samplesPerBlock) this.momentaryFrameCount++;
+    this.momentaryIndex = (this.momentaryIndex + 1) % this.samplesPerBlock;
   }
 
   private advanceShortTermWindow(): void {
@@ -137,10 +171,15 @@ export class LoudnessMeter {
     this.blocks = [];
     this.bufferIndex = 0;
     this.processedFrames = 0;
-    this.momentaryEnergy = NaN;
+    this.momentaryIndex = this.momentaryFrameCount = this.momentaryInvalidFrameCount = 0;
+    this.momentaryEnergySum = 0;
+    this.momentaryFrameEnergies.fill(0);
+    this.momentaryInvalidFrames.fill(0);
     this.shortTermIndex = 0;
     this.shortTermFrameCount = 0;
     this.shortTermEnergy = 0;
+    this.shortTermInvalidFrameCount = 0;
+    this.shortTermInvalidFrames.fill(0);
   }
 }
 

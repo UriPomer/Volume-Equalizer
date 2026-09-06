@@ -59,6 +59,34 @@ test('short-term loudness requires an exact three-second continuous sample windo
   assert.ok(Number.isFinite(meter.getShortTermLoudness()));
 });
 
+test('non-finite frames invalidate affected windows without poisoning IIR state', () => {
+  const sampleRate = 48000;
+  const meter = new LoudnessMeter(sampleRate);
+  assert.ok(Number.isNaN(meter.getMomentaryLoudness()));
+
+  const tone = (frames) => Float32Array.from({ length: frames }, (_, i) => .1 * Math.sin(2 * Math.PI * 1000 * i / sampleRate));
+  meter.processBlock(tone(sampleRate * .4));
+  assert.ok(Number.isFinite(meter.getMomentaryLoudness()));
+  assert.ok(Number.isFinite(meter.getIntegratedLoudness()));
+
+  meter.processBlock(Float32Array.of(NaN));
+  assert.ok(Number.isNaN(meter.getMomentaryLoudness()));
+  assert.ok(Number.isNaN(meter.getShortTermLoudness()));
+  assert.ok(Number.isFinite(meter.getIntegratedLoudness()));
+
+  meter.processBlock(tone(sampleRate * .4));
+  assert.ok(Number.isFinite(meter.getMomentaryLoudness()));
+  assert.ok(Number.isFinite(meter.getIntegratedLoudness()));
+
+  meter.processBlock(tone(sampleRate * 3));
+  assert.ok(Number.isFinite(meter.getShortTermLoudness()));
+
+  const silent = new LoudnessMeter(sampleRate);
+  silent.processBlock(new Float32Array(sampleRate * 3));
+  assert.equal(silent.getMomentaryLoudness(), -Infinity);
+  assert.equal(silent.getShortTermLoudness(), -Infinity);
+});
+
 test('multichannel layouts use BS.1770 center, LFE, and surround weights', () => {
   const surround = Math.pow(10, 1.5 / 10);
   assert.equal(channelWeight(2, 6), 1);

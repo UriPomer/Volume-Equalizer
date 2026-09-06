@@ -11,6 +11,13 @@ export type AnalysisStatus =
   | 'failed';
 
 export interface MeterState {
+  programmeLufs: number;
+  outputProgrammeLufs: number;
+  originalIntegratedLufs: number;
+  outputIntegratedLufs: number;
+  phase: import('./gain-control').AgcPhase;
+  gainLimited: boolean;
+  recalibrations: number;
   originalMomentaryLufs: number;
   momentaryLufs: number;
   safetyGain: number;
@@ -24,6 +31,13 @@ export interface MeterState {
 }
 
 export const EMPTY_METER_STATE: MeterState = {
+  programmeLufs: NaN,
+  outputProgrammeLufs: NaN,
+  originalIntegratedLufs: NaN,
+  outputIntegratedLufs: NaN,
+  phase: 'collecting',
+  gainLimited: false,
+  recalibrations: 0,
   originalMomentaryLufs: NaN,
   momentaryLufs: NaN,
   safetyGain: 1,

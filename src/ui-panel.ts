@@ -70,12 +70,15 @@ function panelHtml(settings: Settings): string {
       ${slider('bassBoost', '低频增益', -6, 6, .5, settings.bassBoost)}
       <hr>
       <div class="meter">
-        <small>原始</small>
+        <small>增益前（含低频设置）</small>
         ${meterRow('积分', 'originalIntegrated', ' LUFS')} ${meterRow('瞬时', 'original', ' LUFS')}
         <small>输出</small>
         ${meterRow('积分', 'outputIntegrated', ' LUFS')} ${meterRow('瞬时', 'output', ' LUFS')}
         ${meterRow('增益', 'gain')} ${meterRow('算法', 'status')}
-        ${meterRow('安全衰减', 'safety')}
+        ${meterRow('响段均值 · 输入', 'programme')}
+        ${meterRow('响段均值 · 输出', 'outputProgramme')}
+        ${meterRow('调节状态', 'phase')}
+        ${meterRow('削波保护', 'safety')}
       </div>
     </section>
   </div>`;
@@ -95,7 +98,7 @@ function slider(
 }
 
 function meterRow(label: string, field: string, suffix = ''): string {
-  return `<div><span>${label}</span><b data-meter="${field}">-∞${suffix}</b></div>`;
+  return `<div><span>${label}</span><b data-meter="${field}">测量中</b></div>`;
 }
 
 function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings): void {
@@ -160,20 +163,20 @@ function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings
 }
 
 function updateMeter(shadow: ShadowRoot, getMeter: () => MeterState): void {
-  const showLufs = (rms: number) => {
-    const lufs = rmsToLufs(rms);
-    return `${lufs > -70 ? lufs.toFixed(1) : '-∞'} LUFS`;
-  };
-  const showMomentary = (lufs: number) => Number.isNaN(lufs)
+  const showMomentary = (lufs: number) => !Number.isFinite(lufs) && lufs !== -Infinity
     ? '测量中' : `${Number.isFinite(lufs) ? lufs.toFixed(1) : '-∞'} LUFS`;
   meterTimer = window.setInterval(() => {
     if (!host?.isConnected) return;
     const meter = getMeter();
     setText(shadow, '[data-meter="original"]', showMomentary(meter.originalMomentaryLufs));
-    setText(shadow, '[data-meter="originalIntegrated"]', `${showLufs(meter.originalIntegratedRms)} · ${meter.sampleCount}s`);
+    setText(shadow, '[data-meter="originalIntegrated"]', `${showMomentary(meter.originalIntegratedLufs)} · ${meter.sampleCount}s`);
     setText(shadow, '[data-meter="output"]', showMomentary(meter.momentaryLufs));
     setText(shadow, '[data-meter="safety"]', `${meter.safetyGain.toFixed(2)}x`);
-    setText(shadow, '[data-meter="outputIntegrated"]', showLufs(meter.integratedRms || meter.rms));
+    setText(shadow, '[data-meter="outputIntegrated"]', showMomentary(meter.outputIntegratedLufs));
+    setText(shadow, '[data-meter="programme"]', showMomentary(meter.programmeLufs));
+    setText(shadow, '[data-meter="outputProgramme"]', showMomentary(meter.outputProgrammeLufs));
+    const phases = { collecting: '收集有效声音', calibrating: '平滑校准', stable: '已稳定', recalibrating: '响段重校准', 'full-track': '完整音轨' };
+    setText(shadow, '[data-meter="phase"]', `${phases[meter.phase]}${meter.gainLimited ? ' · 达到倍率限制' : ''}${meter.recalibrations ? ' · 已重校准1次' : ''}`);
     setText(shadow, '[data-meter="gain"]', `${meter.gain.toFixed(2)}x`);
     setText(shadow, '[data-meter="status"]', STATUS_TEXT[meter.analysisStatus]);
   }, 100);

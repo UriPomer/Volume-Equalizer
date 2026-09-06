@@ -10,7 +10,6 @@ export default defineConfig({
     configResolved(config) { outputDirectory = config.build.outDir; },
     buildStart() {
       this.addWatchFile(resolve('public/limiter-worklet.js'));
-      this.addWatchFile(resolve('src/loudness-safety.ts'));
     },
     async writeBundle() {
       await build({

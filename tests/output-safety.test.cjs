@@ -1,92 +1,70 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const vm = require('node:vm');
-const { KWeighting, channelWeight } = require('../dist-test/k-weighting.js');
 const code = require('./worklet-source.cjs')();
 
-function renderScenario({ rate = 48000, channels = 2, seconds = 3, target = -21, sample, commands = () => {}, inspect = () => {} }) {
+function render({ channels = 2, seconds = 1, sample, options = {} }) {
   let Processor;
   vm.runInNewContext(code, {
-    sampleRate: rate,
+    sampleRate: 48000,
     AudioWorkletProcessor: class { constructor() { this.port = { postMessage() {} }; } },
-    registerProcessor(name, value) { Processor = value; }
+    registerProcessor(_, value) { Processor = value; }
   });
-  const processor = new Processor({ processorOptions: { targetLufs: target } });
-  const filters = Array.from({ length: channels }, () => new KWeighting(rate));
-  const window = new Float64Array(Math.round(rate * .4));
-  let sum = 0, index = 0, peakLufs = -Infinity, nonzero = 0;
-  for (let start = 0; start < (seconds + .6) * rate; start += 128) {
-    commands(processor, start / rate);
-    const input = Array.from({ length: channels }, (_,channel) =>
-      Float32Array.from({ length: 128 }, (_,i) => start + i < seconds * rate
-        ? sample((start + i) / rate, channel) : 0));
+  const processor = new Processor({ processorOptions: { lookaheadMs: 15, ...options } });
+  const rendered = Array.from({ length: channels }, () => []);
+  for (let start = 0; start < (seconds + .1) * 48000; start += 128) {
+    const input = Array.from({ length: channels }, (_, channel) => Float32Array.from({ length: 128 }, (_, frame) =>
+      start + frame < seconds * 48000 ? sample((start + frame) / 48000, channel) : 0));
     const output = Array.from({ length: channels }, () => new Float32Array(128));
-    // No main-thread meter callbacks or requestAnimationFrame: protection must
-    // remain effective when a hidden page freezes its programme gain.
     processor.process([input], [output]);
-    inspect(processor, start / rate);
-    for (let frame = 0; frame < 128; frame++) {
-      let energy = 0;
-      for (let channel = 0; channel < channels; channel++) {
-        const x = output[channel][frame];
-        assert.ok(Number.isFinite(x));
-        if (x !== 0) nonzero++;
-        const k = filters[channel].process(x);
-        energy += channelWeight(channel, channels) * k * k;
-      }
-      sum += energy - window[index];
-      window[index] = energy;
-      index = (index + 1) % window.length;
-      if (sum > 0) peakLufs = Math.max(peakLufs, -0.691 + 10 * Math.log10(sum / window.length));
-    }
+    output.forEach((channel, index) => rendered[index].push(...channel));
   }
-  assert.ok(nonzero > 0, 'guard must actually play the buffered audio');
-  assert.ok(peakLufs <= target + 2 + 0.001, `output ${peakLufs.toFixed(4)} LUFS > ${target + 2}`);
-  return peakLufs;
+  return rendered;
 }
 
-test('actual output stays below target +2 after a silent intro and 200ms loud burst', () => {
-  const maximum = renderScenario({ seconds: 12, sample: (t) => {
-    const amplitude = t < 1 ? .05 : (t >= 10 && t < 10.2 ? .3 * 1.8 : 0);
-    return amplitude * Math.sin(2 * Math.PI * 1000 * t);
-  }});
-  console.log(`silent-intro burst: maximum output ${maximum.toFixed(3)} LUFS`);
-});
+function peak(channels) {
+  return channels.reduce((maximum, channel) => channel.reduce(
+    (channelMaximum, sample) => Math.max(channelMaximum, Math.abs(sample)), maximum
+  ), 0);
+}
 
-test('post-EQ bass, loud transients and background playback share the same final ceiling', () => {
-  renderScenario({ sample: (t) => .35 * Math.pow(10, 6 / 20) * Math.sin(2 * Math.PI * 80 * t) });
-  renderScenario({ channels: 1, sample: (t) => t % .21 < .001 ? .85 : 0 });
-});
+function rms(samples) {
+  return Math.sqrt(samples.reduce((sum, sample) => sum + sample * sample, 0) / samples.length);
+}
 
-test('sliding windows remain protected at chunk boundaries and different sample rates', () => {
-  for (const rate of [44100, 48000, 96000]) {
-    renderScenario({ rate, channels: 2, target: -23, sample: (t,c) => {
-      const amplitude = t % .2 > .097 ? .8 : .01;
-      return amplitude * Math.sin(2 * Math.PI * (c ? 4300 : 37) * t);
-    }});
+test('final PCM is finite and peak-safe for 1, 2, and 6 channel programme audio', () => {
+  for (const channels of [1, 2, 6]) {
+    const output = render({ channels, sample: (t, channel) =>
+      1.8 * Math.sin(2 * Math.PI * (100 + channel * 300) * t) });
+    assert.ok(output.flat().every(Number.isFinite));
+    assert.ok(peak(output) <= .891251, `${channels}ch peak ${peak(output)}`);
   }
 });
 
-test('surround programme remains protected without attributing LFE to loudness', () => {
-  renderScenario({ channels: 6, sample: (t,c) => .4 * Math.sin(2 * Math.PI * (c === 3 ? 40 : 800) * t) });
+test('final PCM preserves a 20 dB input difference when no peak limiting is needed', () => {
+  const quiet = render({ seconds: .5, sample: t => .01 * Math.sin(2 * Math.PI * 997 * t) })[0];
+  const loud = render({ seconds: .5, sample: t => .1 * Math.sin(2 * Math.PI * 997 * t) })[0];
+  const trim = Math.round(48000 * .03);
+  const difference = 20 * Math.log10(rms(loud.slice(trim)) / rms(quiet.slice(trim)));
+  assert.ok(Math.abs(difference - 20) <= .2, `output difference ${difference.toFixed(3)} dB`);
 });
 
-test('meter resets do not reset the audio safety budget', () => {
-  let reset = false;
-  renderScenario({ sample: t => .5 * Math.sin(2 * Math.PI * 1000 * t), commands: (p,t) => {
-    if (t > .17 && !reset) { p.port.onmessage({ data: { type: 'reset-meter', epoch: 2 } }); reset = true; }
-  }});
-});
-
-test('bounded programme does not exhaust the next block budget or remain muted after silence', () => {
-  let minGain = 1, endGain = 0;
-  renderScenario({ seconds: 7, sample: t => {
-    const amp = t < 2 ? .6 : t < 3 ? .1 : t < 4 ? .8 : t < 5 ? .2 : 0;
-    return amp * Math.sin(2 * Math.PI * (t < 3 ? 1000 : 71) * t);
-  }, inspect: (p,t) => {
-    if(t < 5) minGain = Math.min(minGain, p.safety.gain);
-    endGain = p.safety.gain;
-  }});
-  assert.ok(minGain > .01, `unexpected dropout: gain ${minGain}`);
-  assert.ok(endGain > .99, `release stuck: gain ${endGain}`);
+test('meter reset changes only meter epoch, not peak limiter audio state', () => {
+  let Processor;
+  vm.runInNewContext(code, {
+    sampleRate: 48000,
+    AudioWorkletProcessor: class { constructor() { this.port = { postMessage() {} }; } },
+    registerProcessor(_, value) { Processor = value; }
+  });
+  const processor = new Processor({ processorOptions: { lookaheadMs: 15 } });
+  const input = new Float32Array(128).fill(.8);
+  const first = new Float32Array(128);
+  processor.process([[input]], [[first]]);
+  const gain = processor.gain;
+  processor.port.onmessage({ data: { type: 'reset-meter', epoch: 2 } });
+  const second = new Float32Array(128);
+  processor.process([[input]], [[second]]);
+  assert.equal(processor.meterEpoch, 2);
+  assert.equal(processor.gain, gain);
+  assert.ok(second.every(Number.isFinite));
 });

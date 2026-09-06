@@ -1,110 +1,42 @@
-# Audio normalization benchmark
+# 实时节目响度基准
 
-This benchmark compares both extension strategies against a whole-program offline reference:
+本基准验收边播边算的算法，不为控制器提供完整音轨。FFmpeg 只负责解码和独立测量输入积分响度；实时增益仅看已经播放的 PCM。
 
-- realtime AGC: cumulative loudness estimate with time-varying gain;
-- full-track implementation: TypeScript BS.1770 measurement with one static gain;
-- offline reference: FFmpeg `loudnorm` whole-program IL/LRA/true-peak measurement with one static, true-peak-safe gain.
+## 素材
 
-The reference deliberately applies one gain to the whole programme. It does not use FFmpeg's dynamic normalization mode, so the source loudness range is preserved.
+源清单在 [fixtures/audio-videos.json](fixtures/audio-videos.json)，媒体下载到被忽略的 fixtures/videos。
 
-## Fixtures
+- Sintel 原始预告片。
+- Big Buck Bunny 预告片降低 12 dB。
+- WAI clear layout、video captions 对白和音乐。
+- clear layout 额外降低/提高 6 dB 作为电平变体，独立运行状态机。
+- W3C movie_300 提高 6 dB：沿用清单中的极高峰值诊断分类，始终输出全部结果，不纳入普通素材通过率；未满足响度和稳定性也不得宣称通过。
 
-Fixture files are downloaded into ignored directory `tests/fixtures/videos/`; large media files are not committed.
-
-| Fixture | Source | Test condition |
-|---|---|---|
-| Sintel trailer | `https://media.w3.org/2010/05/sintel/trailer.mp4` | Original level |
-| Big Buck Bunny trailer | `https://media.w3.org/2010/05/bunny/trailer.mp4` | Input attenuated by 12 dB |
-| W3C movie sample | `https://media.w3.org/2010/05/video/movie_300.mp4` | Input boosted by 6 dB; extreme-peak diagnostic only |
-| WAI clear layout | `https://media.w3.org/wai/perspective-videos/clear-layout-design.mp4` | Original level; speech and music |
-| WAI video captions | `https://media.w3.org/wai/perspective-videos/video-captions.mp4` | Original level; speech and music |
-
-The evaluated fixtures retain real programme dynamics while covering original and quiet levels. The artificial high-level fixture remains in the report for diagnostics but does not affect the result.
-
-## Offline reference
-
-First, FFmpeg measures the complete programme using EBU R128/BS.1770:
-
-```text
-ffmpeg -i INPUT -map 0:a:0 \
-  -af volume=INPUT_GAIN_DB,loudnorm=I=-21:TP=-1:LRA=50:print_format=json \
-  -f null -
-```
-
-The benchmark then calculates one fixed gain:
-
-```text
-loudness gain = target IL - measured IL
-peak-safe gain = target true peak - measured true peak
-reference gain = min(clamp(loudness gain, min gain, max gain), peak-safe gain)
-```
-
-Predicted output IL and true peak are input measurements plus this fixed gain. Output LRA equals input LRA because no time-varying processing is used.
-
-## Commands
+## 运行
 
 ```powershell
 npm run test:audio:download
-npm run test:audio:benchmark
-```
-
-The default command always writes a report and exits successfully. Use the enforcing form for CI or release gating; it exits non-zero when an evaluated fixture fails:
-
-```powershell
 npm run test:audio:enforce
+npm run test:browser
 ```
 
-Summary reports:
+普通报告模式 `npm run test:audio:benchmark` 不因指标失败返回非零；CI 使用 enforce。设置 CHROME_PATH 可指定浏览器。详细 100 ms 轨迹由 `npm run test:audio:trace` 生成；单素材诊断使用 `node scripts/audio-benchmark.mjs --fixture video-captions --trace`。
 
-```text
-test-results/audio-benchmark.json
-test-results/audio-benchmark.md
-```
+结果写入 test-results/audio-benchmark.json 和 .md。单素材运行会覆盖报告，正式验收必须重新运行无 fixture 过滤的 enforce。
 
-Detailed 100 ms gain traces are disabled by default. Enable only for diagnostics:
+## 时序与指标
 
-```powershell
-npm run test:audio:trace
-```
+每块 100 ms PCM 使用上一块决定的倍率渲染，经生产峰值 Worklet 后测量实际输出，再更新下一块倍率。尾部补 0.5 秒静音排空延迟，仅算入输出测量。
 
-This writes `test-results/*-gain-trace.jsonl`. No trace logger is enabled in the production extension.
+独立排序全部有效 400 ms 窗口（步长 100 ms、> -60 LUFS），按时间取最高 40%，在线性能量域求均值，再转回 LUFS。整个校准期包括在实际输出响段均值中。此指标不同于 BS.1770 积分响度，报告同时保留两者。
 
-## Pass criteria
+每个普通素材必须满足：
 
-Evaluated fixtures must satisfy all five conditions:
+- 输入积分与 FFmpeg 偏差 ≤0.5 LU。
+- 实际输出上 40% 均值距 -21 LUFS ≤1.5 LU。
+- 进入稳定态；首次稳定后的有效倍率 P99.5−P0.5 ≤0.5x。
+- 首次稳定后峰值保护介入的实际音频帧比例 ≤1%。
 
-- the full-track TypeScript measurement differs from FFmpeg whole-program measurement by no more than `0.5 LU`, and its fixed gain differs by no more than `0.5 dB`;
-- actual output integrated loudness is within `±1.5 LU` of the safety-constrained
-  reference: FFmpeg's whole-programme fixed gain rendered through the same final
-  protection. The original target deviation remains reported separately as
-  `outputTargetDiffLu` and `targetMeanPass`; it is not presented as passing when it
-  fails. A maximum-window cap plus reserved block budgets reduces integrated
-  loudness, especially on dynamic material, so a bare fixed-gain prediction is no
-  longer the attainable output reference. This comparison tests calibration, not
-  the correctness of the shared guard; independent final-PCM ceiling tests do that;
-- maximum actual output momentary loudness, including the limiter/safety-buffer tail,
-  is no more than `0.01 LU` above `target + 2 LUFS`;
-- gain `P95–P5` from 10 seconds to the end is no greater than `1.5 dB`;
-- maximum gain span from 10 seconds to the end is no greater than `3 dB`.
+普通素材输出均值最大差额不得超过 3 LU。有效倍率按每个 100 ms 消息的节目倍率乘最小峰值保护倍率估算，保守反映块内削波；报告另列完整跨度、首次稳定时间和重校准次数，重校准不会重置统计起点。固定区间主要约束节目倍率，无法将削波变化隐藏在区间之外。
 
-`P95–P5` measures typical audible movement without letting one sample dominate the result. The maximum span remains a hard guard against large excursions. Both use dB because a coefficient difference such as `0.2x` has different perceptual meaning at different gain levels.
-
-The benchmark renders each 100 ms block with the previous programme gain, then consumes
-the worklet's continuous 100 ms meter message (`original`, actual `output`, and
-`safetyGain`) before calculating the next block's programme gain. At programme end it
-feeds at least 0.6 seconds of silence to flush the lookahead and output-safety buffers.
-That flush is included only in actual-output measurements; full-track, input, and
-offline-reference measurements cover the original programme only.
-
-## Diagnostic metrics
-
-- `Final gain diff dB`: final realtime coefficient minus the offline fixed coefficient.
-- `Output vs offline LU`: actual realtime output minus the peak-safe offline prediction.
-- `Output vs protected reference LU`: actual realtime output minus the output of
-  the fixed FFmpeg gain through protection; this is the integrated-quality gate.
-- `Max step dB`: largest 100 ms gain step.
-- `Safety gain`: final-output safety attenuation reported by the worklet. It may move
-  independently of programme gain, so it is not subject to the programme-gain 3 dB span gate.
-
-Output loudness is measured after running the gained PCM through the same lookahead limiter used by the extension. Final gain agreement is not a pass criterion: a correct final coefficient can still follow an audibly wrong programme-level trajectory. Gain-rate limits, true-peak safety, and page visibility behavior are covered by their focused unit and integration tests instead of being duplicated here.
+测试结果只证明这些输入与默认设置；不能外推成所有视频的 99% 成功概率。用户设置限幅、短片、长期无代表性片头及高峰均比音轨都需要单独解释。浏览器 PCM 渲染测试不等于已完成 B 站线上长期试听。

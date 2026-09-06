@@ -13,18 +13,15 @@ const executable = process.env.CHROME_PATH || [
 ].find(existsSync);
 if (!executable) throw new Error('Set CHROME_PATH to a Chromium executable.');
 const worklet = readFileSync(resolve('dist/limiter-worklet.js'));
-const meter = buildSync({ entryPoints: ['src/k-weighting.ts'], bundle: true,
-  write: false, format: 'esm' }).outputFiles[0].text;
 const processorModule = buildSync({ entryPoints: ['src/audio-context.ts'], bundle: true,
   write: false, format: 'esm' }).outputFiles[0].text;
 const page = `<!doctype html><script type="module">
-import {KWeighting, channelWeight} from '/meter.js';
 import {createAudioProcessor} from '/processor.js';
 window.result = null;
 try {
   const results=[];
   for(const inputChannels of [1,2,6]) {
-  const rate = 48000, target = -21, seconds = 8, length = Math.round((seconds + .6) * rate);
+  const rate = 48000, target = -21, seconds = 8, length = Math.round((seconds + .1) * rate);
   const ctx = new OfflineAudioContext(2, length, rate);
   await ctx.audioWorklet.addModule('/worklet.js');
   const source = ctx.createBufferSource();
@@ -37,36 +34,54 @@ try {
       data[i]=amp*Math.sin(2*Math.PI*(t<5?(c?1200:1000):80)*t);
     }
   }
-  const gain=ctx.createGain(); gain.gain.value=1.8;
   const bass=ctx.createBiquadFilter(); bass.type='lowshelf'; bass.frequency.value=120; bass.gain.value=6;
-  const guard=createAudioProcessor(ctx,target);
-  source.connect(gain).connect(bass).connect(guard).connect(ctx.destination);
-  source.connect(guard,0,1);
+  const gain=ctx.createGain(); gain.gain.value=1.8;
+  const guard=createAudioProcessor(ctx);
+  source.connect(bass).connect(gain).connect(guard,0,0).connect(ctx.destination);
+  bass.connect(guard,0,1);
   source.start();
   const output=await ctx.startRendering();
-  const filters=[new KWeighting(rate),new KWeighting(rate)], ring=new Float64Array(rate*.4);
-  let sum=0,maximum=-Infinity,first=-1,peak=0,stereoDifference=0;
+  let first=-1,peak=0,stereoDifference=0;
   for(let i=0;i<length;i++) {
-    let energy=0;
     for(let c=0;c<2;c++) {
-      const x=output.getChannelData(c)[i], k=filters[c].process(x);
+      const x=output.getChannelData(c)[i];
       if(!Number.isFinite(x)) throw new Error('Nonfinite output');
       if(x!==0&&first<0)first=i;
-      peak=Math.max(peak,Math.abs(x)); energy+=channelWeight(c,2)*k*k;
+      peak=Math.max(peak,Math.abs(x));
     }
-    const index=i%ring.length;sum+=energy-ring[index];ring[index]=energy;
     stereoDifference+=Math.abs(output.getChannelData(0)[i]-output.getChannelData(1)[i]);
-    if(sum>0)maximum=Math.max(maximum,-.691+10*Math.log10(sum/ring.length));
   }
-  results.push({inputChannels,maximum,peak,stereoDifference,latencyMs:first/rate*1000,
-    pass:maximum<=target+2+.001&&peak>0&&(inputChannels===1||stereoDifference>1)});
+  const expectedLatencyMs=15;
+  results.push({inputChannels,peak,stereoDifference,latencyMs:first/rate*1000,
+    pass:peak<=.891251&&peak>0&&Math.abs(first/rate*1000-expectedLatencyMs)<=1
+      &&(inputChannels===1||stereoDifference>1)});
   }
-  window.result={results,pass:results.every(result=>result.pass)};
+  async function toneRms(amplitude) {
+    const toneRate=48000;
+    const context=new OfflineAudioContext(1,Math.round(toneRate*.6),toneRate);
+    await context.audioWorklet.addModule('/worklet.js');
+    const tone=context.createBufferSource();
+    tone.buffer=context.createBuffer(1,Math.round(toneRate*.5),toneRate);
+    const data=tone.buffer.getChannelData(0);
+    for(let i=0;i<data.length;i++)data[i]=amplitude*Math.sin(2*Math.PI*997*i/toneRate);
+    const toneBass=context.createBiquadFilter(); toneBass.type='lowshelf'; toneBass.frequency.value=120; toneBass.gain.value=6;
+    const toneGain=context.createGain(); toneGain.gain.value=1;
+    const toneGuard=createAudioProcessor(context);
+    tone.connect(toneBass).connect(toneGain).connect(toneGuard,0,0).connect(context.destination);
+    toneBass.connect(toneGuard,0,1);
+    tone.start();
+    const rendered=await context.startRendering(),pcm=rendered.getChannelData(0);
+    let energy=0,count=0;
+    for(let i=Math.round(toneRate*.03);i<Math.round(toneRate*.5);i++){energy+=pcm[i]*pcm[i];count++;}
+    return Math.sqrt(energy/count);
+  }
+  const quiet=await toneRms(.01), loud=await toneRms(.1);
+  const toneDifference=20*Math.log10(loud/quiet);
+  window.result={results,toneDifference,pass:results.every(result=>result.pass)&&Math.abs(toneDifference-20)<=.2};
 }catch(error){window.result={error:String(error.stack||error)};}
 </script>`;
 const server = createServer((req,res) => {
-  const body=req.url==='/worklet.js'?worklet:req.url==='/meter.js'?meter
-    :req.url==='/processor.js'?processorModule:page;
+  const body=req.url==='/worklet.js'?worklet:req.url==='/processor.js'?processorModule:page;
   res.setHeader('Content-Type',req.url.endsWith('.js')?'text/javascript':'text/html');
   res.end(body);
 });

@@ -163,4 +163,34 @@ test('processor reports continuous original and output audio', () => {
   assert.equal(messages[0].original.length, 1);
   assert.equal(messages[0].original[0].length, 4800);
   assert.ok(Math.abs(messages[0].original[0][0] - 0.5) < 1e-6);
+  assert.equal(messages[0].frames, 4800);
+  assert.equal(messages[0].limitedFrames, 0);
+  assert.equal(messages[0].safetyGain, 1);
+});
+
+test('meter reports the actual peak-limited frame ratio and minimum gain', () => {
+  const ProcessorClass = loadProcessor();
+  const processor = new ProcessorClass({ processorOptions: { ceiling: .5, lookaheadMs: 15 } });
+  const messages = [];
+  processor.port = { postMessage: message => messages.push(message) };
+
+  for (let block = 0; block < 38; block++) {
+    const input = new Float32Array(128).fill(1);
+    processor.process([[input]], [[new Float32Array(128)]]);
+  }
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].frames, 4800);
+  assert.ok(messages[0].limitedFrames >= 4000, `limited ${messages[0].limitedFrames} frames`);
+  assert.ok(messages[0].safetyGain <= .500001);
+});
+
+test('non-finite PCM is rendered as silence without poisoning later audio', () => {
+  const input = new Float32Array(4096).fill(.25);
+  input[10] = Infinity;
+  input[11] = NaN;
+  const output = renderMono(input);
+
+  assert.ok(output.every(Number.isFinite));
+  assert.ok(output.slice(1000, 3000).some(sample => Math.abs(sample) > .2));
 });
