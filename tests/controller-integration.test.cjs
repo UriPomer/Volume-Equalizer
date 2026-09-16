@@ -119,6 +119,7 @@ global.requestAnimationFrame = (callback) => { rafCallbacks.push(callback); retu
 global.cancelAnimationFrame = () => {};
 
 const { MediaVolumeController } = require('../dist-test/controller.js');
+const { INITIAL_GAIN } = require('../dist-test/config.js');
 const settings = {
   enabled: true,
   fullAudioAnalysis: false,
@@ -142,6 +143,7 @@ test('controller connects continuous stereo meter and drives gain state', async 
   await new Promise((resolve) => setImmediate(resolve));
 
   const worklet = global.lastWorklet;
+  assert.equal(controller.gain.gain.value, INITIAL_GAIN);
   assert.equal(worklet.options.numberOfInputs, 2);
   assert.equal(worklet.options.channelCountMode, 'explicit');
   assert.deepEqual(worklet.options.outputChannelCount, [2]);
@@ -186,17 +188,17 @@ test('source changes without emptied reset gain and histories on play or meter',
   const controller = new MediaVolumeController(media, settings, () => {}, () => {});
   await new Promise((resolve) => setImmediate(resolve));
 
-  controller.gain.gain.value = 0.8;
+  controller.gain.gain.value = 1.2;
   controller.originalMeter.processBlock(new Float32Array(48000).fill(0.1));
   controller.agc.lockGain(1.3);
   media.currentSrc = 'blob:replacement';
   media.dispatchEvent(new Event('play'));
 
-  assert.equal(controller.gain.gain.value, .5);
+  assert.equal(controller.gain.gain.value, INITIAL_GAIN);
   assert.equal(controller.originalMeter.getIntegrationTime(), 0);
   assert.equal(controller.agc.isLocked(), false);
 
-  controller.gain.gain.value = 0.8;
+  controller.gain.gain.value = 1.2;
   controller.originalMeter.processBlock(new Float32Array(48000).fill(0.1));
   controller.agc.lockGain(1.3);
   media.currentSrc = 'blob:replacement-again';
@@ -207,7 +209,7 @@ test('source changes without emptied reset gain and histories on play or meter',
     output: [new Float32Array(4800).fill(0.2)]
   });
 
-  assert.equal(controller.gain.gain.value, .5);
+  assert.equal(controller.gain.gain.value, INITIAL_GAIN);
   assert.equal(controller.originalMeter.getIntegrationTime(), 0);
   assert.equal(controller.agc.isLocked(), false);
   controller.destroy();
@@ -226,12 +228,12 @@ test('Bilibili SPA route changes reset same-blob media identity', async (t) => {
   });
   await new Promise((resolve) => setImmediate(resolve));
 
-  controller.gain.gain.value = 0.8;
+  controller.gain.gain.value = 1.2;
   global.location.search = '?p=2';
   media.dispatchEvent(new Event('play'));
-  assert.equal(controller.gain.gain.value, .5);
+  assert.equal(controller.gain.gain.value, INITIAL_GAIN);
 
-  controller.gain.gain.value = 0.8;
+  controller.gain.gain.value = 1.2;
   global.location.pathname = '/video/BV2';
   controller.consumeAudio({
     type: 'meter',
@@ -239,7 +241,7 @@ test('Bilibili SPA route changes reset same-blob media identity', async (t) => {
     original: [new Float32Array(4800).fill(0.2)],
     output: [new Float32Array(4800).fill(0.2)]
   });
-  assert.equal(controller.gain.gain.value, .5);
+  assert.equal(controller.gain.gain.value, INITIAL_GAIN);
 });
 
 test('background real meter messages advance AGC while animation frames do not', async (t) => {
@@ -278,7 +280,7 @@ test('a new video resets programme gain even when the page is hidden', async (t)
   setVisibility('hidden');
   media.dispatchEvent(new Event('emptied'));
 
-  assert.equal(controller.gain.gain.value, .5);
+  assert.equal(controller.gain.gain.value, INITIAL_GAIN);
 });
 
 test('visibility changes preserve measurements, epoch and programme gain', async (t) => {
@@ -374,7 +376,7 @@ test('reenabling starts conservatively with empty realtime measurements', async 
   controller.updateSettings({ ...settings, enabled: false });
   controller.updateSettings({ ...settings, enabled: true });
 
-  assert.equal(controller.gain.gain.value, .5);
+  assert.equal(controller.gain.gain.value, INITIAL_GAIN);
   assert.equal(controller.originalMeter.getIntegrationTime(), 0);
   controller.destroy();
 });

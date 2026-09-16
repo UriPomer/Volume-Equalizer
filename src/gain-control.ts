@@ -136,8 +136,8 @@ export class RealtimeAgc {
     if (activeSeconds < 4 || reference < input.targetLufs - 25) destination = Math.min(destination, current);
     if (input.momentaryLufs < reference - 6 && destination > current) destination = current;
     if (this.phase === 'recalibrating') destination = Math.min(destination, current);
-    const next = slew(current, destination, dt, destination < current ? 6 : 2,
-      input.gainChangePerSec * (destination < current ? 3 : 1));
+    const next = slew(current, destination, dt, destination < current ? 12 : 2,
+      input.gainChangePerSec * (destination < current ? 6 : 1));
     if (activeSeconds >= 10 && (this.stableSeconds >= 3 || activeSeconds >= 20)
       && (Math.abs(db(next / desired)) <= 0.25
         || (this.phase === 'recalibrating' && next <= desired))) {

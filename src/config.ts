@@ -5,7 +5,7 @@
 export const BRAND = '[Universal Volume EQ]';
 export const PANEL_ID = 'universal-volume-eq-panel';
 export const TARGET_SELECTOR = 'video, audio';
-export const INITIAL_GAIN = 0.5;
+export const INITIAL_GAIN = 0.8;
 
 export interface Settings {
   enabled: boolean;

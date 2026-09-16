@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { RealtimeAgc } = require('../dist-test/gain-control.js');
+const { INITIAL_GAIN } = require('../dist-test/config.js');
 
 const input = overrides => ({
   currentGain: 1, minGain: .25, maxGain: 2, deltaSec: .1,
@@ -9,7 +10,7 @@ const input = overrides => ({
 });
 function run(seconds, levels, options = {}) {
   const agc = new RealtimeAgc(), trace = [];
-  let gain = .5;
+  let gain = INITIAL_GAIN;
   for (let i=0;i<seconds*10;i++) {
     const level=levels(i/10);
     const result=agc.update(input({ ...options, currentGain: gain, momentaryLufs: level, shortTermLufs: level }));
@@ -30,11 +31,13 @@ test('quiet and loud videos converge using the loudest 40 percent, not arithmeti
 test('silence, invalid measurements and near-silent introductions never boost or stabilize', () => {
   for(const level of [-Infinity,NaN,Infinity,-65]) {
     const {gain,trace}=run(30,()=>level);
-    assert.equal(gain,.5);
+    assert.equal(gain,INITIAL_GAIN);
     assert.equal(trace.at(-1).phase,'collecting');
   }
 });
 test('a current loud start attenuates promptly even after a quiet introduction', () => {
+  const immediate = run(2, () => -12);
+  assert.ok(immediate.trace[9].nextGain <= .36);
   const {trace}=run(20,t=>t<12?-50:-12);
   assert.ok(trace[139].nextGain < .6);
 });
