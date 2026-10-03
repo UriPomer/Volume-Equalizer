@@ -28,21 +28,22 @@ class Biquad {
     this.x1 = this.x2 = this.y1 = this.y2 = 0;
   }
 
-  clone(): Biquad {
-    const copy = new Biquad(this.b0, this.b1, this.b2, this.a1, this.a2);
-    copy.x1 = this.x1;
-    copy.x2 = this.x2;
-    copy.y1 = this.y1;
-    copy.y2 = this.y2;
-    return copy;
+  copyStateFrom(other: Biquad): void {
+    this.x1 = other.x1; this.x2 = other.x2;
+    this.y1 = other.y1; this.y2 = other.y2;
   }
 
-  addScaledState(other: Biquad, gain: number): void {
-    this.x1 += other.x1 * gain;
-    this.x2 += other.x2 * gain;
-    this.y1 += other.y1 * gain;
-    this.y2 += other.y2 * gain;
+  /** Sum of products of all future zero-input outputs, after input history
+   * has decayed. This solves the two-state filter's discrete energy equation. */
+  tailProduct(other: Biquad): number {
+    const denominator = (1 - this.a2) * ((1 + this.a2) ** 2 - this.a1 ** 2);
+    const p11 = (1 + this.a2) / denominator;
+    const p12 = this.a1 * this.a2 / denominator;
+    const p22 = this.a2 ** 2 * p11;
+    return (p11 - 1) * this.y1 * other.y1
+      + p12 * (this.y1 * other.y2 + this.y2 * other.y1) + p22 * this.y2 * other.y2;
   }
+
 }
 
 export class KWeighting {
@@ -63,17 +64,24 @@ export class KWeighting {
     this.highPass.reset();
   }
 
-  addScaledState(other: KWeighting, gain: number): void {
-    this.shelf.addScaledState(other.shelf, gain);
-    this.highPass.addScaledState(other.highPass, gain);
+  copyStateFrom(other: KWeighting): void {
+    this.shelf.copyStateFrom(other.shelf);
+    this.highPass.copyStateFrom(other.highPass);
   }
 
-  clone(): KWeighting {
-    const copy = Object.create(KWeighting.prototype) as KWeighting;
-    copy.shelf = this.shelf.clone();
-    copy.highPass = this.highPass.clone();
-    return copy;
+  /** Consume a preview, not the live filter. Once the 1.7 kHz shelf has
+   * decayed, account analytically for the much longer 38 Hz high-pass tail. */
+  drainTailEnergy(other: KWeighting, frames: number, weight: number, coefficients: Float64Array): void {
+    let a = 0, b = 0, c = 0;
+    for (let frame = 0; frame < frames; frame++) {
+      const signal = this.process(0), tail = other.process(0);
+      a += signal * signal; b += 2 * signal * tail; c += tail * tail;
+    }
+    coefficients[0] += weight * (a + Math.max(0, this.highPass.tailProduct(this.highPass)));
+    coefficients[1] += weight * (b + 2 * this.highPass.tailProduct(other.highPass));
+    coefficients[2] += weight * (c + Math.max(0, other.highPass.tailProduct(other.highPass)));
   }
+
 }
 
 export function channelWeight(index: number, count: number): number {

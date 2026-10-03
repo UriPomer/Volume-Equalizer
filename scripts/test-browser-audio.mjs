@@ -1,134 +1,168 @@
-import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { createServer } from 'node:http';
-import { buildSync } from 'esbuild';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { openBrowser } from './browser-session.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
+import { buildSync } from 'esbuild';
+import { denseMaxima, ffmpegMaxima, sha256, writeFloatWav } from './audio-test-artifacts.mjs';
 
-// Uses an isolated browser profile, never the user's running browser/profile.
-const executable = process.env.CHROME_PATH || [
-  'C:/Program Files/Google/Chrome/Application/chrome.exe',
-  '/usr/bin/google-chrome', '/usr/bin/chromium'
-].find(existsSync);
-if (!executable) throw new Error('Set CHROME_PATH to a Chromium executable.');
-const worklet = readFileSync(resolve('dist/limiter-worklet.js'));
-const processorModule = buildSync({ entryPoints: ['src/audio-context.ts'], bundle: true,
+// Failure model, established before the guard implementation:
+// 1. First loud frame/sustained sound overshoots before a main-thread response.
+// 2. A lower target, reset, EQ or fixed high programme gain bypasses the ceiling.
+// 3. Surround weighting/sample rate differs from the stereo happy path.
+// 4. A mute-only guard passes an upper-bound assertion without useful audio.
+// 5. Below-ceiling signals are unnecessarily compressed or peak safety regresses.
+const cases = [
+  { id: 'first-loud-mono', rate: 48000, channels: 1, target: -21, mode: 'loud' },
+  { id: 'burst-stereo', rate: 48000, channels: 2, target: -17.5, mode: 'burst' },
+  { id: 'surround', rate: 48000, channels: 6, target: -23, mode: 'loud' },
+  { id: '44100-bass-eq', rate: 44100, channels: 2, target: -21, mode: 'bass', bass: 6 },
+  { id: 'high-programme-gain', rate: 48000, channels: 2, target: -23, mode: 'loud', gain: 8 },
+  { id: 'target-change', rate: 48000, channels: 2, target: -15, mode: 'loud', changeAt: 2, nextTarget: -23 },
+  { id: 'meter-reset', rate: 48000, channels: 2, target: -21, mode: 'loud', resetAt: 2 },
+  { id: 'meter-reset-baseline', rate: 48000, channels: 2, target: -21, mode: 'loud' },
+  ...[1, 2, 6].map(channels => ({ id: `mix-${channels}-to-stereo`, rate: 48000, channels,
+    outputChannels: 2, seconds: 8, target: -21, mode: 'mixed', gain: 1.8, bass: 6, bassFrequency: 120 })),
+  { id: 'broadband-noise', rate: 48000, channels: 2, target: -21, mode: 'noise' },
+  { id: 'sub-bass', rate: 48000, channels: 2, target: -21, mode: 'sub-bass', bass: 6, gain: 3 },
+  { id: 'frequency-jump', rate: 48000, channels: 2, target: -21, mode: 'frequency-jump' },
+  { id: 'off-grid-pulses', rate: 44100, channels: 2, target: -23, mode: 'pulses' },
+  { id: 'intersample-peaks', rate: 48000, channels: 1, target: -21, mode: 'intersample' },
+  { id: 'surround-eight', rate: 48000, channels: 8, target: -21, mode: 'loud' },
+  { id: 'source-end-tail', rate: 48000, channels: 1, target: -21, mode: 'tail-impulse' },
+  { id: 'quiet', rate: 48000, channels: 2, target: -21, mode: 'quiet' },
+  { id: 'quiet-times-ten', rate: 48000, channels: 2, target: -21, mode: 'quiet', gain: 10 }
+].map(spec => ({ seconds: 7, gain: 1, outputChannels: spec.channels, ...spec }));
+const artifacts = mkdtempSync(join(process.env.VOLUME_EQ_ARTIFACT_ROOT || tmpdir(), 'volume-eq-ceiling-'));
+const worklet = readFileSync(process.env.VOLUME_EQ_WORKLET_PATH || 'dist/limiter-worklet.js');
+const processor = buildSync({ entryPoints: ['src/audio-context.ts'], bundle: true,
   write: false, format: 'esm' }).outputFiles[0].text;
+const report = { command: 'npm run test:browser', workletSha256: sha256(worklet),
+  testSourceSha256: sha256(readFileSync(new URL(import.meta.url))),
+  createdAt: new Date().toISOString(), cases: [], pass: false };
 const page = `<!doctype html><script type="module">
 import {createAudioProcessor} from '/processor.js';
-window.result = null;
+window.result=null;
 try {
-  const results=[];
-  for(const inputChannels of [1,2,6]) {
-  const rate = 48000, target = -21, seconds = 8, length = Math.round((seconds + .1) * rate);
-  const ctx = new OfflineAudioContext(2, length, rate);
-  await ctx.audioWorklet.addModule('/worklet.js');
-  const source = ctx.createBufferSource();
-  source.buffer = ctx.createBuffer(inputChannels, seconds * rate, rate);
-  for (let c=0;c<inputChannels;c++) {
-    const data=source.buffer.getChannelData(c);
-    for (let i=0;i<data.length;i++) {
-      const t=i/rate;
-      const amp=t<1?.04:t<4?0:t<4.2?.8:t<5?.03:.4;
-      data[i]=amp*Math.sin(2*Math.PI*(t<5?(c?1200:1000):80)*t);
-    }
-  }
-  const bass=ctx.createBiquadFilter(); bass.type='lowshelf'; bass.frequency.value=120; bass.gain.value=6;
-  const gain=ctx.createGain(); gain.gain.value=1.8;
-  const guard=createAudioProcessor(ctx);
-  source.connect(bass).connect(gain).connect(guard,0,0).connect(ctx.destination);
-  bass.connect(guard,0,1);
-  source.start();
-  const output=await ctx.startRendering();
-  let first=-1,peak=0,stereoDifference=0;
-  for(let i=0;i<length;i++) {
-    for(let c=0;c<2;c++) {
-      const x=output.getChannelData(c)[i];
-      if(!Number.isFinite(x)) throw new Error('Nonfinite output');
-      if(x!==0&&first<0)first=i;
-      peak=Math.max(peak,Math.abs(x));
-    }
-    stereoDifference+=Math.abs(output.getChannelData(0)[i]-output.getChannelData(1)[i]);
-  }
-  const expectedLatencyMs=15;
-  results.push({inputChannels,peak,stereoDifference,latencyMs:first/rate*1000,
-    pass:peak<=.891251&&peak>0&&Math.abs(first/rate*1000-expectedLatencyMs)<=1
-      &&(inputChannels===1||stereoDifference>1)});
-  }
-  async function toneRms(amplitude) {
-    const toneRate=48000;
-    const context=new OfflineAudioContext(1,Math.round(toneRate*.6),toneRate);
+  const resetEpochs={};
+  for(const spec of ${JSON.stringify(cases)}) {
+    const context=new OfflineAudioContext(spec.outputChannels,Math.round((spec.seconds+.1)*spec.rate),spec.rate);
     await context.audioWorklet.addModule('/worklet.js');
-    const tone=context.createBufferSource();
-    tone.buffer=context.createBuffer(1,Math.round(toneRate*.5),toneRate);
-    const data=tone.buffer.getChannelData(0);
-    for(let i=0;i<data.length;i++)data[i]=amplitude*Math.sin(2*Math.PI*997*i/toneRate);
-    const toneBass=context.createBiquadFilter(); toneBass.type='lowshelf'; toneBass.frequency.value=120; toneBass.gain.value=6;
-    const toneGain=context.createGain(); toneGain.gain.value=1;
-    const toneGuard=createAudioProcessor(context);
-    tone.connect(toneBass).connect(toneGain).connect(toneGuard,0,0).connect(context.destination);
-    toneBass.connect(toneGuard,0,1);
-    tone.start();
-    const rendered=await context.startRendering(),pcm=rendered.getChannelData(0);
-    let energy=0,count=0;
-    for(let i=Math.round(toneRate*.03);i<Math.round(toneRate*.5);i++){energy+=pcm[i]*pcm[i];count++;}
-    return Math.sqrt(energy/count);
+    const source=context.createBufferSource();
+    source.buffer=context.createBuffer(spec.channels,spec.seconds*spec.rate,spec.rate);
+    for(let c=0;c<spec.channels;c++) {
+      const data=source.buffer.getChannelData(c);
+      let noiseSeed=0x12345678+c;
+      for(let i=0;i<data.length;i++) {
+        const t=i/spec.rate;
+        const amplitude=spec.mode==='mixed'?(t<1?.04:t<4?0:t<4.2?.8:t<5?.03:.4):spec.mode==='quiet'?.006:spec.mode==='burst'?(t<1?.006:t<1.08?.9:t<2?.006:.6):.65;
+        const frequency=spec.mode==='mixed'?(t<5?(c?1200:1000):80):spec.mode==='bass'?80:spec.mode==='sub-bass'?30:spec.mode==='frequency-jump'?(t%1<.5?50:7000):997+c*127;
+        if(spec.mode==='tail-impulse')data[i]=i===data.length-1?.1:0;
+        else if(spec.mode==='noise'){noiseSeed=(Math.imul(noiseSeed,1664525)+1013904223)>>>0;data[i]=(noiseSeed/4294967296*2-1)*.8;}
+        else if(spec.mode==='pulses')data[i]=((i+53)%827<23)?.9:0;
+        else if(spec.mode==='intersample')data[i]=i%4===3?-.4:-.89;
+        else data[i]=amplitude*Math.sin(2*Math.PI*frequency*t);
+      }
+    }
+    const bass=context.createBiquadFilter();bass.type='lowshelf';bass.frequency.value=spec.bassFrequency||200;bass.gain.value=spec.bass||0;
+    const gain=context.createGain();gain.gain.value=spec.gain;
+    const guard=createAudioProcessor(context,spec.target);
+    let resetAcknowledged;
+    const resetObserved=new Promise(resolve=>{resetAcknowledged=resolve;});
+    guard.port.onmessage=event=>{if(event.data.epoch===1){resetEpochs[spec.id]=1;resetAcknowledged();}};
+    if(spec.changeAt)guard.parameters.get('loudnessCeilingLufs')?.setValueAtTime(spec.nextTarget+2,spec.changeAt);
+    if(spec.resetAt)context.suspend(spec.resetAt).then(()=>{guard.port.postMessage({type:'reset-meter',epoch:1});context.resume();});
+    source.connect(bass).connect(gain).connect(guard,0,0).connect(context.destination);
+    bass.connect(guard,0,1);
+    source.start();
+    const output=await context.startRendering();
+    if(spec.resetAt)await Promise.race([resetObserved,new Promise((_,reject)=>setTimeout(()=>reject(new Error('Meter reset not observed')),1000))]);
+    const pcm=new Float32Array(output.length*spec.outputChannels);
+    for(let c=0;c<spec.outputChannels;c++){const data=output.getChannelData(c);for(let i=0;i<data.length;i++)pcm[i*spec.outputChannels+c]=data[i];}
+    await fetch('/output/'+spec.id,{method:'POST',body:pcm.buffer});
   }
-  const quiet=await toneRms(.01), loud=await toneRms(.1);
-  const toneDifference=20*Math.log10(loud/quiet);
-  window.result={results,toneDifference,pass:results.every(result=>result.pass)&&Math.abs(toneDifference-20)<=.2};
+  window.result={pass:true,resetEpochs};
 }catch(error){window.result={error:String(error.stack||error)};}
 </script>`;
-const server = createServer((req,res) => {
-  const body=req.url==='/worklet.js'?worklet:req.url==='/processor.js'?processorModule:page;
-  res.setHeader('Content-Type',req.url.endsWith('.js')?'text/javascript':'text/html');
-  res.end(body);
+writeFileSync(join(artifacts, 'fixture.html'), page);
+const rendered = new Map();
+const server = createServer(async (req, res) => {
+  const spec = cases.find(item => req.url === '/output/' + item.id);
+  if (req.method === 'POST' && spec) {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const bytes = Buffer.concat(chunks);
+    const pcm = new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    rendered.set(spec.id, pcm);
+    writeFloatWav(join(artifacts, spec.id + '.wav'), pcm, spec.rate, spec.outputChannels);
+    res.end('ok'); return;
+  }
+  res.setHeader('Content-Type', req.url.endsWith('.js') ? 'text/javascript' : 'text/html');
+  res.end(req.url === '/worklet.js' ? worklet : req.url === '/processor.js' ? processor : page);
 });
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
-const profile=mkdtempSync(join(tmpdir(),'volume-eq-browser-'));
-let browser, socket;
-const pending=new Map();let sequence=0;
-const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-function send(method,params={}) {
-  const id=++sequence;
-  return new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>{pending.delete(id);reject(new Error('CDP timeout: '+method));},60000);
-    pending.set(id,{resolve:value=>{clearTimeout(timer);resolve(value);},reject});
-    socket.send(JSON.stringify({id,method,params}));
-  });
-}
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+let browser;
 try {
-  browser=spawn(executable,['--headless=new','--disable-gpu','--no-first-run',
-    '--remote-debugging-port=0','--user-data-dir='+profile,'about:blank'],{stdio:'ignore',windowsHide:true});
-  const portFile=join(profile,'DevToolsActivePort');
-  for(let i=0;i<200&&!existsSync(portFile);i++)await delay(100);
-  assert.ok(existsSync(portFile),'Browser did not start');
-  const port=readFileSync(portFile,'utf8').split('\n')[0];
-  const tabs=await(await fetch('http://127.0.0.1:'+port+'/json/list')).json();
-  socket=new WebSocket(tabs.find(t=>t.type==='page').webSocketDebuggerUrl);
-  await new Promise((resolve,reject)=>{socket.onopen=resolve;socket.onerror=reject;});
-  socket.onmessage=event=>{
-    const message=JSON.parse(event.data),request=pending.get(message.id);
-    if(request){pending.delete(message.id);request.resolve(message);}
-  };
-  await send('Page.navigate',{url:'http://127.0.0.1:'+server.address().port});
+  browser = await openBrowser(artifacts);
+  report.browser = await browser.send('Browser.getVersion');
+  await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + server.address().port });
   let result;
-  for(let i=0;i<300;i++) {
+  for (let i = 0; i < 300; i++) {
     await delay(100);
-    const response=await send('Runtime.evaluate',{expression:'window.result',returnByValue:true});
-    result=response.result?.result?.value;
-    if(result)break;
+    result = await browser.evaluate('window.result');
+    if (result) break;
   }
-  console.log(JSON.stringify(result,null,2));
-  assert.equal(result?.pass,true,'Browser output safety failed');
-} finally {
-  if(socket?.readyState===WebSocket.OPEN) {
-    socket.send(JSON.stringify({id:++sequence,method:'Browser.close'}));
-    socket.close();
+  assert.equal(result?.pass, true, JSON.stringify(result));
+  report.resetEpochs = result.resetEpochs;
+  for (const spec of cases) {
+    const pcm = rendered.get(spec.id);
+    assert.ok(pcm, 'Missing rendered audio: ' + spec.id);
+    const epochs = spec.changeAt ? [[0, spec.changeAt, spec.target], [spec.changeAt, pcm.length / spec.outputChannels / spec.rate, spec.nextTarget]]
+      : [[0, pcm.length / spec.outputChannels / spec.rate, spec.target]];
+    const results = epochs.map(([start, end, target], index) => {
+      const audio = pcm.slice(Math.round(start * spec.rate) * spec.outputChannels, Math.round(end * spec.rate) * spec.outputChannels);
+      const file = join(artifacts, spec.id + '-epoch-' + index + '.wav');
+      writeFloatWav(file, audio, spec.rate, spec.outputChannels);
+      const independent = ffmpegMaxima(file), dense = denseMaxima(audio, spec.rate, spec.outputChannels);
+      const ceiling = target + 2;
+      return { start, end, target, ceiling, independent, dense,
+        pass: Number.isFinite(dense.momentary) && independent.momentary <= ceiling + .05
+          && dense.momentary <= ceiling + .01
+          && (end - start < 3 || (Number.isFinite(dense.shortTerm)
+            && independent.shortTerm <= ceiling + .05 && dense.shortTerm <= ceiling + .01))
+          // Sample ceiling is -1 dBFS; independent reconstructed peaks must
+          // remain below full scale. This does not claim a -1 dBTP limiter.
+          && dense.peak <= .891251 && independent.truePeak <= 1 && dense.rms > 1e-4 };
+    });
+    // Sustained loud input must reach within 1 LU of its ceiling: all-silence or
+    // arbitrary fixed attenuation is not an acceptable implementation.
+    const useful = !['loud', 'burst', 'bass'].includes(spec.mode)
+      || results.every(row => row.independent.momentary >= row.ceiling - 1);
+    const first = pcm.findIndex(sample => sample !== 0);
+    const latencyMs = (first / spec.outputChannels / spec.rate - (spec.mode === 'tail-impulse' ? spec.seconds - 1 / spec.rate : 0)) * 1000;
+    let stereoDifference = 0;
+    if (spec.mode === 'mixed') for (let i = 0; i < pcm.length; i += 2) stereoDifference += Math.abs(pcm[i] - pcm[i + 1]);
+    const timingPass = !['mixed', 'tail-impulse'].includes(spec.mode) || Math.abs(latencyMs - 15) <= 1;
+    const tailPass = spec.mode !== 'tail-impulse' || Math.abs(results[0].dense.peak - .1) < 1e-6;
+    const mixPass = spec.mode !== 'mixed' || (spec.channels === 1 ? stereoDifference < 1e-6 : stereoDifference > 1);
+    report.cases.push({ ...spec, results, latencyMs, stereoDifference,
+      pass: useful && timingPass && tailPass && mixPass && results.every(row => row.pass) });
   }
-  if(browser){await delay(500);if(browser.exitCode===null)browser.kill();}
-  server.close();
-  // Only the unique profile created above is removed.
-  rmSync(profile,{recursive:true,force:true,maxRetries:10,retryDelay:200});
+  const quiet = report.cases.find(row => row.id === 'quiet').results[0].dense.rms;
+  const louder = report.cases.find(row => row.id === 'quiet-times-ten').results[0].dense.rms;
+  report.belowCeilingDifferenceDb = 20 * Math.log10(louder / quiet);
+  const reset = rendered.get('meter-reset'), baseline = rendered.get('meter-reset-baseline');
+  report.meterResetAudioUnchanged = reset.length === baseline.length && reset.every((sample, i) => sample === baseline[i]);
+  report.pass = report.cases.every(row => row.pass) && Math.abs(report.belowCeilingDifferenceDb - 20) <= .1
+    && report.resetEpochs['meter-reset'] === 1 && report.meterResetAudioUnchanged;
+  for (const row of report.cases) console.log(JSON.stringify({ id: row.id, pass: row.pass, results: row.results }));
+  assert.equal(report.pass, true, 'Rendered loudness ceiling contract failed');
+} catch (error) { report.error = String(error.stack || error); process.exitCode = 1; }
+finally {
+  try { await browser?.close(); }
+  catch (error) { report.pass = false; report.error = String(error); process.exitCode = 1; }
+  finally { server.close(); }
+  writeFileSync(join(artifacts, 'report.json'), JSON.stringify(report, null, 2));
+  console.log(JSON.stringify({ pass: report.pass, artifacts, error: report.error }));
 }

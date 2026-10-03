@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { LoudnessMeter } = require('../dist-test/loudness-meter.js');
-const { KWeighting, channelWeight } = require('../dist-test/k-weighting.js');
+const { channelWeight } = require('../dist-test/k-weighting.js');
 
 function test(name, fn) {
   try {
@@ -113,18 +113,4 @@ test('changing the channel layout discards the previous layout state', () => {
   assert.equal(meter.getIntegrationTime(), 1 / sampleRate);
   assert.ok(Number.isNaN(meter.getIntegratedLoudness()));
   assert.ok(Number.isNaN(meter.getShortTermLoudness()));
-});
-
-test('K-weighting clones filter coefficients and history exactly', () => {
-  const original = new KWeighting(48000);
-  for (const sample of [0.2, -0.1, 0.35, 0]) original.process(sample);
-  const copy = original.clone();
-
-  for (const sample of [0.4, -0.3, 0.1]) {
-    assert.equal(copy.process(sample), original.process(sample));
-  }
-
-  copy.reset();
-  original.reset();
-  assert.equal(copy.process(0.25), original.process(0.25));
 });

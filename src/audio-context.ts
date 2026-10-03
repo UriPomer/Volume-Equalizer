@@ -30,7 +30,7 @@ export function ensureMediaSource(media: HTMLMediaElement): MediaElementAudioSou
 
 /** Match the destination before measuring/limiting, so a later up/downmix
  * cannot increase loudness after the safety guard. */
-export function createAudioProcessor(context: BaseAudioContext): AudioWorkletNode {
+export function createAudioProcessor(context: BaseAudioContext, targetLufs = -21): AudioWorkletNode {
   const channels = context.destination.channelCount;
   return new AudioWorkletNode(context, 'lookahead-peak-limiter', {
     numberOfInputs: 2,
@@ -39,6 +39,7 @@ export function createAudioProcessor(context: BaseAudioContext): AudioWorkletNod
     channelCount: channels,
     channelCountMode: 'explicit',
     channelInterpretation: 'speakers',
+    parameterData: { loudnessCeilingLufs: targetLufs + 2 },
     processorOptions: {
       lookaheadMs: 15, releaseMs: 50,
       ceiling: 0.8912509381337456, interSampleMargin: 1.03

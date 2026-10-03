@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { DEFAULT_REFERENCE_SETTINGS, measureWithFfmpeg } from './offline-loudness-reference.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const resultsDir = join(root, 'test-results');
+const resultsDir = process.env.VOLUME_EQ_RESULTS_DIR || join(root, 'test-results');
 const fixtures = JSON.parse(readFileSync(join(root, 'tests/fixtures/audio-videos.json'), 'utf8'));
 // Level-shift holdouts share content, not an offline gain decision. They exercise
 // cross-video normalization at amplitudes not used to tune the original fixture.
@@ -47,10 +47,21 @@ for(const fixture of selectedFixtures) {
   const report={id:fixture.id,included,...result,ffmpegInputIntegratedLufs:ffmpeg.integratedLufs,
     inputMeasurementDiffLu:result.inputIntegratedLufs-ffmpeg.integratedLufs};
   report.measurementPass=Math.abs(report.inputMeasurementDiffLu)<=.5;
-  report.loudnessPass=Math.abs(report.outputUpper40Lufs-DEFAULT_REFERENCE_SETTINGS.targetLufs)<=1.5;
+  report.targetReached=Math.abs(report.outputIntegratedLufs-DEFAULT_REFERENCE_SETTINGS.targetLufs)<=1.5;
+  report.ceilingPass=report.outputMaximumMomentaryLufs<=-19+.01&&report.outputMaximumShortTermLufs<=-19+.01;
+  // A constant gain bounded by the entire input's loudest window is an
+  // independently feasible fallback. The adaptive output must do no worse
+  // than this conservative reference, allowing the existing startup tolerance.
+  const safeGain=Math.min(2,Math.pow(10,(-21-report.inputIntegratedLufs)/20),
+    Math.pow(10,(-19-Math.max(report.inputMaximumMomentaryLufs,report.inputMaximumShortTermLufs))/20));
+  report.feasibleFixedOutputLufs=report.inputIntegratedLufs+20*Math.log10(safeGain);
+  report.ceilingConstrained=report.loudnessLimitedFractionAfterStable>.01;
+  report.loudnessPass=report.targetReached||(report.ceilingConstrained&&report.outputIntegratedLufs<-21
+    &&report.outputIntegratedLufs>=report.feasibleFixedOutputLufs-1.5);
   report.stabilityPass=report.firstStableSeconds!==null
-    &&report.gain99Span<=.5+1e-6&&report.limitedFractionAfterStable<=.01;
-  report.pass=report.measurementPass&&report.loudnessPass&&report.stabilityPass;
+    &&report.programmeGainSpan<=.2+1e-6&&report.programmeGainAnchorDeviation<=.1+1e-6
+    &&report.limitedFractionAfterStable<=.01;
+  report.pass=report.measurementPass&&report.ceilingPass&&report.loudnessPass&&report.stabilityPass;
   reports.push(report);
   console.log(JSON.stringify({...report,trace:undefined}));
   if(traceEnabled)writeFileSync(join(resultsDir,fixture.id+'-gain-trace.jsonl'),
@@ -59,21 +70,25 @@ for(const fixture of selectedFixtures) {
 const summary={targetLufs:DEFAULT_REFERENCE_SETTINGS.targetLufs,allFixtures:fixtureIndex<0,generatedAt:new Date().toISOString(),
   reports:reports.map(({trace,...report})=>report)};
 const evaluated=summary.reports.filter(r=>r.included);
-summary.crossVideoUpper40SpreadLu=Math.max(...evaluated.map(r=>r.outputUpper40Lufs))
-  -Math.min(...evaluated.map(r=>r.outputUpper40Lufs));
-summary.pass=evaluated.every(r=>r.pass)&&summary.crossVideoUpper40SpreadLu<=3;
+summary.crossVideoIntegratedSpreadLu=Math.max(...evaluated.map(r=>r.outputIntegratedLufs))
+  -Math.min(...evaluated.map(r=>r.outputIntegratedLufs));
+const unconstrained=evaluated.filter(r=>!r.ceilingConstrained);
+summary.unconstrainedSpreadLu=unconstrained.length>1?Math.max(...unconstrained.map(r=>r.outputIntegratedLufs))
+  -Math.min(...unconstrained.map(r=>r.outputIntegratedLufs)):null;
+summary.pass=summary.reports.every(r=>r.ceilingPass)&&evaluated.every(r=>r.pass)
+  &&(summary.unconstrainedSpreadLu===null||summary.unconstrainedSpreadLu<=3);
 writeFileSync(join(resultsDir,'audio-benchmark.json'),JSON.stringify(summary,null,2)+'\n');
 writeFileSync(join(resultsDir,'audio-benchmark.md'),renderReport(summary));
-console.log('cross-video upper40 spread:',summary.crossVideoUpper40SpreadLu.toFixed(3),'LU; pass:',summary.pass);
+console.log('cross-video integrated spread:',summary.crossVideoIntegratedSpreadLu.toFixed(3),'LU; pass:',summary.pass);
 if(enforce&&!summary.pass)process.exitCode=1;
 
 function simulate(pcm) {
   const rate=48000,frames=pcm.length/2,chunk=4800;
   const inputMeter=new LoudnessMeter(rate,Infinity), outputMeter=new LoudnessMeter(rate,Infinity);
   const agc=new RealtimeAgc(),processor=new Processor({processorOptions:{}});
-  const inputWindows=[],outputWindows=[],trace=[],messages=[];
+  const trace=[],messages=[];
   processor.port.postMessage=m=>messages.push(m);
-  let gain=INITIAL_GAIN,firstStable=null,recalibrations=0,limited=false,limitedAfter=0,framesAfter=0;
+  let gain=INITIAL_GAIN,firstStable=null,anchor=null,limited=false,limitedAfter=0,loudnessLimitedAfter=0,framesAfter=0;
   for(let start=0;start<frames+rate*.5;start+=chunk) {
     const count=Math.min(chunk,Math.ceil(frames+rate*.5-start));
     const raw=[new Float32Array(count),new Float32Array(count)];
@@ -84,53 +99,54 @@ function simulate(pcm) {
     }
     const previousGain=gain;
     // Causal rendering: the current block uses the previous decision.
-    processor.process([gained,raw],[[new Float32Array(count),new Float32Array(count)]]);
+    for(let offset=0;offset<count;offset+=128) {
+      const end=Math.min(count,offset+128);
+      processor.process([gained.map(c=>c.subarray(offset,end)),raw.map(c=>c.subarray(offset,end))],
+        [[new Float32Array(end-offset),new Float32Array(end-offset)]],{loudnessCeilingLufs:Float32Array.of(-19)});
+    }
     for(const message of messages.splice(0)){
       outputMeter.processChannels(message.output);
-      outputWindows.push(outputMeter.getMomentaryLoudness());
       if(start<frames) {
         inputMeter.processChannels(message.original);
         const momentary=inputMeter.getMomentaryLoudness();
-        inputWindows.push(momentary);
         const decision=agc.update({
           currentGain:gain,minGain:.25,maxGain:2,deltaSec:.1,targetLufs:-21,
-          momentaryLufs:momentary,shortTermLufs:inputMeter.getShortTermLoudness(),gainChangePerSec:.2
+          integratedLufs:inputMeter.getIntegratedLoudness(),
+          momentaryLufs:momentary,gainChangePerSec:.2
         });
         gain=decision.nextGain;
-        recalibrations=decision.recalibrations;
         limited=decision.limited;
         const time=Math.min((start+count)/rate,frames/rate);
-        if(firstStable===null&&decision.phase==='stable')firstStable=time;
+        if(firstStable===null&&decision.phase==='stable'){firstStable=time;anchor=gain;}
         if(firstStable!==null) {
           limitedAfter+=message.limitedFrames??0;
+          loudnessLimitedAfter+=message.loudnessLimitedFrames??0;
           framesAfter+=message.frames??message.output[0].length;
         }
-        trace.push({time,inputMomentaryLufs:momentary,outputMomentaryLufs:outputMeter.getMomentaryLoudness(),gain:previousGain,effectiveGain:previousGain*(message.safetyGain??1),
-          referenceLufs:decision.referenceLufs,phase:decision.phase,recalibrations});
+        trace.push({time,inputMomentaryLufs:momentary,outputMomentaryLufs:outputMeter.getMomentaryLoudness(),gain:previousGain,effectiveGain:previousGain*(message.safetyGain??1)*(message.loudnessGain??1),
+          nextProgrammeGain:gain,referenceLufs:decision.referenceLufs,phase:decision.phase});
       }
     }
   }
   const gains=trace.filter(r=>firstStable!==null&&r.time>=firstStable).map(r=>r.effectiveGain).sort((a,b)=>a-b);
-  const outputUpper40Lufs=upper40(outputWindows);
+  // The stable decision applies to the next audio block. Include the anchor
+  // and every subsequent decision, never discard outliers or changed phases.
+  const programmeGains=trace.filter(r=>firstStable!==null&&r.time>=firstStable).map(r=>r.nextProgrammeGain).sort((a,b)=>a-b);
   return {
     durationSeconds:frames/rate,inputIntegratedLufs:inputMeter.getIntegratedLoudness(),
     outputIntegratedLufs:outputMeter.getIntegratedLoudness(),
-    inputUpper40Lufs:upper40(inputWindows),outputUpper40Lufs,outputTargetDiffLu:outputUpper40Lufs+21,
+    inputMaximumMomentaryLufs:inputMeter.getMaximumMomentaryLoudness(),inputMaximumShortTermLufs:inputMeter.getMaximumShortTermLoudness(),
+    outputMaximumMomentaryLufs:outputMeter.getMaximumMomentaryLoudness(),outputMaximumShortTermLufs:outputMeter.getMaximumShortTermLoudness(),
+    outputTargetDiffLu:outputMeter.getIntegratedLoudness()+21,
     firstStableSeconds:firstStable,gain99Span:gains.length?quantile(gains,.995)-quantile(gains,.005):null,
     totalGainSpan:gains.length?gains.at(-1)-gains[0]:null,
+    programmeGainAnchor:anchor,
+    programmeGainSpan:programmeGains.length?programmeGains.at(-1)-programmeGains[0]:null,
+    programmeGainAnchorDeviation:programmeGains.length?Math.max(Math.abs(programmeGains[0]-anchor),Math.abs(programmeGains.at(-1)-anchor)):null,
     limitedFractionAfterStable:framesAfter?limitedAfter/framesAfter:1,
-    finalGain:gain,boundLimited:limited,recalibrations,trace
+    loudnessLimitedFractionAfterStable:framesAfter?loudnessLimitedAfter/framesAfter:1,
+    finalGain:gain,boundLimited:limited,trace
   };
-}
-// Independent exact sorted-window reference, not the online histogram estimator.
-function upper40(windows) {
-  const energies=windows.filter(x=>Number.isFinite(x)&&x>-60)
-    .map(x=>Math.pow(10,(x+.691)/10)).sort((a,b)=>b-a);
-  const count=energies.length*.4;
-  if(!count)return NaN;
-  let remaining=count,total=0;
-  for(const energy of energies){const take=Math.min(1,remaining);total+=energy*take;remaining-=take;if(remaining<=1e-9)break;}
-  return -.691+10*Math.log10(total/count);
 }
 function quantile(sorted,p) {
   const index=(sorted.length-1)*p,lo=Math.floor(index),hi=Math.ceil(index);
@@ -138,13 +154,14 @@ function quantile(sorted,p) {
 }
 function renderReport(summary) {
   return '# Realtime programme normalization benchmark\n\n'
-    +'Target: -21 LUFS. Direct output upper-40% energy mean tolerance: ±1.5 LU. '
-    +'After first stable state, central 99% effective gain span ≤0.5x; clipping ≤1% of frames. '
-    +'Recalibrations remain included in stability statistics. No compressed-reference substitution.\n\n'
-    +'| Video | Output upper40 LUFS | Target error LU | Integrated LUFS | Stable at s | Gain 99% span x | Clipping fraction | Recalibrations | Result |\n'
-    +'|---|---:|---:|---:|---:|---:|---:|---:|---|\n'
-    +summary.reports.map(r=>'| '+[r.id,r.outputUpper40Lufs.toFixed(3),r.outputTargetDiffLu.toFixed(3),
-      r.outputIntegratedLufs.toFixed(3),r.firstStableSeconds,r.gain99Span?.toFixed(4),
-      r.limitedFractionAfterStable.toFixed(5),r.recalibrations,r.included?(r.pass?'PASS':'FAIL'):'Diagnostic'].join(' | ')+' |').join('\n')
-    +'\n\nCross-video upper40 spread: '+summary.crossVideoUpper40SpreadLu.toFixed(3)+' LU.\n';
+    +'Target: -21 LUFS; output maximum momentary/short-term ceiling: -19 LUFS. '
+    +'Ceiling-constrained averages may remain below target, but must beat the feasible fixed-gain reference within 1.5 LU startup tolerance. '
+    +'After first stable state, every programme gain stays within anchor ±0.1x and total span ≤0.2x; peak clipping ≤1% of frames. '
+    +'The effective span and all constrained target misses remain reported in JSON.\n\n'
+    +'| Video | Output integrated LUFS | Target error LU | Max momentary LUFS | Max short-term LUFS | Ceiling constrained | Programme gain span | Target reached | Result |\n'
+    +'|---|---:|---:|---:|---:|---|---:|---|---|\n'
+    +summary.reports.map(r=>'| '+[r.id,r.outputIntegratedLufs.toFixed(3),r.outputTargetDiffLu.toFixed(3),
+      r.outputMaximumMomentaryLufs.toFixed(3),r.outputMaximumShortTermLufs.toFixed(3),r.ceilingConstrained,
+      r.programmeGainSpan?.toFixed(4),r.targetReached,r.included?(r.pass?'PASS':'FAIL'):'Diagnostic'].join(' | ')+' |').join('\n')
+    +'\n\nCross-video integrated spread: '+summary.crossVideoIntegratedSpreadLu.toFixed(3)+' LU.\n';
 }

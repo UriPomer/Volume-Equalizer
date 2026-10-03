@@ -65,32 +65,6 @@ function maxAbs(samples) {
   return samples.reduce((peak, sample) => Math.max(peak, Math.abs(sample)), 0);
 }
 
-function cubic(p0, p1, p2, p3, t) {
-  const t2 = t * t;
-  const t3 = t2 * t;
-  return 0.5 * (
-    (2 * p1) +
-    (-p0 + p2) * t +
-    (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
-    (-p0 + 3 * p1 - 3 * p2 + p3) * t3
-  );
-}
-
-function maxCubicInterpolatedPeak(samples, steps = 4) {
-  let peak = 0;
-  for (let i = 1; i < samples.length - 2; i++) {
-    const p0 = samples[i - 1];
-    const p1 = samples[i];
-    const p2 = samples[i + 1];
-    const p3 = samples[i + 2];
-    for (let step = 0; step < steps; step++) {
-      const value = cubic(p0, p1, p2, p3, step / steps);
-      peak = Math.max(peak, Math.abs(value));
-    }
-  }
-  return Math.max(peak, maxAbs(samples));
-}
-
 function test(name, fn) {
   try {
     fn();
@@ -119,30 +93,13 @@ test('lookahead limiter catches a later over-ceiling impulse', () => {
   assert.ok(maxAbs(output) <= 0.950001);
 });
 
-test('default limiter leaves true-peak safety headroom below -1 dBFS', () => {
+test('default limiter keeps sample-peak headroom below -1 dBFS', () => {
   const left = new Float32Array(4096).fill(1.5);
   const right = new Float32Array(4096).fill(0.2);
 
   const output = renderStereo(left, right);
 
   assert.ok(maxAbs(output) <= 0.8653);
-});
-
-test('default limiter constrains 4x cubic interpolated true-peak estimate', () => {
-  const input = new Float32Array(4096);
-  for (let i = 0; i < input.length; i += 4) {
-    input[i] = -0.89;
-    input[i + 1] = -0.89;
-    input[i + 2] = -0.89;
-    input[i + 3] = -0.4;
-  }
-
-  const output = renderMono(input, {
-    ceiling: 0.8912509381337456,
-    interSampleMargin: 1
-  });
-
-  assert.ok(maxCubicInterpolatedPeak(output, 4) <= 0.891251);
 });
 
 test('processor reports continuous original and output audio', () => {

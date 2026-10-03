@@ -8,6 +8,7 @@
     "pack": "vite build && node pack.js",
     "test:unit": "node scripts/run-unit-tests.mjs",
     "test:browser": "npm run build && node scripts/test-browser-audio.mjs",
+    "test:realtime": "npm run build && node scripts/test-realtime-browser.mjs",
     "test:audio:download": "node scripts/download-audio-fixtures.mjs",
     "test:audio:benchmark": "node scripts/audio-benchmark.mjs",
     "test:audio:enforce": "node scripts/audio-benchmark.mjs --enforce",

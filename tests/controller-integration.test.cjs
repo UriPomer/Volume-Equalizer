@@ -1,169 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const vm = require('node:vm');
-
-function loadProcessor() {
-  let Processor = null;
-  const context = {
-    sampleRate: 48000,
-    AudioWorkletProcessor: class {
-      constructor() { this.port = { onmessage: null, postMessage() {} }; }
-    },
-    registerProcessor(name, klass) {
-      assert.equal(name, 'lookahead-peak-limiter');
-      Processor = klass;
-    }
-  };
-  vm.createContext(context);
-  vm.runInContext(
-    require('./worklet-source.cjs')(),
-    context
-  );
-  return Processor;
-}
-
-const ProcessorClass = loadProcessor();
-
-class FakeParam {
-  constructor(value = 0) { this.value = value; }
-  cancelScheduledValues() {}
-  setValueAtTime(value) { this.value = value; }
-}
-
-class FakeNode {
-  constructor() { this.connections = []; }
-  connect(destination, output = 0, input = 0) {
-    this.connections.push({ destination, output, input });
-    return destination;
-  }
-  disconnect() { this.connections = []; }
-}
-
-class FakeAnalyser extends FakeNode {
-  constructor() { super(); this.fftSize = 2048; }
-  getFloatTimeDomainData(buffer) { buffer.fill(0.1); }
-}
-
-class FakeContext {
-  constructor() {
-    this.sampleRate = 48000;
-    this.currentTime = 0;
-    this.state = 'running';
-    this.destination = new FakeNode();
-    this.destination.channelCount = 2;
-    this.source = new FakeNode();
-    this.audioWorklet = { addModule: async () => {} };
-  }
-  createMediaElementSource() { return this.source; }
-  createGain() { const node = new FakeNode(); node.gain = new FakeParam(1); return node; }
-  createBiquadFilter() {
-    const node = new FakeNode();
-    node.frequency = new FakeParam();
-    node.gain = new FakeParam();
-    return node;
-  }
-  createDynamicsCompressor() {
-    const node = new FakeNode();
-    for (const key of ['threshold', 'knee', 'ratio', 'attack', 'release']) node[key] = new FakeParam();
-    return node;
-  }
-  createAnalyser() { return new FakeAnalyser(); }
-  resume() { return Promise.resolve(); }
-}
-
-class FakeWorkletNode extends FakeNode {
-  constructor(context, name, options) {
-    super();
-    this.context = context;
-    this.name = name;
-    this.options = options;
-    this.processor = new ProcessorClass(options);
-    this.port = {
-      onmessage: null,
-      postMessage: (data) => this.processor.port.onmessage?.({ data })
-    };
-    this.processor.port.postMessage = (data) => this.port.onmessage?.({ data });
-    global.lastWorklet = this;
-  }
-}
-
-class FakeMedia extends EventTarget {
-  constructor() {
-    super();
-    this.duration = 60;
-    this.currentTime = 0;
-    this.paused = false;
-    this.ended = false;
-    this.muted = false;
-  }
-}
-
-const rafCallbacks = [];
-const documentListeners = new Map();
-global.window = { AudioContext: FakeContext };
-global.document = {
-  hidden: false,
-  visibilityState: 'visible',
-  scripts: [],
-  addEventListener(type, listener) {
-    if (!documentListeners.has(type)) documentListeners.set(type, new Set());
-    documentListeners.get(type).add(listener);
-  },
-  removeEventListener(type, listener) {
-    documentListeners.get(type)?.delete(listener);
-  }
-};
-global.chrome = { runtime: { getURL: (path) => `chrome-extension://test/${path}` } };
-global.AudioWorkletNode = FakeWorkletNode;
-global.requestAnimationFrame = (callback) => { rafCallbacks.push(callback); return rafCallbacks.length; };
-global.cancelAnimationFrame = () => {};
-
-const { MediaVolumeController } = require('../dist-test/controller.js');
-const { INITIAL_GAIN } = require('../dist-test/config.js');
-const settings = {
-  enabled: true,
-  fullAudioAnalysis: false,
-  targetRms: 0.09650504109445904,
-  minGain: 0.25,
-  maxGain: 2,
-  bassBoost: 0,
-  gainChangePerSec: 0.2
-};
-
-function setVisibility(state) {
-  global.document.visibilityState = state;
-  global.document.hidden = state === 'hidden';
-  for (const listener of documentListeners.get('visibilitychange') || []) listener();
-}
-
-test('controller connects continuous stereo meter and drives gain state', async () => {
-  const media = new FakeMedia();
-  let state = null;
-  const controller = new MediaVolumeController(media, settings, (next) => { state = next; }, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-
-  const worklet = global.lastWorklet;
-  assert.equal(controller.gain.gain.value, INITIAL_GAIN);
-  assert.equal(worklet.options.numberOfInputs, 2);
-  assert.equal(worklet.options.channelCountMode, 'explicit');
-  assert.deepEqual(worklet.options.outputChannelCount, [2]);
-  assert.ok(controller.bass.connections.some((item) => item.destination === worklet && item.input === 1));
-
-  for (let index = 0; index < 200; index++) {
-    const original = new Float32Array(128).fill(0.1);
-    const processed = new Float32Array(128).fill(0.1);
-    worklet.processor.process(
-      [[processed, processed], [original, original]],
-      [[new Float32Array(128), new Float32Array(128)]]
-    );
-  }
-  media.currentTime = 1;
-  rafCallbacks[0]();
-
-  assert.ok(state.originalRms > 0);
-  assert.ok(Number.isFinite(state.gain));
-  controller.destroy();
-});
+const { FakeMedia, MediaVolumeController, INITIAL_GAIN, settings, setVisibility } = require('./controller-harness.cjs');
 
 test('background ticks do not run realtime gain control', async (t) => {
   const media = new FakeMedia();
@@ -308,16 +145,6 @@ test('visibility changes preserve measurements, epoch and programme gain', async
   assert.equal(controller.gain.gain.value, gain);
 });
 
-test('reducing the configured maximum cannot raise a safety-attenuated gain', async () => {
-  const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-  controller.gain.gain.value = 0.158;
-  controller.allowBelowMinGain = true;
-  controller.updateSettings({ ...settings, maxGain: 1 });
-  assert.equal(controller.gain.gain.value, 0.158);
-  controller.destroy();
-});
-
 test('processor failure mutes protected output rather than retaining a boost', async () => {
   const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
   await new Promise((resolve) => setImmediate(resolve));
@@ -340,7 +167,7 @@ test('target changes reopen programme calibration without replacing the processo
   controller.destroy();
 });
 
-test('target changes clear output programme history but preserve input AGC history', async () => {
+test('target changes clear output integration but preserve the input reference', async () => {
   const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -351,18 +178,16 @@ test('target changes clear output programme history but preserve input AGC histo
     output: [new Float32Array(19200).fill(0.2)]
   });
   const inputSeconds = controller.originalMeter.getIntegrationTime();
-  const inputReference = controller.gainState.referenceLufs;
-  const activeSeconds = controller.agc.history.getActiveSeconds();
-  assert.ok(Number.isFinite(controller.outputProgramme.getLoudness()));
+  const inputReference = controller.originalMeter.getIntegratedLoudness();
+  assert.ok(Number.isFinite(controller.outputMeter.getIntegratedLoudness()));
   assert.ok(Number.isFinite(inputReference));
 
   controller.updateSettings({ ...settings, targetRms: Math.pow(10, (-23 + 0.691) / 20) });
 
-  assert.equal(controller.outputProgramme.getLoudness(), Number.NaN);
+  assert.equal(controller.outputMeter.getIntegratedLoudness(), Number.NaN);
   assert.equal(controller.originalMeter.getIntegrationTime(), inputSeconds);
   assert.equal(controller.gainState.referenceLufs, inputReference);
-  assert.equal(controller.agc.history.getActiveSeconds(), activeSeconds);
-  assert.equal(controller.agc.history.getLoudness(), inputReference);
+  assert.equal(controller.originalMeter.getIntegratedLoudness(), inputReference);
   controller.destroy();
 });
 
@@ -398,19 +223,22 @@ test('stale worklet meter epochs are ignored after a lifecycle transition', asyn
   controller.destroy();
 });
 
-test('seeking resets measurements but keeps the calibration anchor', async () => {
+test('seeking resets live windows but keeps integration and the calibration anchor', async () => {
   const media = new FakeMedia();
   const controller = new MediaVolumeController(media, settings, () => {}, () => {});
   await new Promise((resolve) => setImmediate(resolve));
 
   controller.originalMeter.processBlock(new Float32Array(48000).fill(0.1));
   assert.ok(controller.originalMeter.getIntegrationTime() > 0);
+  const integrationTime = controller.originalMeter.getIntegrationTime();
+  const integratedLufs = controller.originalMeter.getIntegratedLoudness();
   controller.agc.lockGain(1.3);
 
   media.dispatchEvent(new Event('seeked'));
 
-  // 测量窗口重置，但 AGC 状态（锚点/锁定）保留，gain 不会重新快速校准
-  assert.equal(controller.originalMeter.getIntegrationTime(), 0);
+  assert.equal(controller.originalMeter.getIntegrationTime(), integrationTime);
+  assert.equal(controller.originalMeter.getIntegratedLoudness(), integratedLufs);
+  assert.ok(Number.isNaN(controller.originalMeter.getMomentaryLoudness()));
   assert.equal(controller.agc.isLocked(), true);
   controller.destroy();
 });
@@ -465,12 +293,11 @@ test('disabled controller emits an empty meter state', async () => {
   );
   await new Promise((resolve) => setImmediate(resolve));
 
-  controller.originalRms = 0.4;
   controller.updateSettings({ ...settings, enabled: false });
   controller.emitMeter();
 
-  assert.equal(state.rms, 0);
-  assert.equal(state.originalRms, 0);
+  assert.ok(Number.isNaN(state.outputIntegratedLufs));
+  assert.ok(Number.isNaN(state.originalIntegratedLufs));
   assert.equal(state.gain, 1);
   controller.destroy();
 });

@@ -13,9 +13,8 @@ export class LoudnessMeter {
   private readonly momentaryFrameEnergies: Float64Array;
   private readonly momentaryInvalidFrames: Uint8Array;
   private filters: KWeighting[] = [];
-  private buffers: Float64Array[] = [];
-  private shortTermBuffers: Float64Array[] = [];
-  private shortTermInvalidFrames: Uint8Array;
+  private readonly shortTermFrameEnergies: Float64Array;
+  private readonly shortTermInvalidFrames: Uint8Array;
   private blocks: number[] = [];
   private bufferIndex = 0;
   private processedFrames = 0;
@@ -28,6 +27,8 @@ export class LoudnessMeter {
   private shortTermFrameCount = 0;
   private shortTermEnergy = 0;
   private shortTermInvalidFrameCount = 0;
+  private maximumMomentaryEnergy: number | null = null;
+  private maximumShortTermEnergy: number | null = null;
 
   constructor(
     private readonly sampleRate = 48000,
@@ -39,6 +40,7 @@ export class LoudnessMeter {
     this.momentaryFrameEnergies = new Float64Array(this.samplesPerBlock);
     this.momentaryInvalidFrames = new Uint8Array(this.samplesPerBlock);
     this.shortTermInvalidFrames = new Uint8Array(this.shortTermSamples);
+    this.shortTermFrameEnergies = new Float64Array(this.shortTermSamples);
     this.maxBlocks = Number.isFinite(maxIntegrationSeconds)
       ? Math.ceil(maxIntegrationSeconds / STEP_SECONDS)
       : Number.POSITIVE_INFINITY;
@@ -65,15 +67,18 @@ export class LoudnessMeter {
         const valid = Number.isFinite(input);
         frameInvalid ||= !valid;
         const sample = this.filters[channel].process(valid ? input : 0);
-        this.buffers[channel][this.bufferIndex] = sample;
         frameEnergy += channelWeight(channel, channels.length) * sample ** 2;
-        this.addShortTermSample(channel, sample, channels.length);
       }
       this.addMomentarySample(frameEnergy, frameInvalid);
-      this.addShortTermValidity(frameInvalid);
+      this.addShortTermSample(frameEnergy, frameInvalid);
       this.bufferIndex++;
-      this.advanceShortTermWindow();
-      if (this.bufferIndex === this.samplesPerBlock) this.commitBlock(channels.length);
+      if (this.momentaryFrameCount === this.samplesPerBlock && this.momentaryInvalidFrameCount === 0) {
+        this.maximumMomentaryEnergy = Math.max(this.maximumMomentaryEnergy ?? 0, this.momentaryEnergySum / this.samplesPerBlock);
+      }
+      if (this.shortTermFrameCount === this.shortTermSamples && this.shortTermInvalidFrameCount === 0) {
+        this.maximumShortTermEnergy = Math.max(this.maximumShortTermEnergy ?? 0, this.shortTermEnergy / this.shortTermSamples);
+      }
+      if (this.bufferIndex === this.samplesPerBlock) this.commitBlock();
     }
   }
 
@@ -100,50 +105,54 @@ export class LoudnessMeter {
     return this.processedFrames / this.sampleRate;
   }
 
-  reset(): void {
-    this.blocks = [];
+  getMaximumMomentaryLoudness(): number {
+    return this.maximumMomentaryEnergy === null ? NaN : toLufs(this.maximumMomentaryEnergy);
+  }
+
+  getMaximumShortTermLoudness(): number {
+    return this.maximumShortTermEnergy === null ? NaN : toLufs(this.maximumShortTermEnergy);
+  }
+
+  reset({ preserveIntegrated = false } = {}): void {
+    if (!preserveIntegrated) {
+      this.blocks = [];
+      this.processedFrames = 0;
+      this.maximumMomentaryEnergy = this.maximumShortTermEnergy = null;
+    }
     this.bufferIndex = 0;
-    this.processedFrames = 0;
     this.momentaryIndex = this.momentaryFrameCount = this.momentaryInvalidFrameCount = 0;
     this.momentaryEnergySum = 0;
     this.shortTermIndex = 0;
     this.shortTermFrameCount = 0;
     this.shortTermEnergy = 0;
     this.shortTermInvalidFrameCount = 0;
-    this.buffers.forEach((buffer) => buffer.fill(0));
     this.momentaryFrameEnergies.fill(0);
     this.momentaryInvalidFrames.fill(0);
-    this.shortTermBuffers.forEach((buffer) => buffer.fill(0));
+    this.shortTermFrameEnergies.fill(0);
     this.shortTermInvalidFrames.fill(0);
     this.filters.forEach((filter) => filter.reset());
   }
 
-  private commitBlock(channelCount: number): void {
+  private commitBlock(): void {
     const energy = this.momentaryEnergySum / this.samplesPerBlock;
     const valid = this.momentaryInvalidFrameCount === 0;
     if (valid && toLufs(energy) >= ABSOLUTE_GATE_LUFS) {
       this.blocks.push(energy);
       if (this.blocks.length > this.maxBlocks) this.blocks.shift();
     }
-    for (let channel = 0; channel < channelCount; channel++) {
-      this.buffers[channel].copyWithin(0, this.stepSamples);
-    }
     this.bufferIndex = this.samplesPerBlock - this.stepSamples;
   }
 
-  private addShortTermSample(channel: number, sample: number, channelCount: number): void {
-    const buffer = this.shortTermBuffers[channel];
-    const oldEnergy = buffer[this.shortTermIndex];
-    const newEnergy = sample * sample;
-    buffer[this.shortTermIndex] = newEnergy;
-    this.shortTermEnergy += channelWeight(channel, channelCount) * (newEnergy - oldEnergy);
-  }
-
-  private addShortTermValidity(invalid: boolean): void {
+  private addShortTermSample(energy: number, invalid: boolean): void {
+    const oldEnergy = this.shortTermFrameEnergies[this.shortTermIndex];
+    this.shortTermFrameEnergies[this.shortTermIndex] = energy;
+    this.shortTermEnergy += energy - oldEnergy;
     const oldInvalid = this.shortTermInvalidFrames[this.shortTermIndex];
     const nextInvalid = invalid ? 1 : 0;
     this.shortTermInvalidFrames[this.shortTermIndex] = nextInvalid;
     this.shortTermInvalidFrameCount += nextInvalid - oldInvalid;
+    if (this.shortTermFrameCount < this.shortTermSamples) this.shortTermFrameCount++;
+    this.shortTermIndex = (this.shortTermIndex + 1) % this.shortTermSamples;
   }
 
   private addMomentarySample(energy: number, invalid: boolean): void {
@@ -158,28 +167,10 @@ export class LoudnessMeter {
     this.momentaryIndex = (this.momentaryIndex + 1) % this.samplesPerBlock;
   }
 
-  private advanceShortTermWindow(): void {
-    if (this.shortTermFrameCount < this.shortTermSamples) this.shortTermFrameCount++;
-    this.shortTermIndex = (this.shortTermIndex + 1) % this.shortTermSamples;
-  }
-
   private replaceChannelLayout(count: number): void {
     this.channelCount = count;
     this.filters = Array.from({ length: count }, () => new KWeighting(this.sampleRate));
-    this.buffers = Array.from({ length: count }, () => new Float64Array(this.samplesPerBlock));
-    this.shortTermBuffers = Array.from({ length: count }, () => new Float64Array(this.shortTermSamples));
-    this.blocks = [];
-    this.bufferIndex = 0;
-    this.processedFrames = 0;
-    this.momentaryIndex = this.momentaryFrameCount = this.momentaryInvalidFrameCount = 0;
-    this.momentaryEnergySum = 0;
-    this.momentaryFrameEnergies.fill(0);
-    this.momentaryInvalidFrames.fill(0);
-    this.shortTermIndex = 0;
-    this.shortTermFrameCount = 0;
-    this.shortTermEnergy = 0;
-    this.shortTermInvalidFrameCount = 0;
-    this.shortTermInvalidFrames.fill(0);
+    this.reset();
   }
 }
 

@@ -64,7 +64,7 @@ function panelHtml(settings: Settings): string {
       <header><strong>音量均衡</strong><button data-action="enabled"></button></header>
       <hr>
       <label class="mode">完整音轨预分析<button data-action="fullAudioAnalysis"></button></label>
-      ${slider('targetLufs', '目标响度', -23, -10, .5, target)}
+      ${slider('targetLufs', '目标积分响度', -23, -10, .5, target)}
       ${slider('maxGain', '增益上限', 1, 3, .1, settings.maxGain)}
       ${slider('minGain', '增益下限', .2, 1, .05, settings.minGain)}
       ${slider('bassBoost', '低频增益', -6, 6, .5, settings.bassBoost)}
@@ -74,11 +74,12 @@ function panelHtml(settings: Settings): string {
         ${meterRow('积分', 'originalIntegrated', ' LUFS')} ${meterRow('瞬时', 'original', ' LUFS')}
         <small>输出</small>
         ${meterRow('积分', 'outputIntegrated', ' LUFS')} ${meterRow('瞬时', 'output', ' LUFS')}
+        ${meterRow('最大瞬时 · 400ms', 'maximumMomentary')}
+        ${meterRow('最大短时 · 3s', 'maximumShortTerm')}
         ${meterRow('增益', 'gain')} ${meterRow('算法', 'status')}
-        ${meterRow('响段均值 · 输入', 'programme')}
-        ${meterRow('响段均值 · 输出', 'outputProgramme')}
         ${meterRow('调节状态', 'phase')}
         ${meterRow('削波保护', 'safety')}
+        ${meterRow('响度保护', 'loudnessSafety')}
       </div>
     </section>
   </div>`;
@@ -172,11 +173,12 @@ function updateMeter(shadow: ShadowRoot, getMeter: () => MeterState): void {
     setText(shadow, '[data-meter="originalIntegrated"]', `${showMomentary(meter.originalIntegratedLufs)} · ${meter.sampleCount}s`);
     setText(shadow, '[data-meter="output"]', showMomentary(meter.momentaryLufs));
     setText(shadow, '[data-meter="safety"]', `${meter.safetyGain.toFixed(2)}x`);
+    setText(shadow, '[data-meter="loudnessSafety"]', `${meter.loudnessGain.toFixed(2)}x`);
+    setText(shadow, '[data-meter="maximumMomentary"]', showMomentary(meter.maximumMomentaryLufs));
+    setText(shadow, '[data-meter="maximumShortTerm"]', showMomentary(meter.maximumShortTermLufs));
     setText(shadow, '[data-meter="outputIntegrated"]', showMomentary(meter.outputIntegratedLufs));
-    setText(shadow, '[data-meter="programme"]', showMomentary(meter.programmeLufs));
-    setText(shadow, '[data-meter="outputProgramme"]', showMomentary(meter.outputProgrammeLufs));
-    const phases = { collecting: '收集有效声音', calibrating: '平滑校准', stable: '已稳定', recalibrating: '响段重校准', 'full-track': '完整音轨' };
-    setText(shadow, '[data-meter="phase"]', `${phases[meter.phase]}${meter.gainLimited ? ' · 达到倍率限制' : ''}${meter.recalibrations ? ' · 已重校准1次' : ''}`);
+    const phases = { collecting: '收集有效声音', calibrating: '平滑校准', stable: '已稳定', 'full-track': '完整音轨' };
+    setText(shadow, '[data-meter="phase"]', `${meter.loudnessGain < .999 ? '响度上限限制' : phases[meter.phase]}${meter.gainLimited ? ' · 达到倍率限制' : ''}`);
     setText(shadow, '[data-meter="gain"]', `${meter.gain.toFixed(2)}x`);
     setText(shadow, '[data-meter="status"]', STATUS_TEXT[meter.analysisStatus]);
   }, 100);
