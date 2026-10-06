@@ -8,6 +8,19 @@ const AudioContextClass = window.AudioContext || (window as any).webkitAudioCont
 
 let audioCtx: AudioContext | null = null;
 const mediaSources = new WeakMap<HTMLMediaElement, MediaElementAudioSourceNode>();
+const workletModules = new WeakMap<BaseAudioContext, Promise<void>>();
+
+export function loadAudioWorklets(context: BaseAudioContext): Promise<void> {
+  let promise = workletModules.get(context);
+  if (!promise) {
+    promise = context.audioWorklet.addModule(chrome.runtime.getURL('limiter-worklet.js')).catch(error => {
+      workletModules.delete(context);
+      throw error;
+    });
+    workletModules.set(context, promise);
+  }
+  return promise;
+}
 
 /**
  * 获取或创建全局 AudioContext
@@ -44,6 +57,16 @@ export function createAudioProcessor(context: BaseAudioContext, targetLufs = -21
       lookaheadMs: 15, releaseMs: 50,
       ceiling: 0.8912509381337456, interSampleMargin: 1.03
     }
+  });
+}
+
+/** Per-media measurement only; safety belongs to the shared mixed output. */
+export function createMediaMeter(context: BaseAudioContext): AudioWorkletNode {
+  return new AudioWorkletNode(context, 'media-input-meter', {
+    numberOfInputs: 2, numberOfOutputs: 1,
+    outputChannelCount: [context.destination.channelCount],
+    channelCount: context.destination.channelCount,
+    channelCountMode: 'explicit', channelInterpretation: 'speakers'
   });
 }
 

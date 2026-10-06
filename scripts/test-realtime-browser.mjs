@@ -8,6 +8,8 @@ import { join, resolve } from 'node:path';
 import { openBrowser } from './browser-session.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { measureWithFfmpeg } from './offline-loudness-reference.mjs';
+import { captureBootstrap, captureProcessor } from './browser-audio-capture.mjs';
+import { denseMaxima, ffmpegMaxima, writeFloatWav } from './audio-test-artifacts.mjs';
 
 // Real media -> built content script -> AudioWorklet -> controller -> panel.
 // Only chrome.storage and extension URL resolution are adapted to localhost.
@@ -20,10 +22,10 @@ const content = readFileSync(resolve('dist/content.js'));
 const worklet = readFileSync(resolve('dist/limiter-worklet.js'));
 const rate = 48000;
 const fixture = join(artifacts, 'mixed.wav');
-function writeTone(file, seconds, amplitude) {
+function writeTone(file, seconds, amplitude, frequency = 1000) {
   const pcm = Buffer.alloc(seconds * rate * 4);
   for (let i = 0; i < seconds * rate; i++) {
-    const value = Math.round(32767 * amplitude(i / rate) * Math.sin(2 * Math.PI * 1000 * i / rate));
+    const value = Math.round(32767 * amplitude(i / rate) * Math.sin(2 * Math.PI * frequency * i / rate));
     pcm.writeInt16LE(value, i * 4);
     pcm.writeInt16LE(value, i * 4 + 2);
   }
@@ -43,6 +45,9 @@ writeTone(join(artifacts, 'silence.wav'), 15, () => 0);
 writeTone(join(artifacts, 'quiet.wav'), 30, () => .016);
 writeTone(join(artifacts, 'loud.wav'), 15, () => .35);
 writeTone(join(artifacts, 'stability.wav'), 75, t => t < 18 ? .12 : t < 38 ? .075 : .35);
+writeTone(join(artifacts, 'periodic.wav'), 70, t => t % 3 < .6 ? .16 : .16 * Math.pow(10, -12 / 20));
+writeTone(join(artifacts, 'multiple.wav'), 20, () => .65);
+writeTone(join(artifacts, 'second.wav'), 20, () => .65, 1301);
 const reference = measureWithFfmpeg(fixture);
 const commit = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
 const report = { command: 'npm run test:realtime', commit, generatedAt: new Date().toISOString(),
@@ -54,6 +59,7 @@ const report = { command: 'npm run test:realtime', commit, generatedAt: new Date
 const page = `<!doctype html><meta charset="utf-8"><style>body{background:#17202b;color:white;font:18px system-ui}</style>
 <h1>Realtime integrated loudness regression</h1><audio controls></audio>
 <script>
+${captureBootstrap}
 const stored={targetRms:Math.pow(10,(-17.5+.691)/20)};
 window.mediaEvents=[];
 window.programmeGains=[];
@@ -74,12 +80,20 @@ window.chrome={runtime:{getURL:path=>'/'+path},storage:{local:{
   set:(settings,callback)=>{Object.assign(stored,settings);callback();}
 },onChanged:{addListener(){},removeListener(){}}}};
 </script><script src="/content.js"></script>`;
-const server = createServer((req, res) => {
+const recorded = [];
+const server = createServer(async (req, res) => {
   const name = req.url?.slice(1);
-  if (name === 'content.js' || name === 'limiter-worklet.js') {
+  if (req.method === 'POST' && name === 'recording') {
+    const chunks=[];
+    for await (const chunk of req) chunks.push(chunk);
+    recorded.push({sequence:Number(req.headers['x-audio-sequence']),bytes:Buffer.concat(chunks)});
+    res.end('ok');
+  } else if (name === 'capture.js') {
+    res.setHeader('Content-Type', 'text/javascript'); res.end(captureProcessor);
+  } else if (name === 'content.js' || name === 'limiter-worklet.js') {
     res.setHeader('Content-Type', 'text/javascript');
     res.end(name === 'content.js' ? content : worklet);
-  } else if (['mixed.wav', 'silence.wav', 'quiet.wav', 'loud.wav', 'stability.wav'].includes(name)) {
+  } else if (['mixed.wav', 'silence.wav', 'quiet.wav', 'loud.wav', 'stability.wav', 'periodic.wav', 'multiple.wav', 'second.wav'].includes(name)) {
     const data = readFileSync(join(artifacts, name));
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Content-Length', data.length);
@@ -189,6 +203,20 @@ try {
   assert.ok(report.stability.span <= .2 + 1e-6, 'Whole stable programme gain span must be <=0.2x');
   assert.ok(report.stability.maximumDeviation <= .1 + 1e-6, 'Programme gain must stay within first anchor +/-0.1x, including after seek');
   await screenshot('stable-gain');
+  await setSlider('targetLufs', -21);
+  const periodicTraceStart = report.trace.length;
+  await playFixture('periodic.wav');
+  await observe(60);
+  // A source change can occur between UI animation frames. Exclude the old
+  // video's last rendered status; this profile needs >=10 s for calibration.
+  const periodic = report.trace.slice(periodicTraceStart), firstPeriodicStable = periodic.find(row => row.time >= 10 && row.phase === '已稳定');
+  assert.ok(firstPeriodicStable && firstPeriodicStable.time <= 25, 'Periodic high dynamics must finish calibration');
+  const periodicDecisions = await evaluate(`window.programmeGains.filter(row=>row.fixture==='periodic.wav'&&row.mediaTime>=${firstPeriodicStable?.time ?? 0})`);
+  const periodicValues = periodicDecisions.map(row => row.value);
+  report.periodic = {firstStableSeconds:firstPeriodicStable.time, min:Math.min(...periodicValues),max:Math.max(...periodicValues),decisions:periodicDecisions};
+  assert.ok(report.periodic.max-report.periodic.min<=.2+1e-6, 'Periodic input must obey the complete stable gain span');
+  await checkpoint('periodic-high-dynamics-stable');
+  await setSlider('targetLufs', -17.5);
   const mixedTraceStart = report.trace.length;
   await playFixture('mixed.wav');
   await observe(32);
@@ -237,7 +265,47 @@ try {
   assert.ok(ceiling.gain > 0 && ceiling.gain < 1 && ceiling.loudnessProtection < 1, 'Ceiling must override the configured 1x gain floor');
   assert.ok(ceiling.maximumMomentary <= -15.5 && ceiling.maximumShortTerm <= -15.5, 'Gain floor must not bypass target +2 LU');
   assert.ok(ceiling.output >= -17.5, 'Ceiling must retain useful audio when the floor prevents normalization');
-  await evaluate(`document.querySelector('audio').remove()`);
+  const captureRate = await evaluate('window.startAudioCapture()');
+  await playFixture('multiple.wav');
+  const secondLoad = await evaluate(`(async()=>{const media=document.createElement('audio');media.id='second-media';document.body.append(media);const bytes=await(await fetch('/second.wav')).arrayBuffer();const sha256=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),v=>v.toString(16).padStart(2,'0')).join('');media.src=URL.createObjectURL(new Blob([bytes],{type:'audio/wav'}));await media.play();return {file:'second.wav',bytes:bytes.byteLength,sha256};})()`);
+  report.inputLoads.push(secondLoad);
+  assert.equal(secondLoad.sha256,createHash('sha256').update(readFileSync(join(artifacts,'second.wav'))).digest('hex'));
+  await observe(8);
+  assert.ok(await evaluate(`document.getElementById('second-media').currentTime>7&&!document.getElementById('second-media').paused`), 'Both native media elements must actually play');
+  await evaluate('window.stopAudioCapture()');
+  assert.equal(await evaluate('window.captureState.sources.size'),1,'All protected media must share one destination guard');
+  const bytes = Buffer.concat(recorded.sort((a,b)=>a.sequence-b.sequence).map(row=>row.bytes)), pcm = new Float32Array(bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.length));
+  const recordingFile = join(artifacts,'two-media-output.wav');
+  writeFloatWav(recordingFile,pcm,captureRate,2);
+  const independent = ffmpegMaxima(recordingFile), dense = denseMaxima(pcm,captureRate,2);
+  report.multipleMedia = {file:recordingFile,independent,dense};
+  assert.ok(pcm.length>captureRate*2*7, 'Record more than seven seconds of real destination PCM');
+  assert.ok(independent.momentary<=-15.5+.05&&independent.shortTerm<=-15.5+.05, 'Mixed destination must honor target +2 LU');
+  assert.ok(dense.peak<=.891251&&independent.truePeak<=1, 'Mixed destination must not bypass peak protection');
+  assert.ok(dense.rms>1e-3&&independent.momentary>=-16.5, 'Mixed destination must retain useful audio');
+  await screenshot('two-media');
+  await setSlider('targetLufs',-21);
+  await observe(1);
+  recorded.length=0;
+  await evaluate('window.startAudioCapture()');
+  await observe(4);
+  await evaluate(`(()=>{const media=document.getElementById('second-media');media.pause();URL.revokeObjectURL(media.src);media.remove();})()`);
+  await observe(4);
+  await evaluate('window.stopAudioCapture()');
+  const lifecycleBytes=Buffer.concat(recorded.sort((a,b)=>a.sequence-b.sequence).map(row=>row.bytes));
+  const lifecyclePcm=new Float32Array(lifecycleBytes.buffer.slice(lifecycleBytes.byteOffset,lifecycleBytes.byteOffset+lifecycleBytes.length));
+  const lifecycleFile=join(artifacts,'mixed-target-change-and-removal.wav');
+  writeFloatWav(lifecycleFile,lifecyclePcm,captureRate,2);
+  const lifecycleReference=ffmpegMaxima(lifecycleFile);
+  // Independently measure the final three seconds after the second media is gone.
+  const remainingFile=join(artifacts,'remaining-media-output.wav');
+  writeFloatWav(remainingFile,lifecyclePcm.slice(-captureRate*2*3),captureRate,2);
+  const remainingReference=ffmpegMaxima(remainingFile);
+  report.mixedLifecycle={file:lifecycleFile,independent:lifecycleReference,remainingFile,remainingReference};
+  assert.ok(lifecycleReference.momentary<=-19+.05&&lifecycleReference.shortTerm<=-19+.05,'Target changes must reach the shared guard with multiple media');
+  assert.ok(remainingReference.momentary>-20&&remainingReference.truePeak<=1,'Removing one media must leave the other audible and protected');
+  assert.equal(await evaluate('window.captureState.sources.size'),1,'Removing one media must retain the shared output');
+  await evaluate(`document.querySelectorAll('audio').forEach(media=>media.remove())`);
   for (let i = 0; i < 50; i++) {
     if (await evaluate(`document.getElementById('universal-volume-eq-panel').style.display==='none'`)) break;
     await delay(100);

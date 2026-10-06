@@ -129,7 +129,7 @@ test('visibility changes preserve measurements, epoch and programme gain', async
   });
   await new Promise((resolve) => setImmediate(resolve));
 
-  const processor = global.lastWorklet.processor;
+  const processor = (global.lastMeter ?? global.lastWorklet).processor;
   for (let start = 0; start < 48000; start += 128) {
     const tone = Float32Array.from({ length: 128 }, (_, i) =>
       .8 * Math.sin(2 * Math.PI * 1000 * (start + i) / 48000));
@@ -179,12 +179,17 @@ test('target changes clear output integration but preserve the input reference',
   });
   const inputSeconds = controller.originalMeter.getIntegrationTime();
   const inputReference = controller.originalMeter.getIntegratedLoudness();
-  assert.ok(Number.isFinite(controller.outputMeter.getIntegratedLoudness()));
+  const processor = global.lastWorklet.processor;
+  for (let start = 0; start < 19200; start += 128) {
+    const tone = Float32Array.from({length:128}, (_, i) => .2 * Math.sin(2 * Math.PI * 1000 * (start+i)/48000));
+    processor.process([[tone,tone]], [[new Float32Array(128),new Float32Array(128)]]);
+  }
+  assert.ok(Number.isFinite(controller.output.getState().outputIntegratedLufs));
   assert.ok(Number.isFinite(inputReference));
 
   controller.updateSettings({ ...settings, targetRms: Math.pow(10, (-23 + 0.691) / 20) });
 
-  assert.equal(controller.outputMeter.getIntegratedLoudness(), Number.NaN);
+  assert.equal(controller.output.getState().outputIntegratedLufs, Number.NaN);
   assert.equal(controller.originalMeter.getIntegrationTime(), inputSeconds);
   assert.equal(controller.gainState.referenceLufs, inputReference);
   assert.equal(controller.originalMeter.getIntegratedLoudness(), inputReference);

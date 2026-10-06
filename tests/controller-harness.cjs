@@ -2,15 +2,14 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 
 function loadProcessor() {
-  let Processor = null;
+  const processors = new Map();
   const context = {
     sampleRate: 48000,
     AudioWorkletProcessor: class {
       constructor() { this.port = { onmessage: null, postMessage() {} }; }
     },
     registerProcessor(name, klass) {
-      assert.equal(name, 'lookahead-peak-limiter');
-      Processor = klass;
+      processors.set(name, klass);
     }
   };
   vm.createContext(context);
@@ -18,10 +17,10 @@ function loadProcessor() {
     require('./worklet-source.cjs')(),
     context
   );
-  return Processor;
+  return processors;
 }
 
-const ProcessorClass = loadProcessor();
+const processorClasses = loadProcessor();
 
 class FakeParam {
   constructor(value = 0) { this.value = value; }
@@ -66,13 +65,14 @@ class FakeWorkletNode extends FakeNode {
     this.name = name;
     this.options = options;
     this.parameters = new Map([['loudnessCeilingLufs', new FakeParam(options.parameterData?.loudnessCeilingLufs ?? -19)]]);
-    this.processor = new ProcessorClass(options);
+    this.processor = new (processorClasses.get(name))(options);
     this.port = {
       onmessage: null,
       postMessage: (data) => this.processor.port.onmessage?.({ data })
     };
     this.processor.port.postMessage = (data) => this.port.onmessage?.({ data });
-    global.lastWorklet = this;
+    if (name === 'lookahead-peak-limiter') global.lastWorklet = this;
+    else global.lastMeter = this;
   }
 }
 

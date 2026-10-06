@@ -1,4 +1,5 @@
-import { createAudioProcessor, ensureAudioContext, ensureMediaSource } from './audio-context';
+import { createMediaMeter, ensureAudioContext, ensureMediaSource } from './audio-context';
+import { getAudioOutput, SharedAudioOutput } from './audio-output';
 import { INITIAL_GAIN, Settings } from './config';
 import { analyzeFullAudio, calculateFullAudioGain, classifyMediaDuration, FullAudioAnalysisError, FullAudioAnalysisResult } from './full-audio-analysis';
 import { AgcUpdateResult, RealtimeAgc } from './gain-control';
@@ -11,19 +12,7 @@ type MeterMessage = {
   type: 'meter';
   epoch: number;
   original: Float32Array[];
-  output: Float32Array[];
-  safetyGain?: number;
-  loudnessGain?: number;
 };
-
-let processorModulePromise: Promise<void> | null = null;
-
-function loadProcessorModule(context: AudioContext, url: string): Promise<void> {
-  return processorModulePromise ??= context.audioWorklet.addModule(url).catch((error) => {
-    processorModulePromise = null;
-    throw error;
-  });
-}
 
 export class MediaVolumeController {
   private readonly media: HTMLMediaElement;
@@ -36,7 +25,8 @@ export class MediaVolumeController {
   private readonly bass: BiquadFilterNode;
   private processor: AudioWorkletNode | null = null;
   private originalMeter: LoudnessMeter;
-  private outputMeter: LoudnessMeter;
+  private readonly output: SharedAudioOutput;
+  private readonly releaseOutput: () => void;
   private agc = new RealtimeAgc();
   private analysisStatus: AnalysisStatus = 'realtime';
   private analysisAbort: AbortController | null = null;
@@ -44,8 +34,6 @@ export class MediaVolumeController {
   private analysisResult: FullAudioAnalysisResult | null = null;
   private meterEpoch = 0;
   private rafId = 0;
-  private safetyGain = 1;
-  private loudnessGain = 1;
   private gainState: AgcUpdateResult = { nextGain: 1, phase: 'collecting', referenceLufs: NaN, limited: false };
   private destroyed = false;
   private mediaKey = '';
@@ -95,7 +83,13 @@ export class MediaVolumeController {
     this.bass.frequency.value = 200;
     this.bass.gain.value = settings.bassBoost;
     this.originalMeter = new LoudnessMeter(this.context.sampleRate);
-    this.outputMeter = new LoudnessMeter(this.context.sampleRate);
+    this.output = getAudioOutput(this.context, rmsToLufs(settings.targetRms));
+    this.releaseOutput = this.output.retain(() => {
+      if (this.destroyed) return;
+      this.analysisStatus = 'processor-unavailable';
+      this.connectGraph();
+    });
+    this.output.updateSettings(rmsToLufs(settings.targetRms), settings.enabled);
 
     this.bindEvents();
     this.connectGraph();
@@ -116,9 +110,7 @@ export class MediaVolumeController {
     const previous = this.settings;
     this.settings = next;
     this.bass.gain.value = next.bassBoost;
-    if (previous.targetRms !== next.targetRms) {
-      this.processor?.parameters.get('loudnessCeilingLufs')?.setValueAtTime(rmsToLufs(next.targetRms) + 2, this.context.currentTime);
-    }
+    this.output.updateSettings(rmsToLufs(next.targetRms), next.enabled);
 
     if (previous.enabled !== next.enabled) {
       this.setGain(INITIAL_GAIN);
@@ -131,10 +123,7 @@ export class MediaVolumeController {
 
     if (previous.targetRms !== next.targetRms || previous.bassBoost !== next.bassBoost) {
       if (previous.bassBoost !== next.bassBoost) this.invalidateMeasurements();
-      else {
-        this.invalidateMeasurements(false);
-        this.outputMeter.reset();
-      }
+      else this.invalidateMeasurements(false);
       this.agc.unlockGain();
       if (next.fullAudioAnalysis && this.analysisResult) this.applyFullTrackGain();
     }
@@ -174,6 +163,7 @@ export class MediaVolumeController {
       this.processor.onprocessorerror = null;
       this.processor = null;
     }
+    this.releaseOutput();
   }
 
   private bindEvents(): void {
@@ -184,10 +174,10 @@ export class MediaVolumeController {
   }
 
   private loadProcessor(): void {
-    const url = chrome.runtime.getURL('limiter-worklet.js');
-    loadProcessorModule(this.context, url).then(() => {
+    this.output.ready.then(() => {
       if (this.destroyed) return;
-      const node = createAudioProcessor(this.context, rmsToLufs(this.settings.targetRms));
+      if (!this.output.isReady()) throw new Error('Mixed output protection unavailable');
+      const node = createMediaMeter(this.context);
       node.port.onmessage = (event: MessageEvent<MeterMessage>) => {
         if (event.data?.type === 'meter') this.consumeAudio(event.data);
       };
@@ -210,6 +200,7 @@ export class MediaVolumeController {
       this.invalidateMeasurements(!(this.settings.fullAudioAnalysis && this.analysisResult));
       this.connectGraph();
     }).catch((error) => {
+      if (this.destroyed) return;
       if (this.analysisStatus === 'realtime') {
         this.analysisStatus = 'processor-unavailable';
       }
@@ -228,12 +219,12 @@ export class MediaVolumeController {
       this.source.connect(this.context.destination);
       return;
     }
-    if (this.processor) {
+    if (this.processor && this.output.isReady()) {
       this.source.connect(this.bass);
       this.bass.connect(this.gain);
       this.gain.connect(this.processor, 0, 0);
       this.bass.connect(this.processor, 0, 1);
-      this.processor.connect(this.context.destination);
+      this.output.connect(this.processor);
       return;
     }
     // A failed processor must not release a stale boosted signal.
@@ -262,9 +253,6 @@ export class MediaVolumeController {
       || !message.original.length
     ) return;
     this.originalMeter.processChannels(message.original);
-    this.outputMeter.processChannels(message.output);
-    this.safetyGain = Number.isFinite(message.safetyGain) ? clamp(message.safetyGain!, 0, 1) : 1;
-    this.loudnessGain = Number.isFinite(message.loudnessGain) ? clamp(message.loudnessGain!, 0, 1) : 1;
     const duration = message.original[0].length / this.context.sampleRate;
     if (!this.media.muted && !this.media.paused && !this.media.ended) {
       this.updateGain(duration);
@@ -301,26 +289,21 @@ export class MediaVolumeController {
       return;
     }
     const originalLufs = this.originalMeter.getIntegratedLoudness();
-    const outputLufs = this.outputMeter.getIntegratedLoudness();
+    const output = this.output.getState();
     this.onMeter({
+      ...output,
       originalMomentaryLufs: this.originalMeter.getMomentaryLoudness(),
-      momentaryLufs: this.outputMeter.getMomentaryLoudness(),
-      safetyGain: this.safetyGain,
-      loudnessGain: this.loudnessGain,
-      maximumMomentaryLufs: this.outputMeter.getMaximumMomentaryLoudness(),
-      maximumShortTermLufs: this.outputMeter.getMaximumShortTermLoudness(),
       phase: this.gainState.phase,
       gainLimited: this.gainState.limited,
       originalIntegratedLufs: originalLufs,
-      outputIntegratedLufs: outputLufs,
-      gain: this.gain.gain.value * this.safetyGain * this.loudnessGain,
+      gain: this.gain.gain.value * output.safetyGain * output.loudnessGain,
       sampleCount: Math.floor(this.originalMeter.getIntegrationTime()),
-      analysisStatus: this.processor ? this.analysisStatus : 'processor-unavailable'
+      analysisStatus: this.processor && this.output.isReady() ? this.analysisStatus : 'processor-unavailable'
     });
   }
 
   private setGain(value: number): void {
-    const gain = this.settings.enabled && !this.processor ? 0
+    const gain = this.settings.enabled && (!this.processor || !this.output.isReady()) ? 0
       : clamp(value, this.settings.minGain, this.settings.maxGain);
     this.gain.gain.cancelScheduledValues(this.context.currentTime);
     this.gain.gain.setValueAtTime(gain, this.context.currentTime);
@@ -328,18 +311,16 @@ export class MediaVolumeController {
 
   private resetMeters(resetAgc = true): void {
     this.originalMeter.reset({ preserveIntegrated: !resetAgc });
-    this.outputMeter.reset({ preserveIntegrated: !resetAgc });
+    this.output.resetForMedia(!resetAgc);
     if (resetAgc) {
       this.agc.reset();
       this.gainState = { nextGain: this.gain.gain.value, phase: 'collecting', referenceLufs: NaN, limited: false };
     }
-    this.safetyGain = this.loudnessGain = 1;
   }
 
   private invalidateMeasurements(resetAgc = true): void {
     this.meterEpoch++;
-    this.processor?.port.postMessage({ type: 'reset-meter', epoch: this.meterEpoch,
-      loudnessCeilingLufs: rmsToLufs(this.settings.targetRms) + 2 });
+    this.processor?.port.postMessage({ type: 'reset-meter', epoch: this.meterEpoch });
     this.resetMeters(resetAgc);
   }
 

@@ -29,7 +29,7 @@ let Processor;
 new Function('AudioWorkletProcessor','registerProcessor','sampleRate',
   buildSync({entryPoints:[join(root,'public/limiter-worklet.js')],bundle:true,write:false,format:'iife'}).outputFiles[0].text
 )(class {constructor(){this.port={postMessage(){}};}},
-  (_name,value)=>{Processor=value;},48000);
+  (name,value)=>{if(name==='lookahead-peak-limiter')Processor=value;},48000);
 
 mkdirSync(resultsDir,{recursive:true});
 const reports=[];

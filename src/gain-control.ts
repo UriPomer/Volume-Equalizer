@@ -103,10 +103,6 @@ export class RealtimeAgc {
     const activeSeconds = this.activeSeconds;
     this.phase = activeSeconds < 1 ? 'collecting' : 'calibrating';
     let destination = desired;
-    if (input.momentaryLufs > input.targetLufs + 4) {
-      destination = Math.min(destination, clamp(Math.pow(10,
-        (input.targetLufs + 1 - input.momentaryLufs) / 20), input.minGain, input.maxGain));
-    }
     // Four seconds of useful audio before boosting; a very quiet intro cannot
     // justify a large boost. Downward calibration is permitted immediately.
     if (activeSeconds < 4 || reference < input.targetLufs - 25) destination = Math.min(destination, current);

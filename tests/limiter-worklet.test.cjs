@@ -11,8 +11,7 @@ function loadProcessor() {
       constructor() { this.port = { onmessage: null, postMessage() {} }; }
     },
     registerProcessor(name, klass) {
-      assert.equal(name, 'lookahead-peak-limiter');
-      ProcessorClass = klass;
+      if (name === 'lookahead-peak-limiter') ProcessorClass = klass;
     }
   };
   vm.createContext(context);

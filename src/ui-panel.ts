@@ -72,7 +72,7 @@ function panelHtml(settings: Settings): string {
       <div class="meter">
         <small>增益前（含低频设置）</small>
         ${meterRow('积分', 'originalIntegrated', ' LUFS')} ${meterRow('瞬时', 'original', ' LUFS')}
-        <small>输出</small>
+        <small>输出（页面混音）</small>
         ${meterRow('积分', 'outputIntegrated', ' LUFS')} ${meterRow('瞬时', 'output', ' LUFS')}
         ${meterRow('最大瞬时 · 400ms', 'maximumMomentary')}
         ${meterRow('最大短时 · 3s', 'maximumShortTerm')}

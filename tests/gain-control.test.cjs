@@ -46,6 +46,13 @@ test('quiet and loud videos converge to the supplied gated integrated loudness',
     assert.equal(last.phase,'stable');
   }
 });
+test('periodic high dynamics finish calibration instead of repeatedly following each loud phrase', () => {
+  const {trace, gain} = run(90, t => t % 3 < .6 ? -16 : -28);
+  const first = trace.find(row => row.phase === 'stable');
+  assert.ok(first && first.time <= 20, 'Stationary programme must finish calibration');
+  assertStableCorridor(trace);
+  assert.ok(Math.abs(trace.at(-1).referenceLufs + 20 * Math.log10(gain) + 21) <= .5);
+});
 test('silence, invalid measurements and near-silent introductions never boost or stabilize', () => {
   for(const level of [-Infinity,NaN,Infinity,-65]) {
     const {gain,trace}=run(30,()=>level);

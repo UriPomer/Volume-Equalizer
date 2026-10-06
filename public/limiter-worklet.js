@@ -208,3 +208,49 @@ function clampNumber(value, min, max, fallback) {
 }
 
 registerProcessor('lookahead-peak-limiter', LookaheadPeakLimiterProcessor);
+
+/** Pass programme PCM to the common output and measure this media's input.
+ * There is no per-media limiter, filter preview or additional delay here. */
+class MediaInputMeterProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.size = Math.max(128, Math.round(sampleRate / 10));
+    this.index = 0;
+    this.epoch = 0;
+    this.channels = [];
+    this.port.onmessage = event => {
+      if (event.data?.type !== 'reset-meter') return;
+      this.epoch = event.data.epoch;
+      this.index = 0;
+    };
+  }
+
+  process(inputs, outputs) {
+    const output = outputs[0], input = inputs[0] || [], original = inputs[1] || [];
+    const frames = output[0]?.length || 128;
+    if (this.channels.length !== original.length) {
+      this.channels = Array.from({length:original.length}, () => new Float32Array(this.size));
+      this.index = 0;
+    }
+    for (let channel = 0; channel < output.length; channel++) {
+      if (input[channel]) output[channel].set(input[channel]);
+      else output[channel].fill(0);
+    }
+    // A disconnected/paused source need not advance programme observations.
+    if (!original.length) return true;
+    for (let frame = 0; frame < frames; frame++) {
+      for (let channel = 0; channel < original.length; channel++) {
+        const value = original[channel][frame];
+        this.channels[channel][this.index] = Number.isFinite(value) ? value : 0;
+      }
+      if (++this.index === this.size) {
+        const pcm = this.channels.map(channel => channel.slice());
+        this.port.postMessage({type:'meter',epoch:this.epoch,original:pcm},pcm.map(channel=>channel.buffer));
+        this.index = 0;
+      }
+    }
+    return true;
+  }
+}
+
+registerProcessor('media-input-meter', MediaInputMeterProcessor);
