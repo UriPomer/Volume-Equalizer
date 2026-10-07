@@ -105,7 +105,7 @@ test('recalibration continues to honor user gain bounds', () => {
 });
 test('explicit settings recalibration establishes a new fixed anchor', () => {
   const {agc, gain} = run(30, () => -21);
-  agc.unlockGain();
+  agc.recalibrate();
   let currentGain = gain;
   const trace = [];
   for (let i = 0; i < 300; i++) {
@@ -127,12 +127,4 @@ test('new video resets history instead of inheriting previous boost', () => {
   const result=agc.update(input({momentaryLufs:-Infinity, integratedLufs:NaN}));
   assert.equal(result.nextGain,1);
   assert.ok(Number.isNaN(result.referenceLufs));
-});
-test('explicit full-track mode is separate and can be exited without discarding observations', () => {
-  const agc=new RealtimeAgc();
-  agc.lockGain(.5);
-  assert.equal(agc.isLocked(),true);
-  assert.equal(agc.update(input()).phase,'full-track');
-  agc.unlockGain();
-  assert.equal(agc.isLocked(),false);
 });

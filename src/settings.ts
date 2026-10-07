@@ -15,10 +15,6 @@ export function normalizeSettings(value: unknown): Settings {
     : {};
   return {
     enabled: booleanValue(input.enabled, DEFAULT_SETTINGS.enabled),
-    fullAudioAnalysis: booleanValue(
-      input.fullAudioAnalysis,
-      DEFAULT_SETTINGS.fullAudioAnalysis
-    ),
     targetRms: numberValue(
       input.targetRms,
       TARGET_RMS_MIN,

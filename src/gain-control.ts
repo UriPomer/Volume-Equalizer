@@ -8,7 +8,7 @@ export interface AgcUpdateInput {
   momentaryLufs: number;
   gainChangePerSec: number;
 }
-export type AgcPhase = 'collecting' | 'calibrating' | 'stable' | 'full-track';
+export type AgcPhase = 'collecting' | 'calibrating' | 'stable';
 export interface AgcUpdateResult {
   nextGain: number;
   phase: AgcPhase;
@@ -20,7 +20,6 @@ export interface AgcUpdateResult {
  * state; UI frames, silence and missing measurements cannot recalibrate it. */
 export class RealtimeAgc {
   private activeSeconds = 0;
-  private externalGain: number | null = null;
   private requestGain: number | null = null;
   private referenceMark = NaN;
   private stableSeconds = 0;
@@ -30,19 +29,15 @@ export class RealtimeAgc {
 
   reset(): void {
     this.activeSeconds = 0;
-    this.externalGain = this.requestGain = null;
+    this.requestGain = null;
     this.referenceMark = NaN;
     this.stableSeconds = this.correctionSeconds = 0;
     this.correctionDirection = 0;
     this.phase = 'collecting';
   }
 
-  isLocked(): boolean { return this.externalGain !== null; }
-  lockGain(gain: number): void {
-    if (Number.isFinite(gain) && gain > 0) this.externalGain = gain;
-  }
-  unlockGain(): void {
-    this.externalGain = this.requestGain = null;
+  recalibrate(): void {
+    this.requestGain = null;
     this.stableSeconds = this.correctionSeconds = 0;
     this.phase = 'calibrating';
   }
@@ -60,15 +55,11 @@ export class RealtimeAgc {
       limited: Number.isFinite(rawGain) && (rawGain < input.minGain || rawGain > input.maxGain)
     });
 
-    if (this.externalGain !== null) {
-      this.phase = 'full-track';
-      return result(slew(current, clamp(this.externalGain, input.minGain, input.maxGain), dt, 2, input.gainChangePerSec));
-    }
     if (!audible || !Number.isFinite(reference) || dt === 0) return result(current);
 
     const desired = clamp(rawGain, input.minGain, input.maxGain);
     if (this.phase === 'stable') {
-      const error = input.targetLufs - (reference + db(current));
+      const error = db(desired / current);
       const direction = Math.abs(error) > 0.1 ? Math.sign(error) : 0;
       if (direction !== this.correctionDirection) this.correctionSeconds = 0;
       this.correctionDirection = direction;
@@ -84,7 +75,7 @@ export class RealtimeAgc {
       }
       const requested = this.requestGain ?? current;
       const downward = requested < current;
-      return result(slew(current, requested, dt, downward ? 2 : 0.5,
+      return result(slew(current, requested, dt, downward ? 1 : 0.5,
         Math.min(downward ? 0.2 : 0.04, input.gainChangePerSec)));
     }
 

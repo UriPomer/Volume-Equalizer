@@ -16,7 +16,7 @@ import { denseMaxima, ffmpegMaxima, writeFloatWav } from './audio-test-artifacts
 // Observe every native GainNode scheduling call without replacing audio DSP.
 // Failure cases: extrema cause ducking, average misses the target, short
 // phrases pump the gain, target/seek/source changes leave stale measurements,
-// silence boosts, full-track analysis locks a peak-constrained wrong gain.
+// silence boosts, or legacy settings trigger a complete audio download.
 const artifacts = mkdtempSync(join(process.env.VOLUME_EQ_ARTIFACT_ROOT || tmpdir(), 'volume-eq-realtime-'));
 const content = readFileSync(resolve('dist/content.js'));
 const worklet = readFileSync(resolve('dist/limiter-worklet.js'));
@@ -50,10 +50,6 @@ writeTone(join(artifacts, 'periodic.wav'), 70, t => t % 3 < .6 ? .16 : .16 * Mat
 writeTone(join(artifacts, 'multiple.wav'), 20, () => .65);
 writeTone(join(artifacts, 'second.wav'), 20, () => .65, 1301);
 writeTone(join(artifacts, 'startup.wav'), 15, () => .135);
-writeTone(join(artifacts, 'full-track.wav'), 45, t => t % 9 >= 8.8 && t % 9 < 8.8005 ? .82 : t % 3 < .6 ? .09 : .045);
-writeTone(join(artifacts, 'bass-track.wav'), 45, t => t % 3 < .6 ? .09 : .045,80);
-const fullReference=measureWithFfmpeg(join(artifacts,'full-track.wav'));
-const fullTarget=Math.round((fullReference.integratedLufs+4)*2)/2;
 const reference = measureWithFfmpeg(fixture);
 const commit = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
 const report = { command: 'npm run test:realtime', commit, generatedAt: new Date().toISOString(),
@@ -61,12 +57,15 @@ const report = { command: 'npm run test:realtime', commit, generatedAt: new Date
   workletSha256: createHash('sha256').update(worklet).digest('hex'),
   input: { file: fixture, sha256: createHash('sha256').update(readFileSync(fixture)).digest('hex'),
     reference, targetLufs: -17.5, expectedGain: Math.pow(10, (-17.5 - reference.integratedLufs) / 20) },
-  checkpoints: [], trace: [], inputLoads: [], audioGraphEvents: [], consoleEntries: [], pass: false };
+  requests: [], checkpoints: [], trace: [], inputLoads: [], audioGraphEvents: [], consoleEntries: [], pass: false };
 const page = `<!doctype html><meta charset="utf-8"><style>body{background:#17202b;color:white;font:18px system-ui}</style>
 <h1>Realtime integrated loudness regression</h1><audio controls></audio>
 <script>
 ${captureBootstrap}
-const stored={targetRms:Math.pow(10,(-17.5+.691)/20)};
+const stored={fullAudioAnalysis:true,targetRms:Math.pow(10,(-17.5+.691)/20)};
+window.analysisCalls=[];
+const decode=BaseAudioContext.prototype.decodeAudioData;
+BaseAudioContext.prototype.decodeAudioData=function(...args){window.analysisCalls.push('decode');return Reflect.apply(decode,this,args);};
 window.mediaEvents=[];
 window.programmeGains=[];
 const createGain=BaseAudioContext.prototype.createGain;
@@ -92,6 +91,7 @@ document.body.append(bootstrap);
 const recorded = [];
 const server = createServer(async (req, res) => {
   const name = req.url?.slice(1);
+  if(req.method==='GET')report.requests.push(req.url);
   if (req.method === 'POST' && name === 'recording') {
     const chunks=[];
     for await (const chunk of req) chunks.push(chunk);
@@ -105,7 +105,7 @@ const server = createServer(async (req, res) => {
     if(name==='limiter-worklet.js')await delay(250);
     res.setHeader('Content-Type', 'text/javascript');
     res.end(name === 'content.js' ? content : worklet);
-  } else if (['mixed.wav', 'silence.wav', 'quiet.wav', 'loud.wav', 'stability.wav', 'periodic.wav', 'multiple.wav', 'second.wav', 'startup.wav','full-track.wav','bass-track.wav'].includes(name)) {
+  } else if (['mixed.wav', 'silence.wav', 'quiet.wav', 'loud.wav', 'stability.wav', 'periodic.wav', 'multiple.wav', 'second.wav', 'startup.wav'].includes(name)) {
     const data = readFileSync(join(artifacts, name));
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Content-Length', data.length);
@@ -140,7 +140,7 @@ async function snapshot() {
     const root=host.shadowRoot;
     const text=key=>root.querySelector('[data-meter="'+key+'"]')?.textContent;
     return {time:document.querySelector('audio').currentTime,input:parseFloat(text('originalIntegrated')),
-      output:parseFloat(text('outputIntegrated')),momentary:parseFloat(text('original')),
+      output:parseFloat(text('outputIntegrated')),outputMomentary:parseFloat(text('output')),momentary:parseFloat(text('original')),
       paused:document.querySelector('audio').paused,readyState:document.querySelector('audio').readyState,
       mediaError:document.querySelector('audio').error?.message,
       gain:parseFloat(text('gain')),programmeGain:window.programmeGainParam?.value,
@@ -203,7 +203,9 @@ try {
   const startupRate=await evaluate('window.startAudioCapture()');
   const startupTime = (await snapshot()).time;
   await observe(8);
-  assert.ok((await snapshot()).status.includes('完整音轨已锁定'),'Default mode must automatically analyze the available complete audio');
+  assert.equal((await snapshot()).status,'实时','Only realtime normalization is permitted');
+  assert.deepEqual(await evaluate('window.analysisCalls'),[],'No complete audio decoding is allowed');
+  assert.equal(await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelectorAll('[data-action="fullAudioAnalysis"]').length`),0,'Remove the complete-track analysis control');
   await evaluate('window.stopAudioCapture()');
   const startupBytes=Buffer.concat(recorded.sort((a,b)=>a.sequence-b.sequence).map(row=>row.bytes));
   const startupPcm=new Float32Array(startupBytes.buffer.slice(startupBytes.byteOffset,startupBytes.byteOffset+startupBytes.length));
@@ -220,70 +222,6 @@ try {
   assert.equal(await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelectorAll('[data-meter="programmeGain"]').length`),0,'Panel must show only one effective gain');
   assert.equal(await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelectorAll('[data-meter="loudnessSafety"]').length`),0,'LUFS extrema must be displayed without an additional loudness protector');
   recorded.length=0;
-  await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelector('[data-action="fullAudioAnalysis"]').click()`);
-  // Native fetch + decodeAudioData + complete analysis + actual destination
-  // recording. A rare digital peak may be limited locally, never used to
-  // constrain the entire track's normalization gain.
-  await setSlider('targetLufs',fullTarget);
-  await playFixture('full-track.wav');
-  await evaluate(`(()=>{
-    const bootstrap=document.querySelector('script[data-playinfo]');
-    bootstrap.textContent='window.__playinfo__='+JSON.stringify({data:{dash:{audio:[{baseUrl:location.origin+'/full-track.wav',bandwidth:128000}]}}});
-    document.getElementById('universal-volume-eq-panel').shadowRoot.querySelector('[data-action="fullAudioAnalysis"]').click();
-  })()`);
-  await observe(12);
-  const locked=await checkpoint('complete-track-normalized');
-  assert.ok(locked.status.includes('完整音轨已锁定'),'Complete track must be fetched, decoded and locked');
-  const expectedFullGain=Math.pow(10,(fullTarget-fullReference.integratedLufs)/20);
-  assert.ok(Math.abs(locked.programmeGain-expectedFullGain)<.015,'A rare historical peak must not lower the fixed normalization gain');
-  recorded.length=0;
-  const fullRate=await evaluate('window.startAudioCapture()');
-  const fullStart=(await snapshot()).time, fullTraceStart=report.trace.length;
-  await observe(27);
-  await evaluate('window.stopAudioCapture()');
-  const fullBytes=Buffer.concat(recorded.sort((a,b)=>a.sequence-b.sequence).map(row=>row.bytes));
-  const fullPcm=new Float32Array(fullBytes.buffer.slice(fullBytes.byteOffset,fullBytes.byteOffset+fullBytes.length));
-  const fullOutput=join(artifacts,'complete-track-output.wav');
-  writeFloatWav(fullOutput,fullPcm,fullRate,2);
-  const independentFull=measureWithFfmpeg(fullOutput);
-  const fullRms=(start,end)=>{
-    const block=fullPcm.slice(Math.round((start-fullStart)*fullRate)*2,Math.round((end-fullStart)*fullRate)*2);
-    return Math.sqrt(block.reduce((sum,value)=>sum+value*value,0)/block.length);
-  };
-  const fullContrasts=[15,18,21,24,27,30,33,36].map(start=>20*Math.log10(fullRms(start+.25,start+.45)/fullRms(start+2,start+2.2)));
-  const fullGains=report.trace.slice(fullTraceStart).map(row=>row.programmeGain);
-  report.fullTrack={input:fullReference,target:fullTarget,expectedGain:expectedFullGain,file:fullOutput,
-    independent:independentFull,contrasts:fullContrasts,gainSpan:Math.max(...fullGains)-Math.min(...fullGains)};
-  assert.ok(Math.abs(independentFull.integratedLufs-fullTarget)<=.35,'Independent FFmpeg average must match the target');
-  assert.ok(fullContrasts.every(value=>Math.abs(value-20*Math.log10(2))<=.1),'Fixed gain must preserve phrase contrast');
-  assert.ok(report.fullTrack.gainSpan<1e-6,'Whole-track gain must remain fixed through loud and quiet phrases');
-  await screenshot('complete-track');
-  // The normalization reference includes the user's audible EQ, not the raw
-  // downloaded source. Changing EQ must invalidate a completed analysis.
-  await evaluate(`document.querySelector('script[data-playinfo]').textContent='window.__playinfo__='+JSON.stringify({data:{dash:{audio:[{baseUrl:location.origin+'/bass-track.wav',bandwidth:128000}]}}})`);
-  await setSlider('targetLufs',-21);
-  await setSlider('bassBoost',6);
-  await playFixture('bass-track.wav');
-  await observe(12);
-  assert.ok((await snapshot()).status.includes('完整音轨已锁定'),'EQ-adjusted complete track must finish analysis');
-  recorded.length=0;
-  await evaluate('window.startAudioCapture()');
-  await observe(15);
-  await evaluate('window.stopAudioCapture()');
-  const eqBytes=Buffer.concat(recorded.sort((a,b)=>a.sequence-b.sequence).map(row=>row.bytes));
-  const eqPcm=new Float32Array(eqBytes.buffer.slice(eqBytes.byteOffset,eqBytes.byteOffset+eqBytes.length));
-  const eqOutput=join(artifacts,'complete-track-eq-output.wav');
-  writeFloatWav(eqOutput,eqPcm,fullRate,2);
-  report.fullTrackEq={file:eqOutput,bassBoost:6,target:-21,independent:measureWithFfmpeg(eqOutput)};
-  assert.ok(Math.abs(report.fullTrackEq.independent.integratedLufs+21)<=.35,'Full-track average must include the audible bass setting');
-  // Bilibili SPA pages can retain an old DASH bootstrap. A longer, unrelated
-  // audio track is no more valid than a truncated one; fall back audibly.
-  await playFixture('startup.wav');
-  await observe(3);
-  const mismatched=await checkpoint('mismatched-track-falls-back');
-  assert.ok(mismatched.status.includes('音轨时长不匹配'),'A different track duration must not produce a full-track lock');
-  assert.ok(mismatched.gain>0&&Number.isFinite(mismatched.output),'Fallback must continue producing measured audio');
-  await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelector('[data-action="fullAudioAnalysis"]').click()`);
   await setSlider('bassBoost',0);
   await setSlider('targetLufs', -17.5);
   await playFixture('stability.wav');
@@ -294,17 +232,23 @@ try {
   }
   assert.ok(stable.phase.includes('已稳定'), 'Initial constant passage must establish a stable anchor');
   const anchor = stable.programmeGain, firstStableIndex = stable.gainTraceIndex;
-  await observe(62 - stable.time);
+  await observe(48 - stable.time);
+  const earlyChange=await checkpoint('sustained-content-early-error');
+  await observe(24);
   const sustained = await checkpoint('stable-gain-with-sustained-loud-content');
   assert.ok(sustained.maximumMomentary > -15.5 && sustained.maximumShortTerm > -15.5, 'Unclipped loud passages may exceed target +2 LU');
-  assert.ok(Math.abs(sustained.input+20*Math.log10(sustained.programmeGain)+17.5)<.4,'Sustained changes must recalibrate the cumulative programme average');
+  // A large unannounced change cannot retroactively normalize earlier PCM.
+  // Observe the real cumulative error rather than claiming input * latest gain
+  // is the already-rendered average. Require transparency of the current PCM.
+  assert.ok(Math.abs(sustained.outputMomentary-sustained.momentary-20*Math.log10(sustained.programmeGain))<=.3,'Unclipped output must follow the single programme gain without hidden loudness attenuation');
+  assert.ok(Math.abs(sustained.input+20*Math.log10(sustained.programmeGain)+17.5)<.4,'The programme gain must approach the cumulative input reference');
   await evaluate(`document.querySelector('audio').pause();document.querySelector('audio').currentTime=20`);
   await observe(1, false);
   await evaluate(`document.querySelector('audio').play()`);
   await observe(4);
   const decisions = await evaluate(`window.programmeGains.slice(${firstStableIndex})`);
   const values = decisions.map(row => row.value), min = Math.min(...values), max = Math.max(...values);
-  report.stability = {anchor, min, max, span: max - min, maximumDeviation: Math.max(Math.abs(min-anchor),Math.abs(max-anchor)), decisions};
+  report.stability = {earlyOutputErrorLu:earlyChange.output+17.5,lateOutputErrorLu:sustained.output+17.5,anchor, min, max, span: max - min, maximumDeviation: Math.max(Math.abs(min-anchor),Math.abs(max-anchor)), decisions};
   assert.ok(values.length > 400, 'Verify every scheduled gain, not occasional rounded UI samples');
   assert.ok(report.stability.span>.2,'A changed programme average must escape the old fixed corridor');
   assert.ok(values.every((value,i)=>!i||Math.abs(value-values[i-1])<=.021),'Recalibration must remain smooth instead of jumping gain');
@@ -445,6 +389,10 @@ try {
   report.remainingAudioConnections = [...connections];
   assert.ok([...nodes.values()].some(type => type.includes('Worklet')), 'Native WebAudio graph must include the processor');
   assert.equal(connections.size, 0, 'Removing media must disconnect the entire native audio graph');
+  assert.deepEqual(await evaluate('window.analysisCalls'),[],'Realtime operation must never decode a complete track');
+  for(const name of new Set(report.inputLoads.map(row=>row.file))){
+    assert.equal(report.requests.filter(url=>url==='/'+name).length,report.inputLoads.filter(row=>row.file===name).length,'Only the test player may load audio; the extension cannot fetch a complete track');
+  }
   report.pass = true;
 } catch (error) {
   report.error = String(error.stack || error);

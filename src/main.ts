@@ -67,7 +67,7 @@ function attachController(media: HTMLMediaElement): void {
     // 站点可能已用 createMediaElementSource 占用该元素（YouTube/Twitch 等），
     // 此时绑定必然失败：在面板上给出提示，并在该元素下一次 play 时重试。
     warnFailure('media-attach-retry', '媒体绑定失败，将在播放时重试', error);
-    meterState = { ...EMPTY_METER_STATE, analysisStatus: 'attach-failed' };
+    meterState = { ...EMPTY_METER_STATE, processingStatus: 'attach-failed' };
     ensurePanel(settings, updateSettings, () => meterState);
     updatePanelVisibility(1);
     scheduleAttachRetry(media);

@@ -1,14 +1,4 @@
-export type AnalysisStatus =
-  | 'realtime'
-  | 'waiting-metadata'
-  | 'waiting-play'
-  | 'attach-failed'
-  | 'analyzing'
-  | 'full-track'
-  | 'incomplete'
-  | 'unsupported'
-  | 'processor-unavailable'
-  | 'failed';
+export type ProcessingStatus = 'realtime' | 'attach-failed' | 'processor-unavailable';
 
 export interface MeterState {
   originalIntegratedLufs: number;
@@ -22,7 +12,7 @@ export interface MeterState {
   maximumShortTermLufs: number;
   gain: number;
   sampleCount: number;
-  analysisStatus: AnalysisStatus;
+  processingStatus: ProcessingStatus;
 }
 
 export const EMPTY_METER_STATE: MeterState = {
@@ -37,5 +27,5 @@ export const EMPTY_METER_STATE: MeterState = {
   maximumShortTermLufs: NaN,
   gain: 1,
   sampleCount: 0,
-  analysisStatus: 'realtime'
+  processingStatus: 'realtime'
 };

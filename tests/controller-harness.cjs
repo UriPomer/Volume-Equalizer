@@ -111,7 +111,6 @@ const { MediaVolumeController } = require('../dist-test/controller.js');
 const { INITIAL_GAIN } = require('../dist-test/config.js');
 const settings = {
   enabled: true,
-  fullAudioAnalysis: false,
   targetRms: 0.09650504109445904,
   minGain: 0.25,
   maxGain: 2,

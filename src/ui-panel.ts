@@ -1,21 +1,14 @@
 import { PANEL_ID, Settings } from './config';
 import { lufsToRms, rmsToLufs } from './lufs-calculator';
-import { AnalysisStatus, MeterState } from './types';
+import { ProcessingStatus, MeterState } from './types';
 
 type SliderRole = 'targetLufs' | 'maxGain' | 'minGain' | 'bassBoost';
 type ChangeSettings = (settings: Settings) => Settings;
 
-const STATUS_TEXT: Record<AnalysisStatus, string> = {
+const STATUS_TEXT: Record<ProcessingStatus, string> = {
   realtime: '实时',
-  'waiting-metadata': '等待视频元数据',
-  'waiting-play': '等待播放后分析',
   'attach-failed': '媒体被页面占用',
-  analyzing: '完整音轨分析中',
-  'full-track': '完整音轨已锁定',
-  incomplete: '音轨时长不匹配 · 实时继续',
-  unsupported: '直播不支持完整分析',
-  'processor-unavailable': '保护不可用 · 已静音',
-  failed: '分析失败 · 实时继续'
+  'processor-unavailable': '保护不可用 · 已静音'
 };
 
 let host: HTMLElement | null = null;
@@ -64,7 +57,6 @@ function panelHtml(settings: Settings): string {
     <section>
       <header><div><strong>音量均衡</strong><small data-role="version"></small></div><button data-action="enabled"></button></header>
       <hr>
-      <label class="mode">完整音轨预分析<button data-action="fullAudioAnalysis"></button></label>
       ${slider('targetLufs', '目标积分响度', -23, -10, .5, target)}
       ${slider('maxGain', '增益上限', 1, 3, .1, settings.maxGain)}
       ${slider('minGain', '增益下限', .2, 1, .05, settings.minGain)}
@@ -105,15 +97,12 @@ function meterRow(label: string, field: string, suffix = ''): string {
 function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings): void {
   currentSettings = initial;
   const enabled = query<HTMLButtonElement>(shadow, '[data-action="enabled"]');
-  const full = query<HTMLButtonElement>(shadow, '[data-action="fullAudioAnalysis"]');
   const sliders = [...shadow.querySelectorAll<HTMLInputElement>('input[data-role]')];
 
   const render = () => {
     const settings = currentSettings as Settings;
     enabled.textContent = settings.enabled ? '已开启' : '已关闭';
     enabled.classList.toggle('on', settings.enabled);
-    full.textContent = settings.fullAudioAnalysis ? '已开启' : '实时模式';
-    full.classList.toggle('on', settings.fullAudioAnalysis);
     query<HTMLElement>(shadow, '.dock i').classList.toggle('off', !settings.enabled);
     for (const input of sliders) {
       const role = input.dataset.role as SliderRole;
@@ -126,14 +115,6 @@ function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings
   enabled.onclick = () => {
     const base = currentSettings as Settings;
     currentSettings = change({ ...base, enabled: !base.enabled });
-    render();
-  };
-  full.onclick = () => {
-    const base = currentSettings as Settings;
-    currentSettings = change({
-      ...base,
-      fullAudioAnalysis: !base.fullAudioAnalysis
-    });
     render();
   };
   for (const input of sliders) {
@@ -176,10 +157,10 @@ function updateMeter(shadow: ShadowRoot, getMeter: () => MeterState): void {
     setText(shadow, '[data-meter="maximumMomentary"]', showMomentary(meter.maximumMomentaryLufs));
     setText(shadow, '[data-meter="maximumShortTerm"]', showMomentary(meter.maximumShortTermLufs));
     setText(shadow, '[data-meter="outputIntegrated"]', showMomentary(meter.outputIntegratedLufs));
-    const phases = { collecting: '收集有效声音', calibrating: '平滑校准', stable: '已稳定', 'full-track': '完整音轨' };
+    const phases = { collecting: '收集有效声音', calibrating: '平滑校准', stable: '已稳定' };
     setText(shadow, '[data-meter="phase"]', `${phases[meter.phase]}${meter.gainLimited ? ' · 达到倍率限制' : ''}`);
     setText(shadow, '[data-meter="gain"]', `${meter.gain.toFixed(2)}x`);
-    setText(shadow, '[data-meter="status"]', STATUS_TEXT[meter.analysisStatus]);
+    setText(shadow, '[data-meter="status"]', STATUS_TEXT[meter.processingStatus]);
   }, 100);
 }
 
@@ -208,10 +189,10 @@ const PANEL_CSS = `
 .dock b{font-size:11px;writing-mode:vertical-rl;letter-spacing:.5px}
 section{width:220px;box-sizing:border-box;padding:12px;border-radius:14px 0 0 0;border-right:0;opacity:0;transition:.2s}
 :host([data-open]) section{opacity:1}
-header,.mode,.param span,.meter div{display:flex;align-items:center;justify-content:space-between}
+header,.param span,.meter div{display:flex;align-items:center;justify-content:space-between}
 header{font-size:13px}button{border:0;border-radius:99px;padding:3px 9px;background:#ffffff18;color:#ffffff90;cursor:pointer;font-size:10px}button.on{background:#0ea5e9;color:white}
 header small{display:block;font-size:10px;color:#ffffff70;margin-top:2px}
-hr{border:0;height:1px;background:#ffffff12;margin:9px 0}.mode,.param{display:block;color:#ffffff90;font-size:11px}.mode{display:flex;margin:9px 0}
+hr{border:0;height:1px;background:#ffffff12;margin:9px 0}.param{display:block;color:#ffffff90;font-size:11px}
 .param{margin-top:8px}.param span b{color:#e2e8f0;font-size:12px}input{appearance:none;width:100%;height:3px;background:#ffffff20;border-radius:2px;cursor:pointer}input::-webkit-slider-thumb{appearance:none;width:13px;height:13px;border-radius:50%;background:#38bdf8}
 .meter{font-size:11px}.meter small{display:block;color:#ffffff50;font-weight:600;margin-top:6px}.meter div{padding:2px 0}.meter span{color:#ffffff60}.meter b{color:#cbd5e1;font-weight:500;font-variant-numeric:tabular-nums;text-align:right}
 `;

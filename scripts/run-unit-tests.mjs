@@ -11,7 +11,6 @@ try {
     '--ignoreConfig',
     'src/gain-control.ts',
     'src/loudness-meter.ts',
-    'src/full-audio-analysis.ts',
     'src/controller.ts',
     'src/settings.ts',
     '--outDir', output,
@@ -24,7 +23,6 @@ try {
   execFileSync(process.execPath, [
     '--test',
     'tests/controller-integration.test.cjs',
-    'tests/full-audio-analysis.test.cjs',
     'tests/gain-control.test.cjs',
     'tests/limiter-worklet.test.cjs',
     'tests/loudness-meter.test.cjs',

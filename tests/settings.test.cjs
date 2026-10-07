@@ -14,7 +14,7 @@ test('settings normalization rejects non-finite and out-of-range values', () => 
   });
 
   assert.equal(settings.enabled, true);
-  assert.equal(settings.fullAudioAnalysis, true);
+  assert.equal('fullAudioAnalysis' in settings, false, 'Legacy settings cannot enable audio downloads');
   assert.equal(settings.targetRms, 0.09650504109445904);
   assert.equal(settings.minGain, 0.2);
   assert.equal(settings.maxGain, 3);

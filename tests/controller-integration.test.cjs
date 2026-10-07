@@ -27,17 +27,14 @@ test('source changes without emptied reset gain and histories on play or meter',
 
   controller.gain.gain.value = 1.2;
   controller.originalMeter.processBlock(new Float32Array(48000).fill(0.1));
-  controller.agc.lockGain(1.3);
   media.currentSrc = 'blob:replacement';
   media.dispatchEvent(new Event('play'));
 
   assert.equal(controller.gain.gain.value, INITIAL_GAIN);
   assert.equal(controller.originalMeter.getIntegrationTime(), 0);
-  assert.equal(controller.agc.isLocked(), false);
 
   controller.gain.gain.value = 1.2;
   controller.originalMeter.processBlock(new Float32Array(48000).fill(0.1));
-  controller.agc.lockGain(1.3);
   media.currentSrc = 'blob:replacement-again';
   controller.consumeAudio({
     type: 'meter',
@@ -48,7 +45,6 @@ test('source changes without emptied reset gain and histories on play or meter',
 
   assert.equal(controller.gain.gain.value, INITIAL_GAIN);
   assert.equal(controller.originalMeter.getIntegrationTime(), 0);
-  assert.equal(controller.agc.isLocked(), false);
   controller.destroy();
 });
 
@@ -160,10 +156,8 @@ test('target changes reopen programme calibration without replacing the processo
   const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
   await new Promise((resolve) => setImmediate(resolve));
   const processor = global.lastWorklet.processor;
-  controller.agc.lockGain(.8);
   controller.updateSettings({ ...settings, targetRms: Math.pow(10, (-23 + 0.691) / 20) });
   assert.equal(global.lastWorklet.processor, processor);
-  assert.equal(controller.agc.isLocked(), false);
   controller.destroy();
 });
 
@@ -237,35 +231,13 @@ test('seeking resets live windows but keeps integration and the calibration anch
   assert.ok(controller.originalMeter.getIntegrationTime() > 0);
   const integrationTime = controller.originalMeter.getIntegrationTime();
   const integratedLufs = controller.originalMeter.getIntegratedLoudness();
-  controller.agc.lockGain(1.3);
 
   media.dispatchEvent(new Event('seeked'));
 
   assert.equal(controller.originalMeter.getIntegrationTime(), integrationTime);
   assert.equal(controller.originalMeter.getIntegratedLoudness(), integratedLufs);
   assert.ok(Number.isNaN(controller.originalMeter.getMomentaryLoudness()));
-  assert.equal(controller.agc.isLocked(), true);
-  controller.destroy();
-});
-
-test('full-track analysis waits for playback before fetching', async () => {
-  const media = new FakeMedia();
-  media.paused = true;
-  const controller = new MediaVolumeController(
-    media,
-    { ...settings, fullAudioAnalysis: true },
-    () => {},
-    () => {}
-  );
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(controller.analysisStatus, 'waiting-play');
-  assert.equal(controller.analysisAbort, null);
-  assert.equal(controller.analysisAttemptKey, null);
-
-  media.paused = false;
-  media.dispatchEvent(new Event('play'));
-  assert.equal(controller.analysisAttemptKey, controller.analysisKey());
+  assert.equal(controller.gain.gain.value, INITIAL_GAIN);
   controller.destroy();
 });
 
@@ -304,41 +276,5 @@ test('disabled controller emits an empty meter state', async () => {
   assert.ok(Number.isNaN(state.outputIntegratedLufs));
   assert.ok(Number.isNaN(state.originalIntegratedLufs));
   assert.equal(state.gain, 1);
-  controller.destroy();
-});
-
-test('a failed full-track source is not retried on every play', async () => {
-  const media = new FakeMedia();
-  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-
-  controller.settings = { ...controller.settings, fullAudioAnalysis: true };
-  controller.analysisAttemptKey = controller.analysisKey();
-  controller.startAnalysis();
-
-  assert.equal(controller.analysisAbort, null);
-  controller.destroy();
-});
-
-test('returning to a tab preserves a completed full-track gain lock', async () => {
-  const media = new FakeMedia();
-  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-
-  controller.settings = { ...controller.settings, fullAudioAnalysis: true };
-  controller.analysisResult = {
-    integratedLufs: -24,
-    samplePeak: 0.2,
-    estimatedTruePeak: 0.2,
-    duration: 60,
-    sourceUrl: 'https://example.test/audio'
-  };
-  controller.applyFullTrackGain();
-  assert.equal(controller.agc.isLocked(), true);
-
-  setVisibility('hidden');
-  setVisibility('visible');
-
-  assert.equal(controller.agc.isLocked(), true);
   controller.destroy();
 });
