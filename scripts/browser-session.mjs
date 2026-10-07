@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 // One isolated browser per E2E run. Never attach to the user's profile.
+// Startup failures: a slow first launch, a locked port file, a missing executable
+// or an exited process. Use the endpoint advertised by our child process rather
+// than the Windows port-file handoff; startup remains bounded and failures loud.
 export async function openBrowser(artifacts, onEvent = () => {}) {
   const executable = process.env.CHROME_PATH || [
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -13,7 +16,7 @@ export async function openBrowser(artifacts, onEvent = () => {}) {
   assert.ok(executable, 'Set CHROME_PATH to a Chromium executable');
   const profile = join(resolve(artifacts), 'browser-profile');
   const pending = new Map();
-  let browser, socket, sequence = 0;
+  let browser, socket, port, sequence = 0, stderr = '';
 
   function send(method, params = {}) {
     if (socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('Browser disconnected'));
@@ -45,6 +48,7 @@ export async function openBrowser(artifacts, onEvent = () => {}) {
       await delay(500);
       if (browser.exitCode === null) browser.kill();
     }
+    writeFileSync(join(artifacts, 'browser-stderr.log'), stderr);
     assert.equal(resolve(profile), join(resolve(artifacts), 'browser-profile'));
     rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
@@ -59,17 +63,21 @@ export async function openBrowser(artifacts, onEvent = () => {}) {
     browser = spawn(executable, ['--headless=new', '--disable-gpu', '--no-first-run', '--mute-audio',
       '--autoplay-policy=no-user-gesture-required', '--disable-background-timer-throttling',
       '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank'],
-    { stdio: 'ignore', windowsHide: true });
+    { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+    browser.stderr.on('data', chunk => {
+      stderr = (stderr + chunk.toString()).slice(-16384);
+      const advertised = stderr.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\/devtools\/browser\//);
+      if (advertised) port = Number(advertised[1]);
+    });
     let startError;
     browser.on('error', error => { startError = error; });
-    const portFile = join(profile, 'DevToolsActivePort');
-    for (let i = 0; i < 100 && !existsSync(portFile); i++) {
+    const deadline = Date.now() + 30000;
+    while (!port && Date.now() < deadline) {
       if (startError) throw startError;
       if (browser.exitCode !== null) throw new Error('Browser exited during startup');
       await delay(100);
     }
-    assert.ok(existsSync(portFile), 'Browser did not start');
-    const port = readFileSync(portFile, 'utf8').split('\n')[0];
+    assert.ok(Number.isInteger(port) && port > 0 && port <= 65535, 'Browser debugging endpoint timed out after 30s');
     const tabs = await (await fetch('http://127.0.0.1:' + port + '/json/list', { signal: AbortSignal.timeout(10000) })).json();
     socket = new WebSocket(tabs.find(tab => tab.type === 'page').webSocketDebuggerUrl);
     await new Promise((resolve, reject) => {
