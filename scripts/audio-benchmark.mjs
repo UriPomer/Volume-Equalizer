@@ -102,7 +102,7 @@ function simulate(pcm) {
     for(let offset=0;offset<count;offset+=128) {
       const end=Math.min(count,offset+128);
       processor.process([gained.map(c=>c.subarray(offset,end)),raw.map(c=>c.subarray(offset,end))],
-        [[new Float32Array(end-offset),new Float32Array(end-offset)]],{loudnessCeilingLufs:Float32Array.of(-19)});
+        [[new Float32Array(end-offset),new Float32Array(end-offset)]],{loudnessCeilingLufs:Float32Array.of(-19),programmeGain:Float32Array.of(previousGain)});
     }
     for(const message of messages.splice(0)){
       outputMeter.processChannels(message.output);

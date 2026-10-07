@@ -2,7 +2,10 @@ import { LoudnessCeiling } from '../src/loudness-ceiling';
 
 class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
   static get parameterDescriptors() {
-    return [{ name: 'loudnessCeilingLufs', defaultValue: -19, minValue: -68, maxValue: 2, automationRate: 'k-rate' }];
+    return [
+      { name: 'loudnessCeilingLufs', defaultValue: -19, minValue: -68, maxValue: 2, automationRate: 'k-rate' },
+      { name: 'programmeGain', defaultValue: 1, minValue: .000001, maxValue: 32, automationRate: 'a-rate' }
+    ];
   }
 
   constructor(options) {
@@ -20,11 +23,14 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
     this.gain = 1;
     this.loudnessCeiling = new LoudnessCeiling(sampleRate);
     this.peakGains = new Float32Array(128);
+    this.programmeGains = new Float32Array(128);
     this.writeIndex = 0;
     this.delayLines = [];
     this.previousSamples = [];
     this.gainLine = new Float32Array(this.lookaheadSamples);
     this.gainLine.fill(1);
+    this.programmeLine = new Float32Array(this.lookaheadSamples);
+    this.programmeLine.fill(1);
     this.meterSize = Math.max(128, Math.round(sampleRate / 10));
     this.meterIndex = 0;
     this.originalMeter = [];
@@ -48,12 +54,23 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
 
   process(inputs, outputs, parameters) {
     const ceiling = parameters?.loudnessCeilingLufs?.[0] ?? -19;
+    const programmeGain = Math.max(.000001, parameters?.programmeGain?.[0] ?? 1);
+    let restart = this.loudnessCeiling.setCeiling(ceiling);
     // Couple the new meter epoch to the audio parameter becoming effective;
     // messages containing old-target samples must not enter the new maxima.
     if (this.pendingMeterReset && Math.abs(ceiling - this.pendingMeterReset.loudnessCeilingLufs) < 1e-4) {
       this.meterEpoch = this.pendingMeterReset.epoch;
+      restart ||= this.pendingMeterReset.resetProtection === true;
       this.pendingMeterReset = null;
       this.resetMeter();
+    }
+    if (restart) {
+      this.loudnessCeiling.restart();
+      this.gain = 1;
+      this.gainLine.fill(1);
+      this.programmeLine.fill(programmeGain);
+      for (const line of this.delayLines) line.fill(0);
+      for (const history of this.previousSamples) history.fill(0);
     }
     const input = inputs[0] || [];
     const original = inputs[1] && inputs[1].length ? inputs[1] : input;
@@ -67,9 +84,16 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
 
     const frames = output[0].length;
     const channelCount = output.length;
-    if (this.peakGains.length < frames) this.peakGains = new Float32Array(frames);
+    if (this.peakGains.length < frames) {
+      this.peakGains = new Float32Array(frames);
+      this.programmeGains = new Float32Array(frames);
+    }
 
     for (let frame = 0; frame < frames; frame++) {
+      const frameProgrammeGain = Math.max(.000001, parameters?.programmeGain?.[frame] ?? programmeGain);
+      // The retained source ceiling only decreases. Detect at its normalized
+      // level, avoiding clipping PCM that final loudness protection makes safe.
+      const normalizationGain = this.loudnessCeiling.getGain(frameProgrammeGain);
       let linkedPeak = 0;
 
       for (let channel = 0; channel < channelCount; channel++) {
@@ -83,7 +107,7 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
           Math.abs(sample),
           this.estimateCubicPeak(history[0], history[1], history[2], sample)
         );
-        const guardedPeak = truePeak * this.interSampleMargin * 1.0001;
+        const guardedPeak = truePeak * normalizationGain * this.interSampleMargin * 1.0001;
         if (guardedPeak > linkedPeak) linkedPeak = guardedPeak;
         this.delayLines[channel][this.writeIndex] = sample;
         history[0] = history[1];
@@ -98,6 +122,7 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
         this.gain = Math.min(1, targetGain + (this.gain - targetGain) * this.releaseCoeff);
       }
       this.gainLine[this.writeIndex] = this.gain;
+      this.programmeLine[this.writeIndex] = frameProgrammeGain;
       const previousIndex = (this.writeIndex - 1 + this.lookaheadSamples) % this.lookaheadSamples;
       const prePreviousIndex = (this.writeIndex - 2 + this.lookaheadSamples) % this.lookaheadSamples;
       this.gainLine[previousIndex] = Math.min(this.gainLine[previousIndex], this.gain);
@@ -111,10 +136,11 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
           ? delayedSample * delayedGain : 0;
       }
       this.peakGains[frame] = delayedGain;
+      this.programmeGains[frame] = this.programmeLine[readIndex];
       this.writeIndex = readIndex;
     }
 
-    const loudnessGain = this.loudnessCeiling.process(output, ceiling);
+    const loudnessGain = this.loudnessCeiling.process(output, ceiling, this.programmeGains);
     for (let frame = 0; frame < frames; frame++) {
       this.meterMinimumGain = Math.min(this.meterMinimumGain, this.peakGains[frame]);
       this.meterMinimumLoudnessGain = Math.min(this.meterMinimumLoudnessGain, loudnessGain);

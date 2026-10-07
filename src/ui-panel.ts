@@ -47,6 +47,7 @@ export function ensurePanel(
 
   const shadow = host.attachShadow({ mode: 'open' });
   shadow.innerHTML = `<style>${PANEL_CSS}</style>${panelHtml(settings)}`;
+  setText(shadow, '[data-role="version"]', `v${chrome.runtime.getManifest().version}`);
   bindPanel(shadow, settings, changeSettings);
   updateMeter(shadow, getMeter);
   return host;
@@ -61,7 +62,7 @@ function panelHtml(settings: Settings): string {
   return `<div class="wrap">
     <div class="dock"><i></i><b>EQ</b></div>
     <section>
-      <header><strong>音量均衡</strong><button data-action="enabled"></button></header>
+      <header><div><strong>音量均衡</strong><small data-role="version"></small></div><button data-action="enabled"></button></header>
       <hr>
       <label class="mode">完整音轨预分析<button data-action="fullAudioAnalysis"></button></label>
       ${slider('targetLufs', '目标积分响度', -23, -10, .5, target)}
@@ -76,7 +77,7 @@ function panelHtml(settings: Settings): string {
         ${meterRow('积分', 'outputIntegrated', ' LUFS')} ${meterRow('瞬时', 'output', ' LUFS')}
         ${meterRow('最大瞬时 · 400ms', 'maximumMomentary')}
         ${meterRow('最大短时 · 3s', 'maximumShortTerm')}
-        ${meterRow('增益', 'gain')} ${meterRow('算法', 'status')}
+        ${meterRow('节目增益', 'programmeGain')} ${meterRow('实际增益', 'gain')} ${meterRow('算法', 'status')}
         ${meterRow('调节状态', 'phase')}
         ${meterRow('削波保护', 'safety')}
         ${meterRow('响度保护', 'loudnessSafety')}
@@ -178,8 +179,9 @@ function updateMeter(shadow: ShadowRoot, getMeter: () => MeterState): void {
     setText(shadow, '[data-meter="maximumShortTerm"]', showMomentary(meter.maximumShortTermLufs));
     setText(shadow, '[data-meter="outputIntegrated"]', showMomentary(meter.outputIntegratedLufs));
     const phases = { collecting: '收集有效声音', calibrating: '平滑校准', stable: '已稳定', 'full-track': '完整音轨' };
-    setText(shadow, '[data-meter="phase"]', `${meter.loudnessGain < .999 ? '响度上限限制' : phases[meter.phase]}${meter.gainLimited ? ' · 达到倍率限制' : ''}`);
+    setText(shadow, '[data-meter="phase"]', `${phases[meter.phase]}${meter.loudnessGain < .999 ? ' · 响度上限限制' : ''}${meter.gainLimited ? ' · 达到倍率限制' : ''}`);
     setText(shadow, '[data-meter="gain"]', `${meter.gain.toFixed(2)}x`);
+    setText(shadow, '[data-meter="programmeGain"]', `${meter.programmeGain.toFixed(2)}x`);
     setText(shadow, '[data-meter="status"]', STATUS_TEXT[meter.analysisStatus]);
   }, 100);
 }
@@ -211,6 +213,7 @@ section{width:220px;box-sizing:border-box;padding:12px;border-radius:14px 0 0 0;
 :host([data-open]) section{opacity:1}
 header,.mode,.param span,.meter div{display:flex;align-items:center;justify-content:space-between}
 header{font-size:13px}button{border:0;border-radius:99px;padding:3px 9px;background:#ffffff18;color:#ffffff90;cursor:pointer;font-size:10px}button.on{background:#0ea5e9;color:white}
+header small{display:block;font-size:10px;color:#ffffff70;margin-top:2px}
 hr{border:0;height:1px;background:#ffffff12;margin:9px 0}.mode,.param{display:block;color:#ffffff90;font-size:11px}.mode{display:flex;margin:9px 0}
 .param{margin-top:8px}.param span b{color:#e2e8f0;font-size:12px}input{appearance:none;width:100%;height:3px;background:#ffffff20;border-radius:2px;cursor:pointer}input::-webkit-slider-thumb{appearance:none;width:13px;height:13px;border-radius:50%;background:#38bdf8}
 .meter{font-size:11px}.meter small{display:block;color:#ffffff50;font-weight:600;margin-top:6px}.meter div{padding:2px 0}.meter span{color:#ffffff60}.meter b{color:#cbd5e1;font-weight:500;font-variant-numeric:tabular-nums;text-align:right}

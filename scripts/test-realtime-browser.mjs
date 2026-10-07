@@ -20,6 +20,7 @@ import { denseMaxima, ffmpegMaxima, writeFloatWav } from './audio-test-artifacts
 const artifacts = mkdtempSync(join(process.env.VOLUME_EQ_ARTIFACT_ROOT || tmpdir(), 'volume-eq-realtime-'));
 const content = readFileSync(resolve('dist/content.js'));
 const worklet = readFileSync(resolve('dist/limiter-worklet.js'));
+const installedVersion = JSON.parse(readFileSync(resolve('dist/manifest.json'),'utf8')).version;
 const rate = 48000;
 const fixture = join(artifacts, 'mixed.wav');
 function writeTone(file, seconds, amplitude, frequency = 1000) {
@@ -75,7 +76,7 @@ BaseAudioContext.prototype.createGain=function(...args){
   return node;
 };
 for(const type of ['pause','play','waiting','stalled','error','ended','seeking','seeked'])document.querySelector('audio').addEventListener(type,event=>window.mediaEvents.push({type,time:event.target.currentTime}));
-window.chrome={runtime:{getURL:path=>'/'+path},storage:{local:{
+window.chrome={runtime:{getURL:path=>'/'+path,getManifest:()=>({version:'${installedVersion}'})},storage:{local:{
   get:(defaults,callback)=>callback({...defaults,...stored}),
   set:(settings,callback)=>{Object.assign(stored,settings);callback();}
 },onChanged:{addListener(){},removeListener(){}}}};
@@ -132,6 +133,7 @@ async function snapshot() {
       paused:document.querySelector('audio').paused,readyState:document.querySelector('audio').readyState,
       mediaError:document.querySelector('audio').error?.message,
       gain:parseFloat(text('gain')),programmeGain:window.programmeGainParam?.value,
+      displayedProgrammeGain:parseFloat(text('programmeGain')),version:root.querySelector('[data-role="version"]')?.textContent,
       gainTraceIndex:window.programmeGains.length-1,safety:parseFloat(text('safety')),phase:text('phase'),status:text('status'),
       loudnessProtection:parseFloat(text('loudnessSafety')),maximumMomentary:parseFloat(text('maximumMomentary')),
       maximumShortTerm:parseFloat(text('maximumShortTerm')),
@@ -179,13 +181,14 @@ try {
   await send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 900, deviceScaleFactor: 1, mobile: false });
   await send('Page.navigate', { url: 'http://127.0.0.1:' + server.address().port });
   for (let i = 0; i < 100 && !(await snapshot()); i++) await delay(100);
+  assert.equal((await snapshot()).version,'v'+installedVersion,'Panel must show the installed manifest version');
   await playFixture('stability.wav');
   let stable;
   for (let i = 0; i < 16; i++) {
     stable = await observe(1);
-    if (stable.phase === '已稳定') break;
+    if (stable.phase.includes('已稳定')) break;
   }
-  assert.equal(stable.phase, '已稳定', 'Initial constant passage must establish a stable anchor');
+  assert.ok(stable.phase.includes('已稳定'), 'Initial constant passage must establish a stable anchor');
   const anchor = stable.programmeGain, firstStableIndex = stable.gainTraceIndex;
   await observe(62 - stable.time);
   const sustained = await checkpoint('stable-gain-with-sustained-loud-content');
@@ -206,15 +209,33 @@ try {
   await setSlider('targetLufs', -21);
   const periodicTraceStart = report.trace.length;
   await playFixture('periodic.wav');
+  recorded.length=0;
+  const periodicRate=await evaluate('window.startAudioCapture()');
+  const periodicStartTime=await evaluate("document.querySelector('audio').currentTime");
   await observe(60);
+  await evaluate('window.stopAudioCapture()');
   // A source change can occur between UI animation frames. Exclude the old
   // video's last rendered status; this profile needs >=10 s for calibration.
-  const periodic = report.trace.slice(periodicTraceStart), firstPeriodicStable = periodic.find(row => row.time >= 10 && row.phase === '已稳定');
+  const periodic = report.trace.slice(periodicTraceStart), firstPeriodicStable = periodic.find(row => row.time >= 10 && row.phase.includes('已稳定'));
   assert.ok(firstPeriodicStable && firstPeriodicStable.time <= 25, 'Periodic high dynamics must finish calibration');
   const periodicDecisions = await evaluate(`window.programmeGains.filter(row=>row.fixture==='periodic.wav'&&row.mediaTime>=${firstPeriodicStable?.time ?? 0})`);
   const periodicValues = periodicDecisions.map(row => row.value);
   report.periodic = {firstStableSeconds:firstPeriodicStable.time, min:Math.min(...periodicValues),max:Math.max(...periodicValues),decisions:periodicDecisions};
   assert.ok(report.periodic.max-report.periodic.min<=.2+1e-6, 'Periodic input must obey the complete stable gain span');
+  const periodicActual=periodic.filter(row=>row.time>30).map(row=>row.gain);
+  report.periodic.actualGainSpan=Math.max(...periodicActual)-Math.min(...periodicActual);
+  assert.ok(report.periodic.actualGainSpan<=.2,'Final effective gain must not pump between loud and quiet phrases');
+  const periodicBytes=Buffer.concat(recorded.sort((a,b)=>a.sequence-b.sequence).map(row=>row.bytes));
+  const periodicPcm=new Float32Array(periodicBytes.buffer.slice(periodicBytes.byteOffset,periodicBytes.byteOffset+periodicBytes.length));
+  const periodicFile=join(artifacts,'periodic-dynamics-output.wav');
+  writeFloatWav(periodicFile,periodicPcm,periodicRate,2);
+  report.periodic.file=periodicFile;
+  const periodicRms=(start,end)=>{
+    const block=periodicPcm.slice(Math.round((start-periodicStartTime)*periodicRate)*2,Math.round((end-periodicStartTime)*periodicRate)*2);
+    return Math.sqrt(block.reduce((sum,value)=>sum+value*value,0)/block.length);
+  };
+  report.periodic.contrasts=[30,33,36,39,42,45,48,51,54,57].map(start=>20*Math.log10(periodicRms(start+.25,start+.45)/periodicRms(start+2,start+2.2)));
+  assert.ok(report.periodic.contrasts.every(value=>Math.abs(value-12)<=.5),'Recorded destination PCM must retain the 12 dB phrase contrast');
   await checkpoint('periodic-high-dynamics-stable');
   await setSlider('targetLufs', -17.5);
   const mixedTraceStart = report.trace.length;
@@ -223,7 +244,8 @@ try {
   const mixed = await checkpoint('mixed-input-below-target');
   await screenshot('mixed');
   assert.ok(Math.abs(mixed.input - reference.integratedLufs) <= .4, 'Input differs from independent FFmpeg measurement');
-  assert.ok(report.trace.slice(mixedTraceStart).some(row => row.gain > 1.2), 'Below-target integrated input must still allow amplification outside constrained passages');
+  assert.ok(report.trace.slice(mixedTraceStart).some(row => row.programmeGain > 1.2), 'Below-target integrated input must allow programme amplification');
+  assert.ok(Math.abs(mixed.displayedProgrammeGain-mixed.programmeGain)<=.01,'Panel must distinguish programme gain from final gain');
   assert.ok(mixed.output > mixed.input + .3, 'Ceiling protection must not defeat programme normalization entirely');
   assert.ok(mixed.maximumMomentary <= -15.5 && mixed.maximumShortTerm <= -15.5, 'Historical output maxima must honor target +2 LU');
   assert.ok(report.trace.slice(mixedTraceStart).some(row => row.phase.includes('响度上限限制')), 'A binding loudness ceiling must be explicit');
@@ -266,6 +288,7 @@ try {
   assert.ok(ceiling.maximumMomentary <= -15.5 && ceiling.maximumShortTerm <= -15.5, 'Gain floor must not bypass target +2 LU');
   assert.ok(ceiling.output >= -17.5, 'Ceiling must retain useful audio when the floor prevents normalization');
   const captureRate = await evaluate('window.startAudioCapture()');
+  recorded.length=0;
   await playFixture('multiple.wav');
   const secondLoad = await evaluate(`(async()=>{const media=document.createElement('audio');media.id='second-media';document.body.append(media);const bytes=await(await fetch('/second.wav')).arrayBuffer();const sha256=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),v=>v.toString(16).padStart(2,'0')).join('');media.src=URL.createObjectURL(new Blob([bytes],{type:'audio/wav'}));await media.play();return {file:'second.wav',bytes:bytes.byteLength,sha256};})()`);
   report.inputLoads.push(secondLoad);

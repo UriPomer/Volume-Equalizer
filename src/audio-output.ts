@@ -21,7 +21,7 @@ export class SharedAudioOutput {
   readonly ready: Promise<void>;
   private node: AudioWorkletNode | null = null;
   private readonly meter: LoudnessMeter;
-  private readonly clients = new Set<() => void>();
+  private readonly clients = new Map<() => void, () => number>();
   private epoch = 0;
   private safetyGain = 1;
   private loudnessGain = 1;
@@ -44,17 +44,25 @@ export class SharedAudioOutput {
       node.onprocessorerror = () => {
         this.failed = true;
         node.disconnect();
-        for (const fail of this.clients) fail();
+        for (const fail of this.clients.keys()) fail();
       };
       this.node = node;
+      this.updateProgrammeGain();
       if (this.enabled) node.connect(context.destination);
     });
   }
 
-  retain(onFailure: () => void): () => void {
-    this.clients.add(onFailure);
+  retain(onFailure: () => void, getGain: () => number): () => void {
+    this.clients.set(onFailure, getGain);
+    this.updateProgrammeGain();
+    if (this.clients.size > 1) this.resetMeasurements(true, true);
     return () => {
-      if (!this.clients.delete(onFailure) || this.clients.size) return;
+      if (!this.clients.delete(onFailure)) return;
+      if (this.clients.size) {
+        this.updateProgrammeGain();
+        this.resetMeasurements(true, true);
+        return;
+      }
       this.closed = true;
       if (this.node) {
         this.node.port.onmessage = null;
@@ -66,6 +74,11 @@ export class SharedAudioOutput {
   }
 
   isReady(): boolean { return this.node !== null && !this.failed && !this.closed; }
+
+  updateProgrammeGain(): void {
+    const gain = this.clients.size === 1 ? this.clients.values().next().value!() : 1;
+    this.node?.parameters.get('programmeGain')?.setValueAtTime(gain, this.context.currentTime);
+  }
 
   connect(source: AudioNode): void {
     if (!this.isReady()) throw new Error('Mixed output protection unavailable');
@@ -102,9 +115,10 @@ export class SharedAudioOutput {
     };
   }
 
-  private resetMeasurements(preserveIntegrated = false): void {
+  private resetMeasurements(preserveIntegrated = false, resetProtection = !preserveIntegrated): void {
     this.meter.reset({ preserveIntegrated });
-    this.safetyGain = this.loudnessGain = 1;
-    this.node?.port.postMessage({type:'reset-meter',epoch:++this.epoch,loudnessCeilingLufs:this.targetLufs+2});
+    if (resetProtection) this.safetyGain = this.loudnessGain = 1;
+    this.node?.port.postMessage({type:'reset-meter',epoch:++this.epoch,
+      loudnessCeilingLufs:this.targetLufs+2,resetProtection});
   }
 }

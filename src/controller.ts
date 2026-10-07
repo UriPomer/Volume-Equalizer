@@ -88,7 +88,7 @@ export class MediaVolumeController {
       if (this.destroyed) return;
       this.analysisStatus = 'processor-unavailable';
       this.connectGraph();
-    });
+    }, () => this.gain.gain.value);
     this.output.updateSettings(rmsToLufs(settings.targetRms), settings.enabled);
 
     this.bindEvents();
@@ -297,6 +297,7 @@ export class MediaVolumeController {
       gainLimited: this.gainState.limited,
       originalIntegratedLufs: originalLufs,
       gain: this.gain.gain.value * output.safetyGain * output.loudnessGain,
+      programmeGain: this.gain.gain.value,
       sampleCount: Math.floor(this.originalMeter.getIntegrationTime()),
       analysisStatus: this.processor && this.output.isReady() ? this.analysisStatus : 'processor-unavailable'
     });
@@ -307,6 +308,7 @@ export class MediaVolumeController {
       : clamp(value, this.settings.minGain, this.settings.maxGain);
     this.gain.gain.cancelScheduledValues(this.context.currentTime);
     this.gain.gain.setValueAtTime(gain, this.context.currentTime);
+    this.output.updateProgrammeGain();
   }
 
   private resetMeters(resetAgc = true): void {

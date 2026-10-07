@@ -15,33 +15,78 @@ export class LoudnessCeiling {
   private readonly inputEnergy: Float64Array;
   private inputIndex = 0;
   private inputSum = 0;
+  private inputFilled = 0;
   private momentaryIndex = 0;
   private shortTermIndex = 0;
   private momentarySum = 0;
   private shortTermSum = 0;
   private gain = 1;
+  private heldGain = Infinity;
+  private observedFrames = 0;
   private previousCeiling = NaN;
 
   constructor(private readonly rate: number) {
     this.momentary = new Float64Array(Math.ceil(rate * .4));
     this.shortTerm = new Float64Array(Math.ceil(rate * 3));
-    this.inputEnergy = new Float64Array(Math.ceil(rate * .1));
+    // Reserve time before the 400 ms output window fills, while keeping the
+    // steady fixed-gain cost below 10*log10(400/350) = 0.58 LU.
+    this.inputEnergy = new Float64Array(Math.ceil(rate * .35));
   }
 
-  process(channels: Float32Array[], ceilingLufs: number): number {
+  getGain(programmeGain = 1): number { return Math.min(1, this.heldGain / programmeGain); }
+
+  /** Recalibrate for an explicit source/settings change, retaining already
+   * emitted PCM's window budget. A seek or meter reset must not release gain. */
+  restart(): void {
+    this.gain = 1;
+    this.heldGain = Infinity;
+    this.observedFrames = 0;
+    this.inputEnergy.fill(0); this.inputSum = this.inputIndex = this.inputFilled = 0;
+    for (const filter of this.inputFilters) filter.reset();
+  }
+
+  setCeiling(ceilingLufs: number): boolean {
+    if (ceilingLufs === this.previousCeiling) return false;
+    this.previousCeiling = ceilingLufs;
+    this.resetOutputWindows();
+    return true;
+  }
+
+  process(channels: Float32Array[], ceilingLufs: number, programmeGains?: Float32Array): number {
     const frames = channels[0]?.length ?? 0;
     if (!frames) return this.gain;
     this.prepare(channels.length);
-    if (ceilingLufs !== this.previousCeiling) {
-      // A changed target starts a new measurement epoch. Already-played audio
-      // cannot satisfy a lower retrospective ceiling; retain the filter tail
-      // and gain, but do not mute for three seconds to repay its old energy.
-      this.resetOutputWindows();
-      this.previousCeiling = ceilingLufs;
-    }
+    if (this.setCeiling(ceilingLufs)) this.restart();
     // Small implementation margin covers float PCM and the reference meter's
     // coefficient rounding; this is not an extra user-visible loudness target.
     const energyLimit = Math.pow(10, (ceilingLufs - .15 + .691) / 10);
+    // Learn the source level independently of ordinary gain. Its delayed
+    // per-frame value avoids confusing a calibration change with louder audio.
+    for (let frame = 0; frame < frames; frame++) {
+      let energy = 0;
+      const programmeGain = programmeGains?.[frame] ?? 1;
+      for (let channel = 0; channel < channels.length; channel++) {
+        const input = this.inputFilters[channel].process(channels[channel][frame] / programmeGain);
+        energy += this.weights[channel] * input * input;
+      }
+      this.inputSum += energy - this.inputEnergy[this.inputIndex];
+      this.inputEnergy[this.inputIndex] = energy;
+      this.inputIndex = (this.inputIndex + 1) % this.inputEnergy.length;
+      if (this.inputFilled || energy > 1e-12) this.inputFilled = Math.min(this.inputEnergy.length, this.inputFilled + 1);
+    }
+    const envelopeGain = this.inputFilled > 0 && this.inputSum > 0
+      ? Math.sqrt(energyLimit * Math.max(this.inputFilled === this.inputEnergy.length
+        ? this.inputFilled : Math.min(this.inputFilled, this.inputEnergy.length / 2), Math.ceil(this.rate * .02)) / this.inputSum) : Infinity;
+    // Startup filter transients are not representative programme evidence.
+    // Protect them immediately, but only retain complete input windows.
+    if (this.inputFilled === this.inputEnergy.length) this.heldGain = Math.min(this.heldGain, envelopeGain);
+    let normalizationGain = 1, maximumEffectiveGain = 0;
+    for (let frame = 0; frame < frames; frame++) {
+      const gain = Math.min(this.getGain(programmeGains?.[frame] ?? 1), envelopeGain / (programmeGains?.[frame] ?? 1));
+      normalizationGain = Math.min(normalizationGain, gain);
+      maximumEffectiveGain = Math.max(maximumEffectiveGain, gain * (programmeGains?.[frame] ?? 1));
+      for (const channel of channels) channel[frame] *= gain;
+    }
     for (let channel = 0; channel < channels.length; channel++) {
       this.signalFilters[channel].reset();
       this.tailFilters[channel].copyStateFrom(this.filters[channel]);
@@ -49,7 +94,6 @@ export class LoudnessCeiling {
     let a = 0, b = 0, c = 0, next = 1;
     let oldMomentary = this.momentarySum, oldShortTerm = this.shortTermSum;
     for (let frame = 0; frame < frames; frame++) {
-      let inputEnergy = 0;
       for (let channel = 0; channel < channels.length; channel++) {
         const signal = this.signalFilters[channel].process(channels[channel][frame]);
         const tail = this.tailFilters[channel].process(0);
@@ -57,25 +101,13 @@ export class LoudnessCeiling {
         a += weight * signal * signal;
         b += 2 * weight * signal * tail;
         c += weight * tail * tail;
-        const input = this.inputFilters[channel].process(channels[channel][frame]);
-        inputEnergy += weight * input * input;
       }
-      this.inputSum += inputEnergy - this.inputEnergy[this.inputIndex];
-      this.inputEnergy[this.inputIndex] = inputEnergy;
-      this.inputIndex = (this.inputIndex + 1) % this.inputEnergy.length;
       oldMomentary -= this.momentary[(this.momentaryIndex + frame) % this.momentary.length];
       oldShortTerm -= this.shortTerm[(this.shortTermIndex + frame) % this.shortTerm.length];
       const budget = Math.min(energyLimit * this.momentary.length - oldMomentary,
         energyLimit * this.shortTerm.length - oldShortTerm);
       next = Math.min(next, maximumGain(a, b, c, budget));
     }
-    // A 100 ms input envelope approaches the ceiling smoothly. The exact
-    // output-window constraints below remain authoritative during new bursts.
-    // Limiting each 128-frame quantum's average instead would flatten speech
-    // and attenuate bass merely because of its phase within that tiny block.
-    const envelopeGain = this.inputSum > energyLimit * this.inputEnergy.length
-      ? Math.sqrt(energyLimit * this.inputEnergy.length / this.inputSum) : 1;
-    next = Math.min(next, envelopeGain, 1 - (1 - this.gain) * Math.exp(-frames / (this.rate * .05)));
     // Reserve the complete filter decay before emitting this quantum. Without
     // this reserve, a spent window budget could overflow even at zero gain:
     // the measurement filters still contain energy from earlier output.
@@ -86,7 +118,13 @@ export class LoudnessCeiling {
     const tailBudget = Math.min(energyLimit * this.momentary.length - oldMomentary,
       energyLimit * this.shortTerm.length - oldShortTerm);
     next = Math.min(next, maximumGain(a + this.tailEnergy[0], b + this.tailEnergy[1], c + this.tailEnergy[2], tailBudget));
-    this.gain = Math.max(0, next);
+    this.observedFrames += frames;
+    // Unexpected louder content still needs an immediate safety reduction.
+    // After calibration, recovering the temporary window guard may add at
+    // most 0.05x per second to overall gain, regardless of programme gain.
+    const recovery = this.observedFrames < this.rate * 10 ? 1
+      : .05 * frames / this.rate / Math.max(maximumEffectiveGain, 1e-6);
+    this.gain = Math.max(0, Math.min(next, this.gain + recovery));
     for (let frame = 0; frame < frames; frame++) {
       let energy = 0;
       for (let channel = 0; channel < channels.length; channel++) {
@@ -100,7 +138,7 @@ export class LoudnessCeiling {
       this.momentaryIndex = (this.momentaryIndex + 1) % this.momentary.length;
       this.shortTermIndex = (this.shortTermIndex + 1) % this.shortTerm.length;
     }
-    return this.gain;
+    return this.gain * normalizationGain;
   }
 
   private resetOutputWindows(): void {
@@ -116,7 +154,7 @@ export class LoudnessCeiling {
     this.inputFilters = Array.from({ length: count }, () => new KWeighting(this.rate));
     this.weights = Array.from({ length: count }, (_, channel) => channelWeight(channel, count));
     this.resetOutputWindows();
-    this.inputEnergy.fill(0); this.inputSum = this.inputIndex = 0;
+    this.restart();
   }
 }
 
