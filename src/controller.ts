@@ -1,6 +1,6 @@
 import { createMediaMeter, ensureAudioContext, ensureMediaSource } from './audio-context';
-import { AudioOutputClient, getAudioOutput, SharedAudioOutput } from './audio-output';
-import { INITIAL_GAIN, Settings } from './config';
+import { getAudioOutput, SharedAudioOutput } from './audio-output';
+import { BASS_FREQUENCY, INITIAL_GAIN, Settings } from './config';
 import { analyzeFullAudio, calculateFullAudioGain, classifyMediaDuration, FullAudioAnalysisError, FullAudioAnalysisResult } from './full-audio-analysis';
 import { AgcUpdateResult, RealtimeAgc } from './gain-control';
 import { logDiagnostic, warnFailure } from './logger';
@@ -26,7 +26,7 @@ export class MediaVolumeController {
   private processor: AudioWorkletNode | null = null;
   private originalMeter: LoudnessMeter;
   private readonly output: SharedAudioOutput;
-  private readonly outputClient: AudioOutputClient;
+  private readonly releaseOutput: () => void;
   private agc = new RealtimeAgc();
   private analysisStatus: AnalysisStatus = 'realtime';
   private analysisAbort: AbortController | null = null;
@@ -60,7 +60,7 @@ export class MediaVolumeController {
   private readonly onLoadedMetadata = () => { this.refreshMediaIdentity(); this.startAnalysis(); };
   private readonly onSeeked = () => {
     // Same-media seeks clear discontinuous live windows, retaining the
-    // integrated control reference and calibration anchor.
+    // integrated control reference and current gain.
     this.invalidateMeasurements(false);
   };
 
@@ -80,11 +80,11 @@ export class MediaVolumeController {
     this.gain = this.context.createGain();
     this.bass = this.context.createBiquadFilter();
     this.bass.type = 'lowshelf';
-    this.bass.frequency.value = 200;
+    this.bass.frequency.value = BASS_FREQUENCY;
     this.bass.gain.value = settings.bassBoost;
-    this.originalMeter = new LoudnessMeter(this.context.sampleRate);
+    this.originalMeter = new LoudnessMeter(this.context.sampleRate, Infinity);
     this.output = getAudioOutput(this.context, rmsToLufs(settings.targetRms));
-    this.outputClient = this.output.retain(() => {
+    this.releaseOutput = this.output.retain(() => {
       if (this.destroyed) return;
       this.analysisStatus = 'processor-unavailable';
       this.connectGraph();
@@ -122,8 +122,13 @@ export class MediaVolumeController {
     }
 
     if (previous.targetRms !== next.targetRms || previous.bassBoost !== next.bassBoost) {
-      if (previous.bassBoost !== next.bassBoost) this.invalidateMeasurements();
-      else this.invalidateMeasurements(false);
+      if (previous.bassBoost !== next.bassBoost) {
+        this.invalidateMeasurements();
+        this.cancelAnalysis();
+        this.analysisAttemptKey = null;
+        this.analysisResult = null;
+        this.startAnalysis();
+      } else this.invalidateMeasurements(false);
       this.agc.unlockGain();
       if (next.fullAudioAnalysis && this.analysisResult) this.applyFullTrackGain();
     }
@@ -163,7 +168,7 @@ export class MediaVolumeController {
       this.processor.onprocessorerror = null;
       this.processor = null;
     }
-    this.outputClient.release();
+    this.releaseOutput();
   }
 
   private bindEvents(): void {
@@ -296,7 +301,7 @@ export class MediaVolumeController {
       phase: this.gainState.phase,
       gainLimited: this.gainState.limited,
       originalIntegratedLufs: originalLufs,
-      gain: this.gain.gain.value * output.safetyGain * output.loudnessGain,
+      gain: this.gain.gain.value * output.safetyGain,
       sampleCount: Math.floor(this.originalMeter.getIntegrationTime()),
       analysisStatus: this.processor && this.output.isReady() ? this.analysisStatus : 'processor-unavailable'
     });
@@ -308,7 +313,6 @@ export class MediaVolumeController {
     const time = this.context.currentTime;
     this.gain.gain.cancelScheduledValues(time);
     this.gain.gain.setValueAtTime(gain, time);
-    this.outputClient.setGain(gain, time);
   }
 
   private resetMeters(resetAgc = true): void {
@@ -349,7 +353,7 @@ export class MediaVolumeController {
     const abort = new AbortController();
     this.analysisAbort = abort;
     this.analysisStatus = 'analyzing';
-    analyzeFullAudio(this.media, this.context, abort.signal).then((result) => {
+    analyzeFullAudio(this.media, this.context, abort.signal, this.settings.bassBoost).then((result) => {
       if (
         this.destroyed
         || abort.signal.aborted

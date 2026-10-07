@@ -18,7 +18,6 @@ export interface MeterState {
   originalMomentaryLufs: number;
   momentaryLufs: number;
   safetyGain: number;
-  loudnessGain: number;
   maximumMomentaryLufs: number;
   maximumShortTermLufs: number;
   gain: number;
@@ -34,7 +33,6 @@ export const EMPTY_METER_STATE: MeterState = {
   originalMomentaryLufs: NaN,
   momentaryLufs: NaN,
   safetyGain: 1,
-  loudnessGain: 1,
   maximumMomentaryLufs: NaN,
   maximumShortTermLufs: NaN,
   gain: 1,

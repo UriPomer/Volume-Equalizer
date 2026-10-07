@@ -1,10 +1,9 @@
 import { LoudnessMeter } from './loudness-meter';
 import { logDiagnostic } from './logger';
+import { BASS_FREQUENCY } from './config';
 
 export interface FullAudioAnalysisResult {
   integratedLufs: number;
-  samplePeak: number;
-  estimatedTruePeak: number;
   duration: number;
   sourceUrl: string;
 }
@@ -31,13 +30,12 @@ export class FullAudioAnalysisError extends Error {
 const MAX_COMPRESSED_AUDIO_BYTES = 48 * 1024 * 1024;
 const MAX_DECODED_AUDIO_BYTES = 256 * 1024 * 1024;
 const ANALYSIS_CHUNK_SECONDS = 1;
-const TRUE_PEAK_MARGIN = 1.03;
-const LIMITER_CEILING = 0.8912509381337456;
 
 export async function analyzeFullAudio(
   media: HTMLMediaElement,
   context: AudioContext,
-  signal: AbortSignal
+  signal: AbortSignal,
+  bassBoost = 0
 ): Promise<FullAudioAnalysisResult> {
   const mediaDuration = media.duration;
   if (classifyMediaDuration(mediaDuration) !== 'ready') {
@@ -120,6 +118,25 @@ export async function analyzeFullAudio(
   );
   assertFullAudioDurationComplete(decoded.duration, mediaDuration);
 
+  if (bassBoost !== 0) {
+    const preview = new OfflineAudioContext(decoded.numberOfChannels, decoded.length, decoded.sampleRate);
+    const source = preview.createBufferSource();
+    source.buffer = decoded;
+    const bass = preview.createBiquadFilter();
+    bass.type = 'lowshelf';
+    bass.frequency.value = BASS_FREQUENCY;
+    bass.gain.value = bassBoost;
+    source.connect(bass).connect(preview.destination);
+    source.start();
+    try {
+      decoded = await preview.startRendering();
+    } finally {
+      source.disconnect();
+      bass.disconnect();
+    }
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+  }
+
   logDiagnostic('完整音轨：解码完整，开始响度分析', {
     decodedDurationSeconds: roundDuration(decoded.duration),
     videoDurationSeconds: roundDuration(mediaDuration),
@@ -133,20 +150,12 @@ export async function analyzeFullAudio(
     (_, channel) => decoded.getChannelData(channel)
   );
   const chunkFrames = Math.max(1, Math.floor(decoded.sampleRate * ANALYSIS_CHUNK_SECONDS));
-  let samplePeak = 0;
-  const truePeakEstimator = new TruePeakEstimator();
 
   for (let offset = 0; offset < decoded.length; offset += chunkFrames) {
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     const end = Math.min(decoded.length, offset + chunkFrames);
     const chunk = channels.map((channel) => channel.subarray(offset, end));
 
-    for (const channel of chunk) {
-      for (let i = 0; i < channel.length; i++) {
-        samplePeak = Math.max(samplePeak, Math.abs(channel[i]));
-      }
-    }
-    truePeakEstimator.processChannels(chunk);
     meter.processChannels(chunk);
 
     // Keep the page responsive while the experimental full-track pass runs.
@@ -160,15 +169,11 @@ export async function analyzeFullAudio(
 
   logDiagnostic('完整音轨：分析完成', {
     integratedLufs,
-    samplePeak,
-    estimatedTruePeak: truePeakEstimator.getPeak(),
     durationSeconds: roundDuration(decoded.duration)
   });
 
   return {
     integratedLufs,
-    samplePeak,
-    estimatedTruePeak: truePeakEstimator.getPeak(),
     duration: decoded.duration,
     sourceUrl
   };
@@ -201,76 +206,22 @@ export function assertFullAudioDurationComplete(
     throw new FullAudioAnalysisError('decode-failed', `解码音轨时长无效: ${decodedDuration}`);
   }
   const toleranceSeconds = Math.max(2, mediaDuration * 0.005);
-  if (decodedDuration + toleranceSeconds < mediaDuration) {
+  if (Math.abs(decodedDuration - mediaDuration) > toleranceSeconds) {
     throw new FullAudioAnalysisError(
       'incomplete',
-      `音轨长度不完整: ${roundDuration(decodedDuration)}/${roundDuration(mediaDuration)} 秒`
+      `音轨时长不匹配: ${roundDuration(decodedDuration)}/${roundDuration(mediaDuration)} 秒`
     );
   }
 }
 
 export function calculateFullAudioGain(
-  result: Pick<FullAudioAnalysisResult, 'integratedLufs' | 'samplePeak'> & {
-    estimatedTruePeak?: number;
-  },
+  result: Pick<FullAudioAnalysisResult, 'integratedLufs'>,
   targetLufs: number,
   minGain: number,
   maxGain: number
 ): number {
   const loudnessGain = Math.pow(10, (targetLufs - result.integratedLufs) / 20);
-  const programmePeak = Math.max(result.samplePeak, result.estimatedTruePeak ?? 0);
-  const peakSafeGain = programmePeak > 0
-    ? LIMITER_CEILING / (programmePeak * TRUE_PEAK_MARGIN)
-    : maxGain;
-  return Math.min(Math.max(loudnessGain, minGain), maxGain, peakSafeGain);
-}
-
-export class TruePeakEstimator {
-  private histories: Float32Array[] = [];
-  private peak = 0;
-
-  processChannels(channels: Float32Array[]): void {
-    while (this.histories.length < channels.length) {
-      this.histories.push(new Float32Array(3));
-    }
-
-    for (let channelIndex = 0; channelIndex < channels.length; channelIndex++) {
-      const history = this.histories[channelIndex];
-      const channel = channels[channelIndex];
-      for (let index = 0; index < channel.length; index++) {
-        const sample = channel[index];
-        this.peak = Math.max(
-          this.peak,
-          Math.abs(sample),
-          estimateCubicPeak(history[0], history[1], history[2], sample)
-        );
-        history[0] = history[1];
-        history[1] = history[2];
-        history[2] = sample;
-      }
-    }
-  }
-
-  getPeak(): number {
-    return this.peak;
-  }
-}
-
-function estimateCubicPeak(p0: number, p1: number, p2: number, p3: number): number {
-  let peak = 0;
-  for (let step = 0; step < 4; step++) {
-    const t = step / 4;
-    const t2 = t * t;
-    const t3 = t2 * t;
-    const value = 0.5 * (
-      (2 * p1) +
-      (-p0 + p2) * t +
-      (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
-      (-p0 + 3 * p1 - 3 * p2 + p3) * t3
-    );
-    peak = Math.max(peak, Math.abs(value));
-  }
-  return peak;
+  return Math.min(Math.max(loudnessGain, minGain), maxGain);
 }
 
 export function findBilibiliAudioUrl(scriptTexts: string[]): string | null {

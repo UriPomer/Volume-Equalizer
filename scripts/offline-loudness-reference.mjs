@@ -41,36 +41,3 @@ export function measureWithFfmpeg(filePath, inputGainDb = 0, settings = DEFAULT_
     thresholdLufs: Number(stats.input_thresh)
   };
 }
-
-export function calculateReferenceTrackGain(measurement, settings = DEFAULT_REFERENCE_SETTINGS) {
-  const loudnessGainDb = settings.targetLufs - measurement.integratedLufs;
-  const peakSafeGainDb = settings.truePeakDbtp - measurement.truePeakDbtp;
-  const minGainDb = linearToDb(settings.minGain);
-  const maxGainDb = linearToDb(settings.maxGain);
-  const gainDb = Math.min(Math.max(loudnessGainDb, minGainDb), maxGainDb, peakSafeGainDb);
-  let limitedBy = 'target';
-  if (gainDb > loudnessGainDb + 1e-6) {
-    limitedBy = 'gain-range';
-  } else if (gainDb < loudnessGainDb - 1e-6) {
-    limitedBy = peakSafeGainDb <= maxGainDb && peakSafeGainDb <= loudnessGainDb
-      ? 'true-peak'
-      : 'gain-range';
-  }
-
-  return {
-    gainDb,
-    gain: dbToLinear(gainDb),
-    predictedOutputLufs: measurement.integratedLufs + gainDb,
-    predictedTruePeakDbtp: measurement.truePeakDbtp + gainDb,
-    predictedLoudnessRangeLu: measurement.loudnessRangeLu,
-    limitedBy
-  };
-}
-
-export function linearToDb(value) {
-  return 20 * Math.log10(Math.max(value, Number.EPSILON));
-}
-
-export function dbToLinear(value) {
-  return Math.pow(10, value / 20);
-}

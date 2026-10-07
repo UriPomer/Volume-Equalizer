@@ -5,8 +5,7 @@ const {
   calculateFullAudioGain,
   classifyMediaDuration,
   findBilibiliAudioUrl,
-  FullAudioAnalysisError,
-  TruePeakEstimator
+  FullAudioAnalysisError
 } = require('../dist-test/full-audio-analysis.js');
 
 function test(name, fn) {
@@ -34,9 +33,9 @@ test('finds highest bandwidth Bilibili DASH audio URL', () => {
   assert.equal(findBilibiliAudioUrl([script]), 'https://cdn.example/high.m4s');
 });
 
-test('full-track gain uses one loudness gain when peak headroom is sufficient', () => {
+test('full-track gain normalizes integrated loudness', () => {
   const gain = calculateFullAudioGain(
-    { integratedLufs: -24, samplePeak: 0.2 },
+    { integratedLufs: -24 },
     -18,
     0.5,
     2
@@ -44,23 +43,16 @@ test('full-track gain uses one loudness gain when peak headroom is sufficient', 
   assert.ok(Math.abs(gain - Math.pow(10, 6 / 20)) < 1e-12);
 });
 
-test('full-track gain respects static peak headroom', () => {
+// Failure contract: a rare peak must not lower the entire programme. User
+// gain bounds, rather than the historical peak, limit normalization.
+test('full-track gain respects user bounds rather than a historical peak', () => {
   const gain = calculateFullAudioGain(
     { integratedLufs: -30, samplePeak: 0.8 },
     -18,
     0.5,
     3
   );
-  assert.ok(Math.abs(gain - 0.8912509381337456 / (0.8 * 1.03)) < 1e-12);
-});
-
-test('true-peak estimator catches cubic inter-sample overshoot', () => {
-  const estimator = new TruePeakEstimator();
-  estimator.processChannels([Float32Array.from([
-    -0.89, -0.89, -0.89, -0.4,
-    -0.89, -0.89, -0.89, -0.4
-  ])]);
-  assert.ok(estimator.getPeak() > 0.89);
+  assert.equal(gain, 3);
 });
 
 test('accepts small audio and video duration differences', () => {

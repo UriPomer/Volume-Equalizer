@@ -27,23 +27,6 @@ class Biquad {
   reset(): void {
     this.x1 = this.x2 = this.y1 = this.y2 = 0;
   }
-
-  copyStateFrom(other: Biquad): void {
-    this.x1 = other.x1; this.x2 = other.x2;
-    this.y1 = other.y1; this.y2 = other.y2;
-  }
-
-  /** Sum of products of all future zero-input outputs, after input history
-   * has decayed. This solves the two-state filter's discrete energy equation. */
-  tailProduct(other: Biquad): number {
-    const denominator = (1 - this.a2) * ((1 + this.a2) ** 2 - this.a1 ** 2);
-    const p11 = (1 + this.a2) / denominator;
-    const p12 = this.a1 * this.a2 / denominator;
-    const p22 = this.a2 ** 2 * p11;
-    return (p11 - 1) * this.y1 * other.y1
-      + p12 * (this.y1 * other.y2 + this.y2 * other.y1) + p22 * this.y2 * other.y2;
-  }
-
 }
 
 export class KWeighting {
@@ -63,25 +46,6 @@ export class KWeighting {
     this.shelf.reset();
     this.highPass.reset();
   }
-
-  copyStateFrom(other: KWeighting): void {
-    this.shelf.copyStateFrom(other.shelf);
-    this.highPass.copyStateFrom(other.highPass);
-  }
-
-  /** Consume a preview, not the live filter. Once the 1.7 kHz shelf has
-   * decayed, account analytically for the much longer 38 Hz high-pass tail. */
-  drainTailEnergy(other: KWeighting, frames: number, weight: number, coefficients: Float64Array): void {
-    let a = 0, b = 0, c = 0;
-    for (let frame = 0; frame < frames; frame++) {
-      const signal = this.process(0), tail = other.process(0);
-      a += signal * signal; b += 2 * signal * tail; c += tail * tail;
-    }
-    coefficients[0] += weight * (a + Math.max(0, this.highPass.tailProduct(this.highPass)));
-    coefficients[1] += weight * (b + 2 * this.highPass.tailProduct(other.highPass));
-    coefficients[2] += weight * (c + Math.max(0, other.highPass.tailProduct(other.highPass)));
-  }
-
 }
 
 export function channelWeight(index: number, count: number): number {

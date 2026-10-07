@@ -20,7 +20,6 @@ export interface AgcUpdateResult {
  * state; UI frames, silence and missing measurements cannot recalibrate it. */
 export class RealtimeAgc {
   private activeSeconds = 0;
-  private anchor: number | null = null;
   private externalGain: number | null = null;
   private requestGain: number | null = null;
   private referenceMark = NaN;
@@ -31,7 +30,7 @@ export class RealtimeAgc {
 
   reset(): void {
     this.activeSeconds = 0;
-    this.anchor = this.externalGain = this.requestGain = null;
+    this.externalGain = this.requestGain = null;
     this.referenceMark = NaN;
     this.stableSeconds = this.correctionSeconds = 0;
     this.correctionDirection = 0;
@@ -43,7 +42,7 @@ export class RealtimeAgc {
     if (Number.isFinite(gain) && gain > 0) this.externalGain = gain;
   }
   unlockGain(): void {
-    this.externalGain = this.anchor = this.requestGain = null;
+    this.externalGain = this.requestGain = null;
     this.stableSeconds = this.correctionSeconds = 0;
     this.phase = 'calibrating';
   }
@@ -68,28 +67,23 @@ export class RealtimeAgc {
     if (!audible || !Number.isFinite(reference) || dt === 0) return result(current);
 
     const desired = clamp(rawGain, input.minGain, input.maxGain);
-    if (this.anchor !== null) {
-      this.phase = 'stable';
+    if (this.phase === 'stable') {
       const error = input.targetLufs - (reference + db(current));
-      const representative = input.momentaryLufs >= reference - 6;
       const direction = Math.abs(error) > 0.1 ? Math.sign(error) : 0;
       if (direction !== this.correctionDirection) this.correctionSeconds = 0;
       this.correctionDirection = direction;
-      // Speech has pauses: accumulate useful evidence across loud phrases.
-      // Quiet windows neither add evidence nor boost.
-      if (representative && direction) this.correctionSeconds += dt;
-      if (representative && Math.abs(error) <= 0.1) this.requestGain = current;
-      if (representative && this.correctionSeconds >= (error < 0 ? 1 : 2)) {
-        // This anchor lasts until a new source or explicit settings change.
-        // Loudness/peak protection acts independently after programme gain.
-        this.requestGain = clamp(desired,
-          Math.max(input.minGain, this.anchor - 0.1),
-          Math.min(input.maxGain, this.anchor + 0.1));
+      // The integrated meter already gates silence. Requiring a loud current
+      // phrase here could freeze a stale gain throughout a quieter passage.
+      if (direction) this.correctionSeconds += dt;
+      if (Math.abs(error) <= 0.1) this.requestGain = current;
+      if (this.correctionSeconds >= (error < 0 ? 1 : 2)) {
+        // Correct only the cumulative average. A fixed early corridor would
+        // prevent normalization when later programme content changes.
+        this.requestGain = desired;
         this.correctionSeconds = 0;
       }
-      const requested = this.requestGain ?? this.anchor;
+      const requested = this.requestGain ?? current;
       const downward = requested < current;
-      if (!representative && !downward) return result(current);
       return result(slew(current, requested, dt, downward ? 2 : 0.5,
         Math.min(downward ? 0.2 : 0.04, input.gainChangePerSec)));
     }
@@ -111,7 +105,6 @@ export class RealtimeAgc {
       input.gainChangePerSec * (destination < current ? 6 : 1));
     if (activeSeconds >= 10 && (this.stableSeconds >= 3 || activeSeconds >= 20)
       && Math.abs(db(next / desired)) <= 0.25) {
-      this.anchor = next;
       this.requestGain = next;
       this.phase = 'stable';
     }

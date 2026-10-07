@@ -24,9 +24,8 @@ function run(seconds, levels, options = {}) {
   }
   return {agc,trace,gain};
 }
-// Failure contracts: slow drift must not walk the anchor; sustained loud
-// content must not reopen calibration; silence and user bounds must not move
-// the corridor. Include EVERY decision after first stable, even other phases.
+// Failure contracts: stationary phrases must not pump, sustained changes in
+// cumulative average must recalibrate smoothly, silence must hold the gain.
 function assertStableCorridor(trace) {
   const first = trace.findIndex(row => row.phase === 'stable');
   assert.ok(first >= 0, 'Calibration must finish');
@@ -74,11 +73,6 @@ test('normal dynamics leave stable gain fixed and silence does not reset it', ()
   const silent = trace.filter(row => row.time > 51 && row.time < 60);
   assert.equal(new Set(silent.map(row => row.nextGain)).size, 1);
 });
-test('slow reference drift cannot move the fixed stability corridor repeatedly', () => {
-  const {trace}=run(600,t=>-21+2*Math.sin(t/50));
-  assertStableCorridor(trace);
-});
-
 test('stable programme control preserves quiet/loud contrast rather than lifting every quiet phrase', () => {
   const level = t => t % 5 < 2 ? -21 : -41;
   const { trace } = run(90, level);
@@ -91,19 +85,22 @@ test('stable programme control preserves quiet/loud contrast rather than lifting
   assert.ok(Math.abs(averageOutput(true) + 21) <= .25);
   assert.ok(Math.abs(averageOutput(true) - averageOutput(false) - 20) <= .25);
 });
-test('sustained substantially louder content cannot replace the stable anchor', () => {
-  const {trace}=run(100,t=>t<25?-27:-12);
-  assertStableCorridor(trace);
+test('sustained louder content recalibrates the cumulative average smoothly', () => {
+  const {trace,gain}=run(100,t=>t<25?-27:-16);
+  assert.ok(Math.abs(trace.at(-1).referenceLufs+20*Math.log10(gain)+21)<.3);
+  const tail=trace.filter(row=>row.time>=25);
+  assert.ok(tail.every((row,i)=>!i||Math.abs(row.nextGain-tail[i-1].nextGain)<=.021));
 });
 test('a brief transient cannot reopen calibration', () => {
   const {trace}=run(60,t=>t>30&&t<30.2?-5:-21);
   assertStableCorridor(trace);
 });
-test('user bounds clip the corridor without shifting the calibration anchor', () => {
+test('recalibration continues to honor user gain bounds', () => {
   for (const level of [-30, -10]) {
     const {trace} = run(100, t => t < 25 ? level : -21);
-    assertStableCorridor(trace);
     assert.ok(trace.every(row => row.nextGain >= .25 && row.nextGain <= 2));
+    const last=trace.at(-1);
+    assert.ok(Math.abs(last.referenceLufs+20*Math.log10(last.nextGain)+21)<.3);
   }
 });
 test('explicit settings recalibration establishes a new fixed anchor', () => {

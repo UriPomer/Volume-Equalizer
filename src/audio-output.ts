@@ -3,11 +3,7 @@ import { LoudnessMeter } from './loudness-meter';
 import { MeterState } from './types';
 
 type OutputState = Pick<MeterState, 'outputIntegratedLufs' | 'momentaryLufs' | 'maximumMomentaryLufs'
-  | 'maximumShortTermLufs' | 'safetyGain' | 'loudnessGain'>;
-export type AudioOutputClient = {
-  setGain: (gain: number, time: number) => void;
-  release: () => void;
-};
+  | 'maximumShortTermLufs' | 'safetyGain'>;
 const outputs = new WeakMap<BaseAudioContext, SharedAudioOutput>();
 
 export function getAudioOutput(context: BaseAudioContext, targetLufs: number): SharedAudioOutput {
@@ -25,46 +21,41 @@ export class SharedAudioOutput {
   readonly ready: Promise<void>;
   private node: AudioWorkletNode | null = null;
   private readonly meter: LoudnessMeter;
-  private readonly clients = new Map<() => void, number>();
+  private readonly clients = new Set<() => void>();
   private epoch = 0;
   private safetyGain = 1;
-  private loudnessGain = 1;
   private enabled = true;
   private failed = false;
   private closed = false;
 
   constructor(private readonly context: BaseAudioContext, private targetLufs: number) {
-    this.meter = new LoudnessMeter(context.sampleRate);
+    this.meter = new LoudnessMeter(context.sampleRate, Infinity);
     this.ready = loadAudioWorklets(context).then(() => {
       if (this.closed) return;
-      const node = createAudioProcessor(context, this.targetLufs);
+      const node = createAudioProcessor(context);
       node.port.onmessage = event => {
         const data = event.data;
         if (!this.enabled || data?.type !== 'meter' || data.epoch !== this.epoch) return;
         this.meter.processChannels(data.output);
         this.safetyGain = data.safetyGain;
-        this.loudnessGain = data.loudnessGain;
       };
       node.onprocessorerror = () => {
         this.failed = true;
         node.disconnect();
-        for (const fail of this.clients.keys()) fail();
+        for (const fail of this.clients) fail();
       };
       this.node = node;
-      this.updateProgrammeGain();
       if (this.enabled) node.connect(context.destination);
     });
   }
 
-  retain(onFailure: () => void): AudioOutputClient {
-    this.clients.set(onFailure, 1);
-    this.updateProgrammeGain();
-    if (this.clients.size > 1) this.resetMeasurements(true, true);
-    const release = () => {
+  retain(onFailure: () => void): () => void {
+    this.clients.add(onFailure);
+    if (this.clients.size > 1) this.resetMeasurements(true);
+    return () => {
       if (!this.clients.delete(onFailure)) return;
       if (this.clients.size) {
-        this.updateProgrammeGain();
-        this.resetMeasurements(true, true);
+        this.resetMeasurements(true);
         return;
       }
       this.closed = true;
@@ -75,23 +66,9 @@ export class SharedAudioOutput {
       }
       outputs.delete(this.context);
     };
-    return { release, setGain: (gain, time) => {
-      if (!this.clients.has(onFailure)) return;
-      this.clients.set(onFailure, gain);
-      this.updateProgrammeGain(time);
-    } };
   }
 
   isReady(): boolean { return this.node !== null && !this.failed && !this.closed; }
-
-  private updateProgrammeGain(time = this.context.currentTime): void {
-    // Synchronize the scheduled value/time, never AudioParam.value: its getter
-    // can still expose the previous render quantum after setValueAtTime.
-    const gain = this.clients.size === 1 ? this.clients.values().next().value! : 1;
-    const parameter = this.node?.parameters.get('programmeGain');
-    parameter?.cancelScheduledValues(time);
-    parameter?.setValueAtTime(gain, time);
-  }
 
   connect(source: AudioNode): void {
     if (!this.isReady()) throw new Error('Mixed output protection unavailable');
@@ -101,7 +78,6 @@ export class SharedAudioOutput {
   updateSettings(targetLufs: number, enabled: boolean): void {
     if (targetLufs !== this.targetLufs) {
       this.targetLufs = targetLufs;
-      this.node?.parameters.get('loudnessCeilingLufs')?.setValueAtTime(targetLufs + 2, this.context.currentTime);
       this.resetMeasurements();
     }
     if (enabled === this.enabled) return;
@@ -124,14 +100,12 @@ export class SharedAudioOutput {
       momentaryLufs: this.meter.getMomentaryLoudness(),
       maximumMomentaryLufs: this.meter.getMaximumMomentaryLoudness(),
       maximumShortTermLufs: this.meter.getMaximumShortTermLoudness(),
-      safetyGain: this.safetyGain, loudnessGain: this.loudnessGain
+      safetyGain: this.safetyGain
     };
   }
 
-  private resetMeasurements(preserveIntegrated = false, resetProtection = !preserveIntegrated): void {
+  private resetMeasurements(preserveIntegrated = false): void {
     this.meter.reset({ preserveIntegrated });
-    if (resetProtection) this.safetyGain = this.loudnessGain = 1;
-    this.node?.port.postMessage({type:'reset-meter',epoch:++this.epoch,
-      loudnessCeilingLufs:this.targetLufs+2,resetProtection});
+    this.node?.port.postMessage({type:'reset-meter',epoch:++this.epoch});
   }
 }

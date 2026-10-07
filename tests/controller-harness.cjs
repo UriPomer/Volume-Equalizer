@@ -64,7 +64,7 @@ class FakeWorkletNode extends FakeNode {
     this.context = context;
     this.name = name;
     this.options = options;
-    this.parameters = new Map([['loudnessCeilingLufs', new FakeParam(options.parameterData?.loudnessCeilingLufs ?? -19)]]);
+    this.parameters = new Map();
     this.processor = new (processorClasses.get(name))(options);
     this.port = {
       onmessage: null,

@@ -14,9 +14,9 @@ import { denseMaxima, ffmpegMaxima, writeFloatWav } from './audio-test-artifacts
 // Real media -> built content script -> AudioWorklet -> controller -> panel.
 // Only chrome.storage and extension URL resolution are adapted to localhost.
 // Observe every native GainNode scheduling call without replacing audio DSP.
-// Failure cases: loud phrases override integrated target; stale history after a
-// target change/seek/new source; silence boosts; unreachable targets look stable;
-// drift, sustained loud passages or seek move the first stable gain anchor.
+// Failure cases: extrema cause ducking, average misses the target, short
+// phrases pump the gain, target/seek/source changes leave stale measurements,
+// silence boosts, full-track analysis locks a peak-constrained wrong gain.
 const artifacts = mkdtempSync(join(process.env.VOLUME_EQ_ARTIFACT_ROOT || tmpdir(), 'volume-eq-realtime-'));
 const content = readFileSync(resolve('dist/content.js'));
 const worklet = readFileSync(resolve('dist/limiter-worklet.js'));
@@ -50,6 +50,10 @@ writeTone(join(artifacts, 'periodic.wav'), 70, t => t % 3 < .6 ? .16 : .16 * Mat
 writeTone(join(artifacts, 'multiple.wav'), 20, () => .65);
 writeTone(join(artifacts, 'second.wav'), 20, () => .65, 1301);
 writeTone(join(artifacts, 'startup.wav'), 15, () => .135);
+writeTone(join(artifacts, 'full-track.wav'), 45, t => t % 9 >= 8.8 && t % 9 < 8.8005 ? .82 : t % 3 < .6 ? .09 : .045);
+writeTone(join(artifacts, 'bass-track.wav'), 45, t => t % 3 < .6 ? .09 : .045,80);
+const fullReference=measureWithFfmpeg(join(artifacts,'full-track.wav'));
+const fullTarget=Math.round((fullReference.integratedLufs+4)*2)/2;
 const reference = measureWithFfmpeg(fixture);
 const commit = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
 const report = { command: 'npm run test:realtime', commit, generatedAt: new Date().toISOString(),
@@ -65,19 +69,6 @@ ${captureBootstrap}
 const stored={targetRms:Math.pow(10,(-17.5+.691)/20)};
 window.mediaEvents=[];
 window.programmeGains=[];
-window.referenceGains=[];
-const NativeWorkletNode=window.AudioWorkletNode;
-window.AudioWorkletNode=class extends NativeWorkletNode {
-  constructor(...args){
-    super(...args);
-    if(args[1]!=='lookahead-peak-limiter')return;
-    const parameter=this.parameters.get('programmeGain'),setValue=parameter.setValueAtTime;
-    parameter.setValueAtTime=function(...values){
-      window.referenceGains.push({value:values[0],contextTime:values[1]});
-      return Reflect.apply(setValue,this,values);
-    };
-  }
-};
 const createGain=BaseAudioContext.prototype.createGain;
 BaseAudioContext.prototype.createGain=function(...args){
   const node=Reflect.apply(createGain,this,args),setValue=node.gain.setValueAtTime;
@@ -94,6 +85,9 @@ window.chrome={runtime:{getURL:path=>'/'+path,getManifest:()=>({version:'${insta
   get:(defaults,callback)=>callback({...defaults,...stored}),
   set:(settings,callback)=>{Object.assign(stored,settings);callback();}
 },onChanged:{addListener(){},removeListener(){}}}};
+const bootstrap=document.createElement('script');bootstrap.dataset.playinfo='';
+bootstrap.textContent='window.__playinfo__='+JSON.stringify({data:{dash:{audio:[{baseUrl:location.origin+'/startup.wav',bandwidth:128000}]}}});
+document.body.append(bootstrap);
 </script>`;
 const recorded = [];
 const server = createServer(async (req, res) => {
@@ -111,7 +105,7 @@ const server = createServer(async (req, res) => {
     if(name==='limiter-worklet.js')await delay(250);
     res.setHeader('Content-Type', 'text/javascript');
     res.end(name === 'content.js' ? content : worklet);
-  } else if (['mixed.wav', 'silence.wav', 'quiet.wav', 'loud.wav', 'stability.wav', 'periodic.wav', 'multiple.wav', 'second.wav', 'startup.wav'].includes(name)) {
+  } else if (['mixed.wav', 'silence.wav', 'quiet.wav', 'loud.wav', 'stability.wav', 'periodic.wav', 'multiple.wav', 'second.wav', 'startup.wav','full-track.wav','bass-track.wav'].includes(name)) {
     const data = readFileSync(join(artifacts, name));
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Content-Length', data.length);
@@ -152,7 +146,7 @@ async function snapshot() {
       gain:parseFloat(text('gain')),programmeGain:window.programmeGainParam?.value,
       version:root.querySelector('[data-role="version"]')?.textContent,
       gainTraceIndex:window.programmeGains.length-1,safety:parseFloat(text('safety')),phase:text('phase'),status:text('status'),
-      loudnessProtection:parseFloat(text('loudnessSafety')),maximumMomentary:parseFloat(text('maximumMomentary')),
+      maximumMomentary:parseFloat(text('maximumMomentary')),
       maximumShortTerm:parseFloat(text('maximumShortTerm')),
       inputText:text('originalIntegrated'),targetLabel:root.querySelector('[data-role="targetLufs"]').parentElement.textContent};
   })()`);
@@ -209,6 +203,7 @@ try {
   const startupRate=await evaluate('window.startAudioCapture()');
   const startupTime = (await snapshot()).time;
   await observe(8);
+  assert.ok((await snapshot()).status.includes('完整音轨已锁定'),'Default mode must automatically analyze the available complete audio');
   await evaluate('window.stopAudioCapture()');
   const startupBytes=Buffer.concat(recorded.sort((a,b)=>a.sequence-b.sequence).map(row=>row.bytes));
   const startupPcm=new Float32Array(startupBytes.buffer.slice(startupBytes.byteOffset,startupBytes.byteOffset+startupBytes.length));
@@ -220,12 +215,76 @@ try {
     startupBlocks.push({time:startupTime+start/startupRate,rms:Math.sqrt(block.reduce((sum,value)=>sum+value*value,0)/block.length)});
   }
   report.startup={file:startupFile,blocks:startupBlocks,independent:ffmpegMaxima(startupFile)};
-  report.startup.schedules=await evaluate(`({programme:window.programmeGains,reference:window.referenceGains})`);
-  assert.ok(!report.consoleEntries.some(entry=>entry.text.includes('programmeGain')&&entry.text.includes('outside nominal range')),'Legitimate startup mute must not generate a programmeGain range warning');
+  report.startup.schedules=await evaluate(`window.programmeGains`);
   assert.ok(startupBlocks.length>=30&&startupBlocks.every(row=>row.rms>.02),'Every steady input interval must remain audible after attachment');
-  assert.ok(report.startup.independent.momentary<=-19+.05,'Late attachment must honor target +2 LU');
   assert.equal(await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelectorAll('[data-meter="programmeGain"]').length`),0,'Panel must show only one effective gain');
+  assert.equal(await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelectorAll('[data-meter="loudnessSafety"]').length`),0,'LUFS extrema must be displayed without an additional loudness protector');
   recorded.length=0;
+  await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelector('[data-action="fullAudioAnalysis"]').click()`);
+  // Native fetch + decodeAudioData + complete analysis + actual destination
+  // recording. A rare digital peak may be limited locally, never used to
+  // constrain the entire track's normalization gain.
+  await setSlider('targetLufs',fullTarget);
+  await playFixture('full-track.wav');
+  await evaluate(`(()=>{
+    const bootstrap=document.querySelector('script[data-playinfo]');
+    bootstrap.textContent='window.__playinfo__='+JSON.stringify({data:{dash:{audio:[{baseUrl:location.origin+'/full-track.wav',bandwidth:128000}]}}});
+    document.getElementById('universal-volume-eq-panel').shadowRoot.querySelector('[data-action="fullAudioAnalysis"]').click();
+  })()`);
+  await observe(12);
+  const locked=await checkpoint('complete-track-normalized');
+  assert.ok(locked.status.includes('完整音轨已锁定'),'Complete track must be fetched, decoded and locked');
+  const expectedFullGain=Math.pow(10,(fullTarget-fullReference.integratedLufs)/20);
+  assert.ok(Math.abs(locked.programmeGain-expectedFullGain)<.015,'A rare historical peak must not lower the fixed normalization gain');
+  recorded.length=0;
+  const fullRate=await evaluate('window.startAudioCapture()');
+  const fullStart=(await snapshot()).time, fullTraceStart=report.trace.length;
+  await observe(27);
+  await evaluate('window.stopAudioCapture()');
+  const fullBytes=Buffer.concat(recorded.sort((a,b)=>a.sequence-b.sequence).map(row=>row.bytes));
+  const fullPcm=new Float32Array(fullBytes.buffer.slice(fullBytes.byteOffset,fullBytes.byteOffset+fullBytes.length));
+  const fullOutput=join(artifacts,'complete-track-output.wav');
+  writeFloatWav(fullOutput,fullPcm,fullRate,2);
+  const independentFull=measureWithFfmpeg(fullOutput);
+  const fullRms=(start,end)=>{
+    const block=fullPcm.slice(Math.round((start-fullStart)*fullRate)*2,Math.round((end-fullStart)*fullRate)*2);
+    return Math.sqrt(block.reduce((sum,value)=>sum+value*value,0)/block.length);
+  };
+  const fullContrasts=[15,18,21,24,27,30,33,36].map(start=>20*Math.log10(fullRms(start+.25,start+.45)/fullRms(start+2,start+2.2)));
+  const fullGains=report.trace.slice(fullTraceStart).map(row=>row.programmeGain);
+  report.fullTrack={input:fullReference,target:fullTarget,expectedGain:expectedFullGain,file:fullOutput,
+    independent:independentFull,contrasts:fullContrasts,gainSpan:Math.max(...fullGains)-Math.min(...fullGains)};
+  assert.ok(Math.abs(independentFull.integratedLufs-fullTarget)<=.35,'Independent FFmpeg average must match the target');
+  assert.ok(fullContrasts.every(value=>Math.abs(value-20*Math.log10(2))<=.1),'Fixed gain must preserve phrase contrast');
+  assert.ok(report.fullTrack.gainSpan<1e-6,'Whole-track gain must remain fixed through loud and quiet phrases');
+  await screenshot('complete-track');
+  // The normalization reference includes the user's audible EQ, not the raw
+  // downloaded source. Changing EQ must invalidate a completed analysis.
+  await evaluate(`document.querySelector('script[data-playinfo]').textContent='window.__playinfo__='+JSON.stringify({data:{dash:{audio:[{baseUrl:location.origin+'/bass-track.wav',bandwidth:128000}]}}})`);
+  await setSlider('targetLufs',-21);
+  await setSlider('bassBoost',6);
+  await playFixture('bass-track.wav');
+  await observe(12);
+  assert.ok((await snapshot()).status.includes('完整音轨已锁定'),'EQ-adjusted complete track must finish analysis');
+  recorded.length=0;
+  await evaluate('window.startAudioCapture()');
+  await observe(15);
+  await evaluate('window.stopAudioCapture()');
+  const eqBytes=Buffer.concat(recorded.sort((a,b)=>a.sequence-b.sequence).map(row=>row.bytes));
+  const eqPcm=new Float32Array(eqBytes.buffer.slice(eqBytes.byteOffset,eqBytes.byteOffset+eqBytes.length));
+  const eqOutput=join(artifacts,'complete-track-eq-output.wav');
+  writeFloatWav(eqOutput,eqPcm,fullRate,2);
+  report.fullTrackEq={file:eqOutput,bassBoost:6,target:-21,independent:measureWithFfmpeg(eqOutput)};
+  assert.ok(Math.abs(report.fullTrackEq.independent.integratedLufs+21)<=.35,'Full-track average must include the audible bass setting');
+  // Bilibili SPA pages can retain an old DASH bootstrap. A longer, unrelated
+  // audio track is no more valid than a truncated one; fall back audibly.
+  await playFixture('startup.wav');
+  await observe(3);
+  const mismatched=await checkpoint('mismatched-track-falls-back');
+  assert.ok(mismatched.status.includes('音轨时长不匹配'),'A different track duration must not produce a full-track lock');
+  assert.ok(mismatched.gain>0&&Number.isFinite(mismatched.output),'Fallback must continue producing measured audio');
+  await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelector('[data-action="fullAudioAnalysis"]').click()`);
+  await setSlider('bassBoost',0);
   await setSlider('targetLufs', -17.5);
   await playFixture('stability.wav');
   let stable;
@@ -237,8 +296,8 @@ try {
   const anchor = stable.programmeGain, firstStableIndex = stable.gainTraceIndex;
   await observe(62 - stable.time);
   const sustained = await checkpoint('stable-gain-with-sustained-loud-content');
-  assert.ok(sustained.loudnessProtection < .999, 'Loud passage must exercise independent safety attenuation');
-  assert.ok(sustained.maximumMomentary <= -15.5 && sustained.maximumShortTerm <= -15.5, 'Stable programme gain must not weaken the loudness ceiling');
+  assert.ok(sustained.maximumMomentary > -15.5 && sustained.maximumShortTerm > -15.5, 'Unclipped loud passages may exceed target +2 LU');
+  assert.ok(Math.abs(sustained.input+20*Math.log10(sustained.programmeGain)+17.5)<.4,'Sustained changes must recalibrate the cumulative programme average');
   await evaluate(`document.querySelector('audio').pause();document.querySelector('audio').currentTime=20`);
   await observe(1, false);
   await evaluate(`document.querySelector('audio').play()`);
@@ -247,9 +306,8 @@ try {
   const values = decisions.map(row => row.value), min = Math.min(...values), max = Math.max(...values);
   report.stability = {anchor, min, max, span: max - min, maximumDeviation: Math.max(Math.abs(min-anchor),Math.abs(max-anchor)), decisions};
   assert.ok(values.length > 400, 'Verify every scheduled gain, not occasional rounded UI samples');
-  assert.ok(max > anchor + .03 && min < anchor - .03, 'Fixture must exercise correction in both directions');
-  assert.ok(report.stability.span <= .2 + 1e-6, 'Whole stable programme gain span must be <=0.2x');
-  assert.ok(report.stability.maximumDeviation <= .1 + 1e-6, 'Programme gain must stay within first anchor +/-0.1x, including after seek');
+  assert.ok(report.stability.span>.2,'A changed programme average must escape the old fixed corridor');
+  assert.ok(values.every((value,i)=>!i||Math.abs(value-values[i-1])<=.021),'Recalibration must remain smooth instead of jumping gain');
   await screenshot('stable-gain');
   await setSlider('targetLufs', -21);
   const periodicTraceStart = report.trace.length;
@@ -285,27 +343,26 @@ try {
   await setSlider('targetLufs', -17.5);
   const mixedTraceStart = report.trace.length;
   await playFixture('mixed.wav');
-  await observe(32);
+  await observe(45);
   const mixed = await checkpoint('mixed-input-below-target');
   await screenshot('mixed');
   assert.ok(Math.abs(mixed.input - reference.integratedLufs) <= .4, 'Input differs from independent FFmpeg measurement');
   assert.ok(report.trace.slice(mixedTraceStart).some(row => row.programmeGain > 1.2), 'Below-target integrated input must allow programme amplification');
-  assert.ok(mixed.output > mixed.input + .3, 'Ceiling protection must not defeat programme normalization entirely');
-  assert.ok(mixed.maximumMomentary <= -15.5 && mixed.maximumShortTerm <= -15.5, 'Historical output maxima must honor target +2 LU');
-  assert.ok(report.trace.slice(mixedTraceStart).some(row => row.phase.includes('响度上限限制')), 'A binding loudness ceiling must be explicit');
+  assert.ok(Math.abs(mixed.output+17.5)<=.5,'Average output must reach the target despite loud phrases');
+  assert.ok(mixed.maximumMomentary > -15.5 && Number.isFinite(mixed.maximumShortTerm), 'Display genuine extrema without capping them');
   assert.equal(mixed.safety, 1, 'Regression fixture must not hit peak protection');
   assert.ok(mixed.targetLabel.includes('积分'), 'UI must identify the integrated target');
   await setSlider('targetLufs', -21);
   await observe(10);
   const lower = await checkpoint('target-lowered');
   assert.ok(lower.gain < 1 && lower.output < mixed.output - 2, 'Lower target must attenuate and clear obsolete output history');
-  assert.ok(lower.maximumMomentary <= -19 && lower.maximumShortTerm <= -19, 'Lower target must update the audio-thread ceiling');
+  assert.ok(Math.abs(lower.output+21)<=.5, 'Lower target must normalize average output');
   assert.ok(Math.abs(lower.input - mixed.input) <= .4, 'Target change must retain input history');
   await setSlider('targetLufs', -17.5);
-  await observe(10);
+  await observe(20);
   const raised = await checkpoint('target-raised');
   assert.ok(raised.output > lower.output + 2, 'Raised target must recover amplification');
-  assert.ok(raised.maximumMomentary <= -15.5 && raised.maximumShortTerm <= -15.5, 'Raised target must retain ceiling enforcement');
+  assert.ok(Math.abs(raised.output+17.5)<=.5, 'Raised target must normalize average output');
   await evaluate(`document.querySelector('audio').pause();document.querySelector('audio').currentTime=5`);
   await observe(1, false);
   const sought = await checkpoint('seek-retains-integrated-history');
@@ -327,10 +384,10 @@ try {
   await setSlider('minGain', 1);
   await playFixture('loud.wav');
   await observe(7);
-  const ceiling = await checkpoint('ceiling-overrides-user-gain-floor');
-  assert.ok(ceiling.gain > 0 && ceiling.gain < 1 && ceiling.loudnessProtection < 1, 'Ceiling must override the configured 1x gain floor');
-  assert.ok(ceiling.maximumMomentary <= -15.5 && ceiling.maximumShortTerm <= -15.5, 'Gain floor must not bypass target +2 LU');
-  assert.ok(ceiling.output >= -17.5, 'Ceiling must retain useful audio when the floor prevents normalization');
+  const floor = await checkpoint('user-gain-floor');
+  assert.equal(floor.gain,1,'A LUFS extreme must not override the user gain floor');
+  assert.ok(floor.maximumMomentary>-15.5&&floor.maximumShortTerm>-15.5,'Display extrema beyond target +2 LU');
+  assert.ok(floor.phase.includes('达到倍率限制'),'An unreachable average must show the gain bound');
   const captureRate = await evaluate('window.startAudioCapture()');
   recorded.length=0;
   await playFixture('multiple.wav');
@@ -347,9 +404,8 @@ try {
   const independent = ffmpegMaxima(recordingFile), dense = denseMaxima(pcm,captureRate,2);
   report.multipleMedia = {file:recordingFile,independent,dense};
   assert.ok(pcm.length>captureRate*2*7, 'Record more than seven seconds of real destination PCM');
-  assert.ok(independent.momentary<=-15.5+.05&&independent.shortTerm<=-15.5+.05, 'Mixed destination must honor target +2 LU');
   assert.ok(dense.peak<=.891251&&independent.truePeak<=1, 'Mixed destination must not bypass peak protection');
-  assert.ok(dense.rms>1e-3&&independent.momentary>=-16.5, 'Mixed destination must retain useful audio');
+  assert.ok(dense.rms>1e-3, 'Mixed destination must retain useful audio');
   await screenshot('two-media');
   await setSlider('targetLufs',-21);
   await observe(1);
@@ -369,7 +425,7 @@ try {
   writeFloatWav(remainingFile,lifecyclePcm.slice(-captureRate*2*3),captureRate,2);
   const remainingReference=ffmpegMaxima(remainingFile);
   report.mixedLifecycle={file:lifecycleFile,independent:lifecycleReference,remainingFile,remainingReference};
-  assert.ok(lifecycleReference.momentary<=-19+.05&&lifecycleReference.shortTerm<=-19+.05,'Target changes must reach the shared guard with multiple media');
+  assert.ok(lifecycleReference.truePeak<=1,'Target changes must retain digital clipping protection');
   assert.ok(remainingReference.momentary>-20&&remainingReference.truePeak<=1,'Removing one media must leave the other audible and protected');
   assert.equal(await evaluate('window.captureState.sources.size'),1,'Removing one media must retain the shared output');
   await evaluate(`document.querySelectorAll('audio').forEach(media=>media.remove())`);

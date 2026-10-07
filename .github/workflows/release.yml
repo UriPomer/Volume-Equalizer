@@ -60,7 +60,7 @@ jobs:
           name: release-audio-verification
           path: |
             test-results/
-            ${{ runner.temp }}/volume-eq-ceiling-*/
+            ${{ runner.temp }}/volume-eq-dynamics-*/
             ${{ runner.temp }}/volume-eq-realtime-*/
 
       - name: Verify tag matches manifest version

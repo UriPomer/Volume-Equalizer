@@ -12,7 +12,7 @@ const STATUS_TEXT: Record<AnalysisStatus, string> = {
   'attach-failed': '媒体被页面占用',
   analyzing: '完整音轨分析中',
   'full-track': '完整音轨已锁定',
-  incomplete: '音轨不完整 · 实时继续',
+  incomplete: '音轨时长不匹配 · 实时继续',
   unsupported: '直播不支持完整分析',
   'processor-unavailable': '保护不可用 · 已静音',
   failed: '分析失败 · 实时继续'
@@ -80,7 +80,6 @@ function panelHtml(settings: Settings): string {
         ${meterRow('增益', 'gain')} ${meterRow('算法', 'status')}
         ${meterRow('调节状态', 'phase')}
         ${meterRow('削波保护', 'safety')}
-        ${meterRow('响度保护', 'loudnessSafety')}
       </div>
     </section>
   </div>`;
@@ -174,12 +173,11 @@ function updateMeter(shadow: ShadowRoot, getMeter: () => MeterState): void {
     setText(shadow, '[data-meter="originalIntegrated"]', `${showMomentary(meter.originalIntegratedLufs)} · ${meter.sampleCount}s`);
     setText(shadow, '[data-meter="output"]', showMomentary(meter.momentaryLufs));
     setText(shadow, '[data-meter="safety"]', `${meter.safetyGain.toFixed(2)}x`);
-    setText(shadow, '[data-meter="loudnessSafety"]', `${meter.loudnessGain.toFixed(2)}x`);
     setText(shadow, '[data-meter="maximumMomentary"]', showMomentary(meter.maximumMomentaryLufs));
     setText(shadow, '[data-meter="maximumShortTerm"]', showMomentary(meter.maximumShortTermLufs));
     setText(shadow, '[data-meter="outputIntegrated"]', showMomentary(meter.outputIntegratedLufs));
     const phases = { collecting: '收集有效声音', calibrating: '平滑校准', stable: '已稳定', 'full-track': '完整音轨' };
-    setText(shadow, '[data-meter="phase"]', `${phases[meter.phase]}${meter.loudnessGain < .999 ? ' · 响度上限限制' : ''}${meter.gainLimited ? ' · 达到倍率限制' : ''}`);
+    setText(shadow, '[data-meter="phase"]', `${phases[meter.phase]}${meter.gainLimited ? ' · 达到倍率限制' : ''}`);
     setText(shadow, '[data-meter="gain"]', `${meter.gain.toFixed(2)}x`);
     setText(shadow, '[data-meter="status"]', STATUS_TEXT[meter.analysisStatus]);
   }, 100);

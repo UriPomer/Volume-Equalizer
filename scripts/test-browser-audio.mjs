@@ -8,20 +8,17 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { buildSync } from 'esbuild';
 import { spawnSync } from 'node:child_process';
 import { denseMaxima, ffmpegMaxima, sha256, writeFloatWav } from './audio-test-artifacts.mjs';
+import { measureWithFfmpeg } from './offline-loudness-reference.mjs';
 
-// Failure model, established before the guard implementation:
-// 1. First loud frame/sustained sound overshoots before a main-thread response.
-// 2. A lower target, reset, EQ or fixed high programme gain bypasses the ceiling.
-// 3. Surround weighting/sample rate differs from the stereo happy path.
-// 4. A mute-only guard passes an upper-bound assertion without useful audio.
-// 5. Below-ceiling signals are unnecessarily compressed or peak safety regresses.
+// Failure model: LUFS extrema must not attenuate unclipped PCM; meter resets
+// must not alter audio; quiet/loud contrast and deliberate programme changes
+// must survive. Actual sample/inter-sample clipping remains protected.
 const cases = [
   { id: 'first-loud-mono', rate: 48000, channels: 1, target: -21, mode: 'loud' },
   { id: 'burst-stereo', rate: 48000, channels: 2, target: -17.5, mode: 'burst' },
   { id: 'surround', rate: 48000, channels: 6, target: -23, mode: 'loud' },
   { id: '44100-bass-eq', rate: 44100, channels: 2, target: -21, mode: 'bass', bass: 6 },
   { id: 'high-programme-gain', rate: 48000, channels: 2, target: -23, mode: 'loud', gain: 8 },
-  { id: 'target-change', rate: 48000, channels: 2, target: -15, mode: 'loud', changeAt: 2, nextTarget: -23 },
   { id: 'meter-reset', rate: 48000, channels: 2, target: -21, mode: 'loud', resetAt: 2 },
   { id: 'meter-reset-baseline', rate: 48000, channels: 2, target: -21, mode: 'loud' },
   ...[1, 2, 6].map(channels => ({ id: `mix-${channels}-to-stereo`, rate: 48000, channels,
@@ -34,21 +31,26 @@ const cases = [
   { id: 'surround-eight', rate: 48000, channels: 8, target: -21, mode: 'loud' },
   { id: 'source-end-tail', rate: 48000, channels: 1, target: -21, mode: 'tail-impulse' },
   { id: 'preserve-loud-quiet-dynamics', rate: 48000, channels: 2, target: -21, mode: 'dynamics', seconds: 18 },
-  { id: 'preserve-amplified-dynamics', rate: 48000, channels: 2, target: -21, mode: 'dynamics', seconds: 18, gain: 4 },
-  { id: 'programme-decrease-keeps-dynamics', rate: 48000, channels: 2, target: -21, mode: 'dynamics', seconds: 18, gain: 4, gainChangeAt: 6.001, nextGain: 1 },
+  { id: 'preserve-amplified-dynamics', rate: 48000, channels: 2, target: -21, mode: 'dynamics', seconds: 18, gain: 2 },
+  { id: 'programme-decrease-keeps-dynamics', rate: 48000, channels: 2, target: -21, mode: 'dynamics', seconds: 18, gain: 2, gainChangeAt: 6.001, nextGain: 1 },
   { id: 'quiet', rate: 48000, channels: 2, target: -21, mode: 'quiet' },
   { id: 'quiet-times-ten', rate: 48000, channels: 2, target: -21, mode: 'quiet', gain: 10 }
 ].map(spec => ({ seconds: 7, gain: 1, outputChannels: spec.channels, ...spec }));
-let referencePcm;
+let referencePcm, referenceMeasurement;
 if (process.env.VOLUME_EQ_REFERENCE_AUDIO) {
+  const full=process.env.VOLUME_EQ_REFERENCE_SECONDS==='full';
+  const duration=full?[]:['-t',process.env.VOLUME_EQ_REFERENCE_SECONDS||'30'];
   const decoded = spawnSync('ffmpeg',['-v','error','-ss',process.env.VOLUME_EQ_REFERENCE_START || '0',
-    '-i',process.env.VOLUME_EQ_REFERENCE_AUDIO,'-t','30','-ar','48000','-ac','2','-f','f32le','-'],{maxBuffer:32*1024*1024});
+    '-i',process.env.VOLUME_EQ_REFERENCE_AUDIO,...duration,'-ar','48000','-ac','2','-f','f32le','-'],{maxBuffer:512*1024*1024});
   if(decoded.status!==0)throw new Error(decoded.stderr.toString());
   referencePcm=decoded.stdout;
-  cases.push({id:'provided-audio-dynamics',mode:'reference',rate:48000,channels:2,outputChannels:2,gain:1,
-    target:Number(process.env.VOLUME_EQ_REFERENCE_TARGET || -21),seconds:referencePcm.length/8/48000});
+  const target=Number(process.env.VOLUME_EQ_REFERENCE_TARGET || -21);
+  referenceMeasurement=measureWithFfmpeg(process.env.VOLUME_EQ_REFERENCE_AUDIO);
+  const gain=full?Math.min(2,Math.max(.25,Math.pow(10,(target-referenceMeasurement.integratedLufs)/20))):1;
+  cases.push({id:'provided-audio-dynamics',mode:'reference',rate:48000,channels:2,outputChannels:2,gain,
+    target,seconds:referencePcm.length/8/48000,fullReference:full});
 }
-const artifacts = mkdtempSync(join(process.env.VOLUME_EQ_ARTIFACT_ROOT || tmpdir(), 'volume-eq-ceiling-'));
+const artifacts = mkdtempSync(join(process.env.VOLUME_EQ_ARTIFACT_ROOT || tmpdir(), 'volume-eq-dynamics-'));
 const worklet = readFileSync(process.env.VOLUME_EQ_WORKLET_PATH || 'dist/limiter-worklet.js');
 const processor = buildSync({ entryPoints: ['src/audio-context.ts'], bundle: true,
   write: false, format: 'esm' }).outputFiles[0].text;
@@ -84,13 +86,11 @@ try {
     }
     const bass=context.createBiquadFilter();bass.type='lowshelf';bass.frequency.value=spec.bassFrequency||200;bass.gain.value=spec.bass||0;
     const gain=context.createGain();gain.gain.value=spec.gain;
-    const guard=createAudioProcessor(context,spec.target);
-    guard.parameters.get('programmeGain')?.setValueAtTime(spec.gain,0);
-    if(spec.gainChangeAt){gain.gain.setValueAtTime(spec.nextGain,spec.gainChangeAt);guard.parameters.get('programmeGain')?.setValueAtTime(spec.nextGain,spec.gainChangeAt);}
+    const guard=createAudioProcessor(context);
+    if(spec.gainChangeAt)gain.gain.setValueAtTime(spec.nextGain,spec.gainChangeAt);
     let resetAcknowledged;
     const resetObserved=new Promise(resolve=>{resetAcknowledged=resolve;});
     guard.port.onmessage=event=>{if(event.data.epoch===1){resetEpochs[spec.id]=1;resetAcknowledged();}};
-    if(spec.changeAt)guard.parameters.get('loudnessCeilingLufs')?.setValueAtTime(spec.nextTarget+2,spec.changeAt);
     if(spec.resetAt)context.suspend(spec.resetAt).then(()=>{guard.port.postMessage({type:'reset-meter',epoch:1});context.resume();});
     source.connect(bass).connect(gain).connect(guard,0,0).connect(context.destination);
     bass.connect(guard,0,1);
@@ -137,27 +137,24 @@ try {
   for (const spec of cases) {
     const pcm = rendered.get(spec.id);
     assert.ok(pcm, 'Missing rendered audio: ' + spec.id);
-    const epochs = spec.changeAt ? [[0, spec.changeAt, spec.target], [spec.changeAt, pcm.length / spec.outputChannels / spec.rate, spec.nextTarget]]
-      : [[0, pcm.length / spec.outputChannels / spec.rate, spec.target]];
+    const epochs = [[0, pcm.length / spec.outputChannels / spec.rate, spec.target]];
     const results = epochs.map(([start, end, target], index) => {
       const audio = pcm.slice(Math.round(start * spec.rate) * spec.outputChannels, Math.round(end * spec.rate) * spec.outputChannels);
       const file = join(artifacts, spec.id + '-epoch-' + index + '.wav');
       writeFloatWav(file, audio, spec.rate, spec.outputChannels);
       const independent = ffmpegMaxima(file), dense = denseMaxima(audio, spec.rate, spec.outputChannels);
-      const ceiling = target + 2;
-      return { start, end, target, ceiling, independent, dense,
-        pass: Number.isFinite(dense.momentary) && independent.momentary <= ceiling + .05
-          && dense.momentary <= ceiling + .01
-          && (end - start < 3 || (Number.isFinite(dense.shortTerm)
-            && independent.shortTerm <= ceiling + .05 && dense.shortTerm <= ceiling + .01))
+      return { start, end, target, independent, dense,
+        pass: Number.isFinite(dense.momentary)
+          && (end - start < 3 || Number.isFinite(dense.shortTerm))
           // Sample ceiling is -1 dBFS; independent reconstructed peaks must
           // remain below full scale. This does not claim a -1 dBTP limiter.
           && dense.peak <= .891251 && independent.truePeak <= 1 && dense.rms > 1e-4 };
     });
-    // Sustained loud input must reach within 1 LU of its ceiling: all-silence or
-    // arbitrary fixed attenuation is not an acceptable implementation.
-    const useful = !['loud', 'burst', 'bass'].includes(spec.mode)
-      || results.every(row => row.independent.momentary >= row.ceiling - 1);
+    // A 0.65 sine has ample digital headroom. It must pass at the supplied
+    // gain regardless of the target; its LUFS maximum intentionally exceeds it.
+    const transparent = spec.mode !== 'loud' || spec.gain !== 1
+      || Math.abs(Math.sqrt(pcm.reduce((sum,value)=>sum+value*value,0)/pcm.length)
+        / (.65 / Math.sqrt(2) * Math.sqrt(spec.seconds / (spec.seconds + .1))) - 1) < .001;
     const first = pcm.findIndex(sample => sample !== 0);
     const latencyMs = (first / spec.outputChannels / spec.rate - (spec.mode === 'tail-impulse' ? spec.seconds - 1 / spec.rate : 0)) * 1000;
     let stereoDifference = 0;
@@ -174,20 +171,27 @@ try {
     const contrasts=spec.mode==='dynamics'?[3,6,9,12,15].map(start=>20*Math.log10(rms(start+.25,start+.55)/rms(start+2,start+2.3))):[];
     const dynamicsPass=contrasts.every(value=>Math.abs(value-12)<=.2);
     const programmeChangeDb=spec.gainChangeAt?20*Math.log10(rms(9.25,9.55)/rms(3.25,3.55)):0;
+    const expectedChangeDb=spec.gainChangeAt?20*Math.log10(spec.nextGain/spec.gain):0;
     const referenceGains=[];
     if(spec.mode==='reference') {
       const input=new Float32Array(referencePcm.buffer.slice(referencePcm.byteOffset,referencePcm.byteOffset+referencePcm.length));
       const delayFrames=Math.round(report.cases.find(row=>row.mode==='tail-impulse').latencyMs/1000*spec.rate),blockFrames=Math.round(.1*spec.rate);
-      for(let start=spec.rate*10;start+blockFrames+delayFrames<input.length/2;start+=blockFrames) {
+      for(let start=spec.rate;start+blockFrames+delayFrames<input.length/2;start+=blockFrames) {
         let xy=0,xx=0;
         for(let i=start*2;i<(start+blockFrames)*2;i++){xx+=input[i]*input[i];xy+=input[i]*pcm[i+delayFrames*2];}
         if(xx>blockFrames*2*1e-8)referenceGains.push({time:start/spec.rate,gain:xy/xx});
       }
     }
     const maximumRecovery=referenceGains.reduce((max,row,i)=>i?Math.max(max,row.gain-referenceGains[i-1].gain):max,0);
+    const referencePass=!spec.fullReference || (referenceGains.length>spec.seconds*8
+      && referenceGains.every(row=>Math.abs(row.gain-spec.gain)<1e-5));
+    const integratedReference=spec.fullReference?measureWithFfmpeg(join(artifacts,spec.id+'.wav')):undefined;
+    const averagePass=!spec.fullReference||Math.abs(integratedReference.integratedLufs-spec.target)<=.15;
     report.cases.push({ ...spec, results, latencyMs, stereoDifference,
       contrasts, dynamicsPass,programmeChangeDb,referenceGains,maximumRecovery,
-      pass: useful && timingPass && tailPass && mixPass && dynamicsPass && Math.abs(programmeChangeDb)<=.2 && maximumRecovery<=.01 && results.every(row => row.pass) });
+      transparent, expectedChangeDb,referencePass,averagePass,integratedReference,referenceMeasurement:spec.fullReference?referenceMeasurement:undefined,
+      pass: transparent && timingPass && tailPass && mixPass && dynamicsPass
+        && referencePass && averagePass && Math.abs(programmeChangeDb-expectedChangeDb)<=.2 && results.every(row => row.pass) });
   }
   const quiet = report.cases.find(row => row.id === 'quiet').results[0].dense.rms;
   const louder = report.cases.find(row => row.id === 'quiet-times-ten').results[0].dense.rms;
@@ -197,7 +201,7 @@ try {
   report.pass = report.cases.every(row => row.pass) && Math.abs(report.belowCeilingDifferenceDb - 20) <= .1
     && report.resetEpochs['meter-reset'] === 1 && report.meterResetAudioUnchanged;
   for (const row of report.cases) console.log(JSON.stringify({ id: row.id, pass: row.pass, results: row.results }));
-  assert.equal(report.pass, true, 'Rendered loudness ceiling contract failed');
+  assert.equal(report.pass, true, 'Rendered dynamics and digital clipping contract failed');
 } catch (error) { report.error = String(error.stack || error); process.exitCode = 1; }
 finally {
   try { await browser?.close(); }
