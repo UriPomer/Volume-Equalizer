@@ -4,6 +4,10 @@ import { MeterState } from './types';
 
 type OutputState = Pick<MeterState, 'outputIntegratedLufs' | 'momentaryLufs' | 'maximumMomentaryLufs'
   | 'maximumShortTermLufs' | 'safetyGain' | 'loudnessGain'>;
+export type AudioOutputClient = {
+  setGain: (gain: number, time: number) => void;
+  release: () => void;
+};
 const outputs = new WeakMap<BaseAudioContext, SharedAudioOutput>();
 
 export function getAudioOutput(context: BaseAudioContext, targetLufs: number): SharedAudioOutput {
@@ -21,7 +25,7 @@ export class SharedAudioOutput {
   readonly ready: Promise<void>;
   private node: AudioWorkletNode | null = null;
   private readonly meter: LoudnessMeter;
-  private readonly clients = new Map<() => void, () => number>();
+  private readonly clients = new Map<() => void, number>();
   private epoch = 0;
   private safetyGain = 1;
   private loudnessGain = 1;
@@ -52,11 +56,11 @@ export class SharedAudioOutput {
     });
   }
 
-  retain(onFailure: () => void, getGain: () => number): () => void {
-    this.clients.set(onFailure, getGain);
+  retain(onFailure: () => void): AudioOutputClient {
+    this.clients.set(onFailure, 1);
     this.updateProgrammeGain();
     if (this.clients.size > 1) this.resetMeasurements(true, true);
-    return () => {
+    const release = () => {
       if (!this.clients.delete(onFailure)) return;
       if (this.clients.size) {
         this.updateProgrammeGain();
@@ -71,13 +75,22 @@ export class SharedAudioOutput {
       }
       outputs.delete(this.context);
     };
+    return { release, setGain: (gain, time) => {
+      if (!this.clients.has(onFailure)) return;
+      this.clients.set(onFailure, gain);
+      this.updateProgrammeGain(time);
+    } };
   }
 
   isReady(): boolean { return this.node !== null && !this.failed && !this.closed; }
 
-  updateProgrammeGain(): void {
-    const gain = this.clients.size === 1 ? this.clients.values().next().value!() : 1;
-    this.node?.parameters.get('programmeGain')?.setValueAtTime(gain, this.context.currentTime);
+  private updateProgrammeGain(time = this.context.currentTime): void {
+    // Synchronize the scheduled value/time, never AudioParam.value: its getter
+    // can still expose the previous render quantum after setValueAtTime.
+    const gain = this.clients.size === 1 ? this.clients.values().next().value! : 1;
+    const parameter = this.node?.parameters.get('programmeGain');
+    parameter?.cancelScheduledValues(time);
+    parameter?.setValueAtTime(gain, time);
   }
 
   connect(source: AudioNode): void {

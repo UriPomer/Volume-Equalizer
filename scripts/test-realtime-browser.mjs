@@ -49,6 +49,7 @@ writeTone(join(artifacts, 'stability.wav'), 75, t => t < 18 ? .12 : t < 38 ? .07
 writeTone(join(artifacts, 'periodic.wav'), 70, t => t % 3 < .6 ? .16 : .16 * Math.pow(10, -12 / 20));
 writeTone(join(artifacts, 'multiple.wav'), 20, () => .65);
 writeTone(join(artifacts, 'second.wav'), 20, () => .65, 1301);
+writeTone(join(artifacts, 'startup.wav'), 15, () => .135);
 const reference = measureWithFfmpeg(fixture);
 const commit = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
 const report = { command: 'npm run test:realtime', commit, generatedAt: new Date().toISOString(),
@@ -64,13 +65,26 @@ ${captureBootstrap}
 const stored={targetRms:Math.pow(10,(-17.5+.691)/20)};
 window.mediaEvents=[];
 window.programmeGains=[];
+window.referenceGains=[];
+const NativeWorkletNode=window.AudioWorkletNode;
+window.AudioWorkletNode=class extends NativeWorkletNode {
+  constructor(...args){
+    super(...args);
+    if(args[1]!=='lookahead-peak-limiter')return;
+    const parameter=this.parameters.get('programmeGain'),setValue=parameter.setValueAtTime;
+    parameter.setValueAtTime=function(...values){
+      window.referenceGains.push({value:values[0],contextTime:values[1]});
+      return Reflect.apply(setValue,this,values);
+    };
+  }
+};
 const createGain=BaseAudioContext.prototype.createGain;
 BaseAudioContext.prototype.createGain=function(...args){
   const node=Reflect.apply(createGain,this,args),setValue=node.gain.setValueAtTime;
   window.programmeGainParam=node.gain;
   node.gain.setValueAtTime=function(...args){
     const result=Reflect.apply(setValue,this,args);
-    window.programmeGains.push({value:args[0],contextTime:args[1],mediaTime:document.querySelector('audio')?.currentTime,fixture:window.activeFixture});
+    window.programmeGains.push({value:args[0],immediateValue:node.gain.value,contextTime:args[1],mediaTime:document.querySelector('audio')?.currentTime,fixture:window.activeFixture});
     return result;
   };
   return node;
@@ -80,7 +94,7 @@ window.chrome={runtime:{getURL:path=>'/'+path,getManifest:()=>({version:'${insta
   get:(defaults,callback)=>callback({...defaults,...stored}),
   set:(settings,callback)=>{Object.assign(stored,settings);callback();}
 },onChanged:{addListener(){},removeListener(){}}}};
-</script><script src="/content.js"></script>`;
+</script>`;
 const recorded = [];
 const server = createServer(async (req, res) => {
   const name = req.url?.slice(1);
@@ -92,9 +106,12 @@ const server = createServer(async (req, res) => {
   } else if (name === 'capture.js') {
     res.setHeader('Content-Type', 'text/javascript'); res.end(captureProcessor);
   } else if (name === 'content.js' || name === 'limiter-worklet.js') {
+    // Loading the extension module is asynchronous on an already running page.
+    // Let the temporary muted GainNode render before protection becomes ready.
+    if(name==='limiter-worklet.js')await delay(250);
     res.setHeader('Content-Type', 'text/javascript');
     res.end(name === 'content.js' ? content : worklet);
-  } else if (['mixed.wav', 'silence.wav', 'quiet.wav', 'loud.wav', 'stability.wav', 'periodic.wav', 'multiple.wav', 'second.wav'].includes(name)) {
+  } else if (['mixed.wav', 'silence.wav', 'quiet.wav', 'loud.wav', 'stability.wav', 'periodic.wav', 'multiple.wav', 'second.wav', 'startup.wav'].includes(name)) {
     const data = readFileSync(join(artifacts, name));
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Content-Length', data.length);
@@ -133,7 +150,7 @@ async function snapshot() {
       paused:document.querySelector('audio').paused,readyState:document.querySelector('audio').readyState,
       mediaError:document.querySelector('audio').error?.message,
       gain:parseFloat(text('gain')),programmeGain:window.programmeGainParam?.value,
-      displayedProgrammeGain:parseFloat(text('programmeGain')),version:root.querySelector('[data-role="version"]')?.textContent,
+      version:root.querySelector('[data-role="version"]')?.textContent,
       gainTraceIndex:window.programmeGains.length-1,safety:parseFloat(text('safety')),phase:text('phase'),status:text('status'),
       loudnessProtection:parseFloat(text('loudnessSafety')),maximumMomentary:parseFloat(text('maximumMomentary')),
       maximumShortTerm:parseFloat(text('maximumShortTerm')),
@@ -180,8 +197,33 @@ try {
   await send('WebAudio.enable');
   await send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 900, deviceScaleFactor: 1, mobile: false });
   await send('Page.navigate', { url: 'http://127.0.0.1:' + server.address().port });
+  // A playing video must remain audible when the extension attaches. Earlier
+  // fixtures waited until all gain parameters settled before starting playback.
+  await playFixture('startup.wav');
+  await evaluate(`(()=>{const script=document.createElement('script');script.src='/content.js';document.body.append(script);})()`);
   for (let i = 0; i < 100 && !(await snapshot()); i++) await delay(100);
   assert.equal((await snapshot()).version,'v'+installedVersion,'Panel must show the installed manifest version');
+  await setSlider('targetLufs', -21);
+  const startupRate=await evaluate('window.startAudioCapture()');
+  const startupTime = (await snapshot()).time;
+  await observe(8);
+  await evaluate('window.stopAudioCapture()');
+  const startupBytes=Buffer.concat(recorded.sort((a,b)=>a.sequence-b.sequence).map(row=>row.bytes));
+  const startupPcm=new Float32Array(startupBytes.buffer.slice(startupBytes.byteOffset,startupBytes.byteOffset+startupBytes.length));
+  const startupFile=join(artifacts,'late-attachment-output.wav');
+  writeFloatWav(startupFile,startupPcm,startupRate,2);
+  const startupBlocks=[];
+  for(let start=startupRate;start+startupRate/5<=startupPcm.length/2;start+=startupRate/5){
+    const block=startupPcm.slice(start*2,(start+startupRate/5)*2);
+    startupBlocks.push({time:startupTime+start/startupRate,rms:Math.sqrt(block.reduce((sum,value)=>sum+value*value,0)/block.length)});
+  }
+  report.startup={file:startupFile,blocks:startupBlocks,independent:ffmpegMaxima(startupFile)};
+  report.startup.schedules=await evaluate(`({programme:window.programmeGains,reference:window.referenceGains})`);
+  assert.ok(startupBlocks.length>=30&&startupBlocks.every(row=>row.rms>.02),'Every steady input interval must remain audible after attachment');
+  assert.ok(report.startup.independent.momentary<=-19+.05,'Late attachment must honor target +2 LU');
+  assert.equal(await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelectorAll('[data-meter="programmeGain"]').length`),0,'Panel must show only one effective gain');
+  recorded.length=0;
+  await setSlider('targetLufs', -17.5);
   await playFixture('stability.wav');
   let stable;
   for (let i = 0; i < 16; i++) {
@@ -245,7 +287,6 @@ try {
   await screenshot('mixed');
   assert.ok(Math.abs(mixed.input - reference.integratedLufs) <= .4, 'Input differs from independent FFmpeg measurement');
   assert.ok(report.trace.slice(mixedTraceStart).some(row => row.programmeGain > 1.2), 'Below-target integrated input must allow programme amplification');
-  assert.ok(Math.abs(mixed.displayedProgrammeGain-mixed.programmeGain)<=.01,'Panel must distinguish programme gain from final gain');
   assert.ok(mixed.output > mixed.input + .3, 'Ceiling protection must not defeat programme normalization entirely');
   assert.ok(mixed.maximumMomentary <= -15.5 && mixed.maximumShortTerm <= -15.5, 'Historical output maxima must honor target +2 LU');
   assert.ok(report.trace.slice(mixedTraceStart).some(row => row.phase.includes('响度上限限制')), 'A binding loudness ceiling must be explicit');

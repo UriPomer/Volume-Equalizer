@@ -1,5 +1,5 @@
 import { createMediaMeter, ensureAudioContext, ensureMediaSource } from './audio-context';
-import { getAudioOutput, SharedAudioOutput } from './audio-output';
+import { AudioOutputClient, getAudioOutput, SharedAudioOutput } from './audio-output';
 import { INITIAL_GAIN, Settings } from './config';
 import { analyzeFullAudio, calculateFullAudioGain, classifyMediaDuration, FullAudioAnalysisError, FullAudioAnalysisResult } from './full-audio-analysis';
 import { AgcUpdateResult, RealtimeAgc } from './gain-control';
@@ -26,7 +26,7 @@ export class MediaVolumeController {
   private processor: AudioWorkletNode | null = null;
   private originalMeter: LoudnessMeter;
   private readonly output: SharedAudioOutput;
-  private readonly releaseOutput: () => void;
+  private readonly outputClient: AudioOutputClient;
   private agc = new RealtimeAgc();
   private analysisStatus: AnalysisStatus = 'realtime';
   private analysisAbort: AbortController | null = null;
@@ -84,11 +84,11 @@ export class MediaVolumeController {
     this.bass.gain.value = settings.bassBoost;
     this.originalMeter = new LoudnessMeter(this.context.sampleRate);
     this.output = getAudioOutput(this.context, rmsToLufs(settings.targetRms));
-    this.releaseOutput = this.output.retain(() => {
+    this.outputClient = this.output.retain(() => {
       if (this.destroyed) return;
       this.analysisStatus = 'processor-unavailable';
       this.connectGraph();
-    }, () => this.gain.gain.value);
+    });
     this.output.updateSettings(rmsToLufs(settings.targetRms), settings.enabled);
 
     this.bindEvents();
@@ -163,7 +163,7 @@ export class MediaVolumeController {
       this.processor.onprocessorerror = null;
       this.processor = null;
     }
-    this.releaseOutput();
+    this.outputClient.release();
   }
 
   private bindEvents(): void {
@@ -297,7 +297,6 @@ export class MediaVolumeController {
       gainLimited: this.gainState.limited,
       originalIntegratedLufs: originalLufs,
       gain: this.gain.gain.value * output.safetyGain * output.loudnessGain,
-      programmeGain: this.gain.gain.value,
       sampleCount: Math.floor(this.originalMeter.getIntegrationTime()),
       analysisStatus: this.processor && this.output.isReady() ? this.analysisStatus : 'processor-unavailable'
     });
@@ -306,9 +305,10 @@ export class MediaVolumeController {
   private setGain(value: number): void {
     const gain = this.settings.enabled && (!this.processor || !this.output.isReady()) ? 0
       : clamp(value, this.settings.minGain, this.settings.maxGain);
-    this.gain.gain.cancelScheduledValues(this.context.currentTime);
-    this.gain.gain.setValueAtTime(gain, this.context.currentTime);
-    this.output.updateProgrammeGain();
+    const time = this.context.currentTime;
+    this.gain.gain.cancelScheduledValues(time);
+    this.gain.gain.setValueAtTime(gain, time);
+    this.outputClient.setGain(gain, time);
   }
 
   private resetMeters(resetAgc = true): void {

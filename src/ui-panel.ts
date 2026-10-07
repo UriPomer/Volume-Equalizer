@@ -77,7 +77,7 @@ function panelHtml(settings: Settings): string {
         ${meterRow('积分', 'outputIntegrated', ' LUFS')} ${meterRow('瞬时', 'output', ' LUFS')}
         ${meterRow('最大瞬时 · 400ms', 'maximumMomentary')}
         ${meterRow('最大短时 · 3s', 'maximumShortTerm')}
-        ${meterRow('节目增益', 'programmeGain')} ${meterRow('实际增益', 'gain')} ${meterRow('算法', 'status')}
+        ${meterRow('增益', 'gain')} ${meterRow('算法', 'status')}
         ${meterRow('调节状态', 'phase')}
         ${meterRow('削波保护', 'safety')}
         ${meterRow('响度保护', 'loudnessSafety')}
@@ -181,7 +181,6 @@ function updateMeter(shadow: ShadowRoot, getMeter: () => MeterState): void {
     const phases = { collecting: '收集有效声音', calibrating: '平滑校准', stable: '已稳定', 'full-track': '完整音轨' };
     setText(shadow, '[data-meter="phase"]', `${phases[meter.phase]}${meter.loudnessGain < .999 ? ' · 响度上限限制' : ''}${meter.gainLimited ? ' · 达到倍率限制' : ''}`);
     setText(shadow, '[data-meter="gain"]', `${meter.gain.toFixed(2)}x`);
-    setText(shadow, '[data-meter="programmeGain"]', `${meter.programmeGain.toFixed(2)}x`);
     setText(shadow, '[data-meter="status"]', STATUS_TEXT[meter.analysisStatus]);
   }, 100);
 }

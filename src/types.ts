@@ -22,7 +22,6 @@ export interface MeterState {
   maximumMomentaryLufs: number;
   maximumShortTermLufs: number;
   gain: number;
-  programmeGain: number;
   sampleCount: number;
   analysisStatus: AnalysisStatus;
 }
@@ -39,7 +38,6 @@ export const EMPTY_METER_STATE: MeterState = {
   maximumMomentaryLufs: NaN,
   maximumShortTermLufs: NaN,
   gain: 1,
-  programmeGain: 1,
   sampleCount: 0,
   analysisStatus: 'realtime'
 };
