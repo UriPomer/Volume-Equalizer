@@ -57,7 +57,7 @@ const report = { command: 'npm run test:realtime', commit, generatedAt: new Date
   workletSha256: createHash('sha256').update(worklet).digest('hex'),
   input: { file: fixture, sha256: createHash('sha256').update(readFileSync(fixture)).digest('hex'),
     reference, targetLufs: -17.5, expectedGain: Math.pow(10, (-17.5 - reference.integratedLufs) / 20) },
-  checkpoints: [], trace: [], inputLoads: [], audioGraphEvents: [], pass: false };
+  checkpoints: [], trace: [], inputLoads: [], audioGraphEvents: [], consoleEntries: [], pass: false };
 const page = `<!doctype html><meta charset="utf-8"><style>body{background:#17202b;color:white;font:18px system-ui}</style>
 <h1>Realtime integrated loudness regression</h1><audio controls></audio>
 <script>
@@ -191,10 +191,12 @@ async function screenshot(name) {
 try {
   browser = await openBrowser(artifacts, event => {
     if (event.method.startsWith('WebAudio.')) report.audioGraphEvents.push(event);
+    if (event.method === 'Log.entryAdded') report.consoleEntries.push(event.params.entry);
   });
   ({ send, evaluate } = browser);
   report.browser = await send('Browser.getVersion');
   await send('WebAudio.enable');
+  await send('Log.enable');
   await send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 900, deviceScaleFactor: 1, mobile: false });
   await send('Page.navigate', { url: 'http://127.0.0.1:' + server.address().port });
   // A playing video must remain audible when the extension attaches. Earlier
@@ -219,6 +221,7 @@ try {
   }
   report.startup={file:startupFile,blocks:startupBlocks,independent:ffmpegMaxima(startupFile)};
   report.startup.schedules=await evaluate(`({programme:window.programmeGains,reference:window.referenceGains})`);
+  assert.ok(!report.consoleEntries.some(entry=>entry.text.includes('programmeGain')&&entry.text.includes('outside nominal range')),'Legitimate startup mute must not generate a programmeGain range warning');
   assert.ok(startupBlocks.length>=30&&startupBlocks.every(row=>row.rms>.02),'Every steady input interval must remain audible after attachment');
   assert.ok(report.startup.independent.momentary<=-19+.05,'Late attachment must honor target +2 LU');
   assert.equal(await evaluate(`document.getElementById('universal-volume-eq-panel').shadowRoot.querySelectorAll('[data-meter="programmeGain"]').length`),0,'Panel must show only one effective gain');

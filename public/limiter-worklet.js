@@ -4,7 +4,7 @@ class LookaheadPeakLimiterProcessor extends AudioWorkletProcessor {
   static get parameterDescriptors() {
     return [
       { name: 'loudnessCeilingLufs', defaultValue: -19, minValue: -68, maxValue: 2, automationRate: 'k-rate' },
-      { name: 'programmeGain', defaultValue: 1, minValue: .000001, maxValue: 32, automationRate: 'a-rate' }
+      { name: 'programmeGain', defaultValue: 1, minValue: 0, maxValue: 32, automationRate: 'a-rate' }
     ];
   }
 
