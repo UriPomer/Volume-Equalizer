@@ -183,10 +183,11 @@ async function screenshot(name) {
   writeFileSync(join(artifacts, name + '.png'), Buffer.from(image.data, 'base64'));
 }
 try {
-  browser = await openBrowser(artifacts, event => {
-    if (event.method.startsWith('WebAudio.')) report.audioGraphEvents.push(event);
-    if (event.method === 'Log.entryAdded') report.consoleEntries.push(event.params.entry);
-  });
+  browser = await openBrowser(artifacts);
+  for (const method of ['WebAudio.audioNodeCreated', 'WebAudio.nodesConnected', 'WebAudio.nodesDisconnected']) {
+    browser.on(method, params => report.audioGraphEvents.push({ method, params }));
+  }
+  browser.on('Log.entryAdded', params => report.consoleEntries.push(params.entry));
   ({ send, evaluate } = browser);
   report.browser = await send('Browser.getVersion');
   await send('WebAudio.enable');
@@ -402,7 +403,7 @@ try {
 } finally {
   if(browser)report.mediaEvents=await evaluate('window.mediaEvents').catch(()=>null);
   try { await browser?.close(); }
-  catch (error) { report.pass = false; report.error = String(error); process.exitCode = 1; }
+  catch (error) { report.pass = false; report.cleanupError = String(error); process.exitCode = 1; }
   finally { server.close(); }
   writeFileSync(join(artifacts, 'report.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify({ pass: report.pass, error: report.error, artifacts }));

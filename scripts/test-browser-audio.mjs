@@ -170,7 +170,7 @@ try {
 } catch (error) { report.error = String(error.stack || error); process.exitCode = 1; }
 finally {
   try { await browser?.close(); }
-  catch (error) { report.pass = false; report.error = String(error); process.exitCode = 1; }
+  catch (error) { report.pass = false; report.cleanupError = String(error); process.exitCode = 1; }
   finally { server.close(); }
   writeFileSync(join(artifacts, 'report.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify({ pass: report.pass, artifacts, error: report.error }));

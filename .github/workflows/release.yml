@@ -2,120 +2,48 @@ name: Release Extension
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  verify:
+    uses: ./.github/workflows/verify.yml
+    with:
+      expected-tag: ${{ github.ref_name }}
+
+  publish:
+    needs: verify
     runs-on: windows-latest
-
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Node
-        uses: actions/setup-node@v5
+      - name: Download verified package
+        uses: actions/download-artifact@v4
         with:
-          node-version: 22
-          cache: npm
+          name: extension-package
+          path: package
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Type check
-        run: npx tsc --noEmit
-
-      - name: Unit and controller state tests
-        run: npm run test:unit
-
-      - name: Install FFmpeg
-        run: choco install ffmpeg --no-progress -y
-
-      - name: Download audio fixtures
-        run: npm run test:audio:download
-
-      - name: Enforce audio quality
-        run: npm run test:audio:enforce
-
-      - name: Build package
-        run: npm run pack
-
-      - name: Native browser DSP contracts
-        run: node scripts/test-browser-audio.mjs
+      - name: Verify package checksum before publishing
         env:
-          VOLUME_EQ_ARTIFACT_ROOT: ${{ runner.temp }}
-
-      - name: Controlled media and panel integration
-        run: node scripts/test-realtime-browser.mjs
-        env:
-          VOLUME_EQ_ARTIFACT_ROOT: ${{ runner.temp }}
-
-      - name: Native processor failure integration
-        run: node scripts/test-browser-failures.mjs
-        env:
-          VOLUME_EQ_ARTIFACT_ROOT: ${{ runner.temp }}
-
-      - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
-
-      - name: Playing media lifecycle continuity E2E
-        run: node scripts/test-reported-video.mjs --lifecycle
-        env:
-          VOLUME_EQ_ARTIFACT_ROOT: ${{ runner.temp }}
-          VOLUME_EQ_REFERENCE_AUDIO: ${{ github.workspace }}/tests/fixtures/videos/clear-layout-design.mp4
-
-      - name: Bilibili player E2E
-        timeout-minutes: 20
-        run: node scripts/test-reported-video.mjs
-        env:
-          VOLUME_EQ_ARTIFACT_ROOT: ${{ runner.temp }}
-
-      - name: Upload audio verification evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-audio-verification
-          path: |
-            test-results/
-            ${{ runner.temp }}/volume-eq-dynamics-*/
-            ${{ runner.temp }}/volume-eq-realtime-*/
-            ${{ runner.temp }}/volume-eq-failures-*/
-            ${{ runner.temp }}/volume-eq-continuity-*/
-
-      - name: Verify tag matches manifest version
+          VERSION: ${{ needs.verify.outputs.version }}
+          EXPECTED_SHA256: ${{ needs.verify.outputs.package-sha256 }}
         shell: pwsh
         run: |
-          $manifest = Get-Content -Raw dist/manifest.json | ConvertFrom-Json
-          $tag = "${{ github.ref_name }}"
-          $expectedTag = "v$($manifest.version)"
-
-          if ($tag -ne $expectedTag) {
-            Write-Error "Tag $tag does not match manifest version $($manifest.version). Expected $expectedTag."
-            exit 1
-          }
-
-          $zip = "bili-volume-eq-v$($manifest.version).zip"
-          if (-not (Test-Path -LiteralPath $zip)) {
-            Write-Error "Expected package $zip was not generated."
-            exit 1
-          }
-
-          "ZIP_PATH=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VERSION=$($manifest.version)" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: bili-volume-eq-v${{ env.VERSION }}
-          path: ${{ env.ZIP_PATH }}
-          if-no-files-found: error
+          $zip = "package/bili-volume-eq-v$env:VERSION.zip"
+          $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+          if ($actual -ne $env:EXPECTED_SHA256) { throw 'Verified release package checksum mismatch' }
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          name: v${{ env.VERSION }}
-          files: ${{ env.ZIP_PATH }}
+          tag_name: ${{ github.ref_name }}
+          name: v${{ needs.verify.outputs.version }}
+          files: package/bili-volume-eq-v${{ needs.verify.outputs.version }}.zip
           fail_on_unmatched_files: true

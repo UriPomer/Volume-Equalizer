@@ -236,16 +236,22 @@ try {
 } catch (error) { report.error = String(error.stack || error); process.exitCode = 1; }
 finally {
   if (rate && !report.pcm) {
-    try { await evaluate('window.continuity.recorder.port.onmessage=null'); report.mediaEvents = await evaluate('window.continuity.events.filter(event=>event.primary)'); saveContinuityPcm(artifacts, recordings.get(contextId), rate, report); }
+    try { await evaluate('window.continuity.recorder.port.onmessage=null'); report.mediaEvents = await evaluate('window.continuity.events.filter(event=>event.primary)'); }
+    catch (error) { report.recordingShutdownError = String(error); }
+    try { saveContinuityPcm(artifacts, recordings.get(contextId), rate, report); }
     catch (error) { report.pcmError = String(error); }
   }
-  try {
-    if (page && !page.isClosed()) await page.screenshot({ path: join(artifacts, 'final.png') });
-    await context?.tracing.stop({ path: join(artifacts, 'trace.zip') });
-  } finally {
-    await context?.close(); server.close();
-    for (const recording of recordings.values()) recording.close();
-    writeFileSync(join(artifacts, 'report.json'), JSON.stringify(report, null, 2));
-    console.log(JSON.stringify({ pass: report.pass, error: report.error, artifacts }));
+  async function cleanup(name, run) {
+    try { await run(); }
+    catch (error) {
+      (report.cleanupErrors ||= []).push({ name, error: String(error) });
+      report.pass = false; process.exitCode = 1;
+    }
   }
+  await cleanup('screenshot', () => page && !page.isClosed() && page.screenshot({ path: join(artifacts, 'final.png'), timeout: 5000 }));
+  await cleanup('trace', () => context?.tracing.stop({ path: join(artifacts, 'trace.zip') }));
+  await cleanup('browser', () => context?.close()); server.close();
+  for (const recording of recordings.values()) await cleanup('recording', () => recording.close());
+  writeFileSync(join(artifacts, 'report.json'), JSON.stringify(report, null, 2));
+  console.log(JSON.stringify({ pass: report.pass, error: report.error, cleanupErrors: report.cleanupErrors, artifacts }));
 }

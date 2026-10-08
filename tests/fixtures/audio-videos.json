@@ -4,6 +4,7 @@
     "title": "Sintel trailer — original level",
     "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
     "file": "sintel-trailer.mp4",
+    "sha256": "b670602fa00934ca27c4351bb0efe7ea7a07fae57284e44226025eeed7c51254",
     "inputGainDb": 0
   },
   {
@@ -11,6 +12,7 @@
     "title": "Big Buck Bunny trailer — quiet programme",
     "url": "https://media.w3.org/2010/05/bunny/trailer.mp4",
     "file": "bunny-trailer.mp4",
+    "sha256": "b2ded9ae5a20fa36ca8cec49ef923bffb5e1a51d9e8c1f8336273d2fa9d35ff0",
     "inputGainDb": -12
   },
   {
@@ -18,6 +20,7 @@
     "title": "W3C movie sample — high level",
     "url": "https://media.w3.org/2010/05/video/movie_300.mp4",
     "file": "movie-300.mp4",
+    "sha256": "80c548058688a577ce9ca501cf9807311b95cc526cc82d292ec7e138e42257de",
     "inputGainDb": 6,
     "includeInEvaluation": false,
     "evaluationReason": "Peak protection limits this programme's output; target reachability is diagnostic. Measurement accuracy and peak protection are mandatory."
@@ -27,6 +30,7 @@
     "title": "WAI clear layout — speech and music",
     "url": "https://media.w3.org/wai/perspective-videos/clear-layout-design.mp4",
     "file": "clear-layout-design.mp4",
+    "sha256": "482897d31fdb62e2077f85dd7571562cbaab87f5c04d41070e3760d06e9eef4e",
     "inputGainDb": 0
   },
   {
@@ -34,6 +38,7 @@
     "title": "WAI video captions — speech and music",
     "url": "https://media.w3.org/wai/perspective-videos/video-captions.mp4",
     "file": "video-captions.mp4",
+    "sha256": "63161e8a2b39d73cbffce69798a8fccacd121a7cf8ffba3a08ab7febb50ab9c5",
     "inputGainDb": 0
   }
 ]

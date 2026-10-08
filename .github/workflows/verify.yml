@@ -1,0 +1,172 @@
+name: Verify Extension
+
+on:
+  workflow_call:
+    inputs:
+      expected-tag:
+        type: string
+        default: ''
+    outputs:
+      version:
+        value: ${{ jobs.verify.outputs.version }}
+      package-sha256:
+        value: ${{ jobs.verify.outputs.package-sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      package-sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate source versions and release tag
+        id: version
+        env:
+          EXPECTED_TAG: ${{ inputs.expected-tag }}
+        shell: pwsh
+        run: |
+          "VOLUME_EQ_ARTIFACT_ROOT=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          $package = Get-Content -Raw package.json | ConvertFrom-Json
+          $manifest = Get-Content -Raw public/manifest.json | ConvertFrom-Json
+          $lock = Get-Content -Raw package-lock.json | ConvertFrom-Json -AsHashtable
+          $version = $package.version
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:\.\d+)?$' -or [version]$version -gt [version]'1.0.0.0') {
+            throw "Invalid extension version or version exceeds 1.0: $version"
+          }
+          if ($manifest.version -ne $version -or $lock.version -ne $version -or $lock.packages[''].version -ne $version) {
+            throw 'Package, lockfile and manifest versions must agree'
+          }
+          if ($env:EXPECTED_TAG -and $env:EXPECTED_TAG -ne "v$version") {
+            throw "Release tag $env:EXPECTED_TAG must equal v$version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Existing unit and controller state tests
+        run: npm run test:unit
+
+      - name: Download transport E2E
+        timeout-minutes: 2
+        run: node scripts/test-fixture-download.mjs
+
+      - name: Install FFmpeg
+        timeout-minutes: 5
+        run: choco install ffmpeg --no-progress -y
+
+      - name: Cache pinned audio fixtures
+        uses: actions/cache@v4
+        with:
+          path: tests/fixtures/videos
+          key: audio-fixtures-${{ hashFiles('tests/fixtures/audio-videos.json') }}
+
+      - name: Download and verify audio fixtures
+        timeout-minutes: 5
+        run: npm run test:audio:download
+
+      - name: Enforce audio quality
+        timeout-minutes: 5
+        run: npm run test:audio:enforce
+
+      - name: Install pinned Playwright Chromium
+        timeout-minutes: 5
+        run: npx playwright install chromium
+
+      - name: Build package once
+        run: npm run pack
+
+      - name: Verify packaged payload and record provenance
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: pwsh
+        run: |
+          $zip = "bili-volume-eq-v$env:VERSION.zip"
+          $unpacked = Join-Path $env:RUNNER_TEMP 'verified-package'
+          Expand-Archive -LiteralPath $zip -DestinationPath $unpacked
+          $files = @(Get-ChildItem -LiteralPath $unpacked -File -Recurse)
+          $expected = @('content.js', 'limiter-worklet.js', 'manifest.json')
+          if ($files.Count -ne $expected.Count) { throw 'Unexpected packaged files' }
+          $payload = @{}
+          foreach ($file in $expected) {
+            $built = (Get-FileHash -LiteralPath "dist/$file" -Algorithm SHA256).Hash
+            $packed = (Get-FileHash -LiteralPath (Join-Path $unpacked $file) -Algorithm SHA256).Hash
+            if ($built -ne $packed) { throw "Packaged payload differs: $file" }
+            $payload[$file] = $built
+          }
+          $sha256 = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+          "sha256=$sha256" >> $env:GITHUB_OUTPUT
+          New-Item -ItemType Directory -Path test-results -Force | Out-Null
+          @{ commit = $env:GITHUB_SHA; version = $env:VERSION; packageSha256 = $sha256; payload = $payload } |
+            ConvertTo-Json -Depth 4 | Set-Content test-results/build-provenance.json
+
+      - name: Browser startup and shutdown E2E
+        timeout-minutes: 2
+        run: node scripts/test-ci-runtime.mjs
+
+      - name: Interrupted native playback retains evidence E2E
+        timeout-minutes: 2
+        run: node scripts/test-evidence-failure.mjs
+
+      - name: Native browser DSP contracts
+        timeout-minutes: 3
+        run: node scripts/test-browser-audio.mjs
+
+      - name: Controlled media and panel integration
+        timeout-minutes: 7
+        run: node scripts/test-realtime-browser.mjs
+
+      - name: Native processor failure integration
+        timeout-minutes: 3
+        run: node scripts/test-browser-failures.mjs
+
+      - name: Playing media lifecycle continuity E2E
+        timeout-minutes: 3
+        run: node scripts/test-reported-video.mjs --lifecycle
+        env:
+          VOLUME_EQ_REFERENCE_AUDIO: ${{ github.workspace }}/tests/fixtures/videos/clear-layout-design.mp4
+
+      - name: Bilibili player E2E
+        timeout-minutes: 20
+        run: node scripts/test-reported-video.mjs
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-verification
+          retention-days: 14
+          compression-level: 1
+          path: |
+            test-results/
+            ${{ runner.temp }}/volume-eq-*/report.json
+            ${{ runner.temp }}/volume-eq-*/*.wav
+            ${{ runner.temp }}/volume-eq-*/*.png
+            ${{ runner.temp }}/volume-eq-*/*.zip
+            ${{ runner.temp }}/volume-eq-*/*.jsonl
+            ${{ runner.temp }}/volume-eq-*/*.log
+
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-package
+          path: bili-volume-eq-v${{ steps.version.outputs.version }}.zip
+          if-no-files-found: error
