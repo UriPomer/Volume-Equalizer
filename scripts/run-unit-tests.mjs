@@ -22,7 +22,7 @@ try {
   ], { cwd: root, stdio: 'inherit' });
   execFileSync(process.execPath, [
     '--test',
-    'tests/controller-integration.test.cjs',
+    'tests/controller-state.test.cjs',
     'tests/gain-control.test.cjs',
     'tests/limiter-worklet.test.cjs',
     'tests/loudness-meter.test.cjs',

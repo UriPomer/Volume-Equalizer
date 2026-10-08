@@ -2,6 +2,8 @@
  * 配置文件 - 常量和默认设置
  */
 
+import { lufsToRms } from './lufs-calculator';
+
 export const BRAND = '[Universal Volume EQ]';
 export const PANEL_ID = 'universal-volume-eq-panel';
 export const TARGET_SELECTOR = 'video, audio';
@@ -18,7 +20,7 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = {
   enabled: true,
-  targetRms: 0.09650504109445904,  // 对应 -21 LUFS
+  targetRms: lufsToRms(-17.5),
   minGain: 0.25,     // 最多衰减约 12 dB；超出可达范围时提示倍率限制
   maxGain: 2.0,      // 最大增益；末端另做削波保护
   bassBoost: 0,              // 低频增益 (dB: -6 ~ +6)

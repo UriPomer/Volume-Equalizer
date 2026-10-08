@@ -4,6 +4,7 @@
 
 import { DEFAULT_SETTINGS, Settings } from './config';
 import { lufsToRms } from './lufs-calculator';
+import { warnFailure } from './logger';
 
 const storageSupported = typeof chrome !== 'undefined' && !!chrome?.storage?.local;
 const TARGET_RMS_MIN = lufsToRms(-23);
@@ -76,13 +77,9 @@ export function subscribeSettings(listener: (settings: Settings) => void): () =>
     changes: Record<string, chrome.storage.StorageChange>,
     areaName: string
   ) => {
-    if (areaName !== 'local') return;
-    const next: Record<string, unknown> = { ...DEFAULT_SETTINGS };
-    for (const key of Object.keys(DEFAULT_SETTINGS) as Array<keyof Settings>) {
-      if (changes[key]) next[key] = changes[key].newValue;
-    }
-    loadSettings().then(listener).catch(() => {
-      listener(normalizeSettings(next));
+    if (areaName !== 'local' || !Object.keys(DEFAULT_SETTINGS).some(key => key in changes)) return;
+    loadSettings().then(listener).catch(error => {
+      warnFailure('settings-refresh', '设置读取失败，保留当前设置', error);
     });
   };
   chrome.storage.onChanged.addListener(onChanged);

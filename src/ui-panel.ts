@@ -8,7 +8,7 @@ type ChangeSettings = (settings: Settings) => Settings;
 const STATUS_TEXT: Record<ProcessingStatus, string> = {
   realtime: '实时',
   'attach-failed': '媒体被页面占用',
-  'processor-unavailable': '保护不可用 · 已静音'
+  'processor-unavailable': '均衡不可用 · 原声播放'
 };
 
 let host: HTMLElement | null = null;
@@ -64,9 +64,9 @@ function panelHtml(settings: Settings): string {
       <hr>
       <div class="meter">
         <small>增益前（含低频设置）</small>
-        ${meterRow('积分', 'originalIntegrated', ' LUFS')} ${meterRow('瞬时', 'original', ' LUFS')}
+        ${meterRow('积分', 'originalIntegrated')} ${meterRow('瞬时', 'original')}
         <small>输出（页面混音）</small>
-        ${meterRow('积分', 'outputIntegrated', ' LUFS')} ${meterRow('瞬时', 'output', ' LUFS')}
+        ${meterRow('积分', 'outputIntegrated')} ${meterRow('瞬时', 'output')}
         ${meterRow('最大瞬时 · 400ms', 'maximumMomentary')}
         ${meterRow('最大短时 · 3s', 'maximumShortTerm')}
         ${meterRow('增益', 'gain')} ${meterRow('算法', 'status')}
@@ -90,7 +90,7 @@ function slider(
   </label>`;
 }
 
-function meterRow(label: string, field: string, suffix = ''): string {
+function meterRow(label: string, field: string): string {
   return `<div><span>${label}</span><b data-meter="${field}">测量中</b></div>`;
 }
 
@@ -145,20 +145,21 @@ function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings
 }
 
 function updateMeter(shadow: ShadowRoot, getMeter: () => MeterState): void {
-  const showMomentary = (lufs: number) => !Number.isFinite(lufs) && lufs !== -Infinity
-    ? '测量中' : `${Number.isFinite(lufs) ? lufs.toFixed(1) : '-∞'} LUFS`;
   meterTimer = window.setInterval(() => {
     if (!host?.isConnected) return;
     const meter = getMeter();
+    const available = meter.processingStatus === 'realtime';
+    const showMomentary = (lufs: number) => !Number.isFinite(lufs) && lufs !== -Infinity
+      ? available ? '测量中' : '不可用' : `${Number.isFinite(lufs) ? lufs.toFixed(1) : '-∞'} LUFS`;
     setText(shadow, '[data-meter="original"]', showMomentary(meter.originalMomentaryLufs));
-    setText(shadow, '[data-meter="originalIntegrated"]', `${showMomentary(meter.originalIntegratedLufs)} · ${meter.sampleCount}s`);
+    setText(shadow, '[data-meter="originalIntegrated"]', showMomentary(meter.originalIntegratedLufs) + (available ? ` · ${meter.sampleCount}s` : ''));
     setText(shadow, '[data-meter="output"]', showMomentary(meter.momentaryLufs));
-    setText(shadow, '[data-meter="safety"]', `${meter.safetyGain.toFixed(2)}x`);
+    setText(shadow, '[data-meter="safety"]', available ? `${meter.safetyGain.toFixed(2)}x` : '未启用');
     setText(shadow, '[data-meter="maximumMomentary"]', showMomentary(meter.maximumMomentaryLufs));
     setText(shadow, '[data-meter="maximumShortTerm"]', showMomentary(meter.maximumShortTermLufs));
     setText(shadow, '[data-meter="outputIntegrated"]', showMomentary(meter.outputIntegratedLufs));
     const phases = { collecting: '收集有效声音', calibrating: '平滑校准', stable: '已稳定' };
-    setText(shadow, '[data-meter="phase"]', `${phases[meter.phase]}${meter.gainLimited ? ' · 达到倍率限制' : ''}`);
+    setText(shadow, '[data-meter="phase"]', available ? `${phases[meter.phase]}${meter.gainLimited ? ' · 达到倍率限制' : ''}` : '均衡未生效');
     setText(shadow, '[data-meter="gain"]', `${meter.gain.toFixed(2)}x`);
     setText(shadow, '[data-meter="status"]', STATUS_TEXT[meter.processingStatus]);
   }, 100);

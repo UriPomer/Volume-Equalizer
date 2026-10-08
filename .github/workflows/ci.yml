@@ -24,7 +24,7 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
-      - name: Unit and integration tests
+      - name: Unit and controller state tests
         run: npm run test:unit
 
       - name: Install FFmpeg
@@ -39,13 +39,33 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Browser audio safety E2E
+      - name: Native browser DSP contracts
         run: node scripts/test-browser-audio.mjs
         env:
           VOLUME_EQ_ARTIFACT_ROOT: ${{ runner.temp }}
 
-      - name: Realtime media and panel E2E
+      - name: Controlled media and panel integration
         run: node scripts/test-realtime-browser.mjs
+        env:
+          VOLUME_EQ_ARTIFACT_ROOT: ${{ runner.temp }}
+
+      - name: Native processor failure integration
+        run: node scripts/test-browser-failures.mjs
+        env:
+          VOLUME_EQ_ARTIFACT_ROOT: ${{ runner.temp }}
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Playing media lifecycle continuity E2E
+        run: node scripts/test-reported-video.mjs --lifecycle
+        env:
+          VOLUME_EQ_ARTIFACT_ROOT: ${{ runner.temp }}
+          VOLUME_EQ_REFERENCE_AUDIO: ${{ github.workspace }}/tests/fixtures/videos/clear-layout-design.mp4
+
+      - name: Bilibili player E2E
+        timeout-minutes: 20
+        run: node scripts/test-reported-video.mjs
         env:
           VOLUME_EQ_ARTIFACT_ROOT: ${{ runner.temp }}
 
@@ -58,3 +78,5 @@ jobs:
             test-results/
             ${{ runner.temp }}/volume-eq-dynamics-*/
             ${{ runner.temp }}/volume-eq-realtime-*/
+            ${{ runner.temp }}/volume-eq-failures-*/
+            ${{ runner.temp }}/volume-eq-continuity-*/

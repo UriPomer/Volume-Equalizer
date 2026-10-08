@@ -1,11 +1,11 @@
-import { createMediaMeter, ensureAudioContext, ensureMediaSource } from './audio-context';
+import { createMediaMeter, ensureAudioContext, ensureMediaSource, releaseMediaSource } from './audio-context';
 import { getAudioOutput, SharedAudioOutput } from './audio-output';
 import { INITIAL_GAIN, Settings } from './config';
 import { AgcUpdateResult, RealtimeAgc } from './gain-control';
 import { warnFailure } from './logger';
 import { LoudnessMeter } from './loudness-meter';
 import { clamp, rmsToLufs } from './lufs-calculator';
-import { ProcessingStatus, EMPTY_METER_STATE, MeterState } from './types';
+import { EMPTY_METER_STATE, MeterState } from './types';
 
 type MeterMessage = {
   type: 'meter';
@@ -27,7 +27,6 @@ export class MediaVolumeController {
   private readonly output: SharedAudioOutput;
   private readonly releaseOutput: () => void;
   private agc = new RealtimeAgc();
-  private processingStatus: ProcessingStatus = 'realtime';
   private meterEpoch = 0;
   private rafId = 0;
   private gainState: AgcUpdateResult = { nextGain: 1, phase: 'collecting', referenceLufs: NaN, limited: false };
@@ -36,7 +35,6 @@ export class MediaVolumeController {
 
   private readonly onEmptied = () => {
     this.mediaKey = this.currentMediaKey();
-    this.processingStatus = 'realtime';
     this.setGain(INITIAL_GAIN);
     this.invalidateMeasurements();
   };
@@ -50,6 +48,7 @@ export class MediaVolumeController {
   };
 
   private readonly onLoadedMetadata = () => { this.refreshMediaIdentity(); };
+  private readonly onPlaybackIdle = () => { this.onIdle?.(); };
   private readonly onSeeked = () => {
     // Same-media seeks clear discontinuous live windows, retaining the
     // integrated control reference and current gain.
@@ -60,7 +59,8 @@ export class MediaVolumeController {
     media: HTMLMediaElement,
     settings: Settings,
     onMeter: (state: MeterState) => void,
-    onActivate: () => void
+    onActivate: () => void,
+    private readonly onIdle?: () => void
   ) {
     this.media = media;
     this.mediaKey = this.currentMediaKey();
@@ -76,23 +76,13 @@ export class MediaVolumeController {
     this.bass.gain.value = settings.bassBoost;
     this.originalMeter = new LoudnessMeter(this.context.sampleRate, Infinity);
     this.output = getAudioOutput(this.context, rmsToLufs(settings.targetRms));
-    this.releaseOutput = this.output.retain(() => {
-      if (this.destroyed) return;
-      this.processingStatus = 'processor-unavailable';
-      this.connectGraph();
-    });
+    this.releaseOutput = this.output.retain(() => this.restoreOriginal());
     this.output.updateSettings(rmsToLufs(settings.targetRms), settings.enabled);
 
     this.bindEvents();
     this.connectGraph();
     this.loadProcessor();
-    if (!media.paused) {
-      this.onActivate();
-      // 迟到挂载且已在播放：与 onPlay 一样恢复 AudioContext，避免注入后无声。
-      this.context.resume().catch((error) => {
-        warnFailure('media-play-resume', 'AudioContext play resume failed', error);
-      });
-    }
+    if (!media.paused) this.onPlay();
     this.tick = this.tick.bind(this);
     this.rafId = requestAnimationFrame(this.tick);
   }
@@ -127,6 +117,8 @@ export class MediaVolumeController {
     this.media.removeEventListener('play', this.onPlay);
     this.media.removeEventListener('loadedmetadata', this.onLoadedMetadata);
     this.media.removeEventListener('seeked', this.onSeeked);
+    this.media.removeEventListener('pause', this.onPlaybackIdle);
+    this.media.removeEventListener('ended', this.onPlaybackIdle);
     this.disconnectGraph();
     if (this.processor) {
       this.processor.port.onmessage = null;
@@ -134,6 +126,7 @@ export class MediaVolumeController {
       this.processor = null;
     }
     this.releaseOutput();
+    releaseMediaSource(this.media);
   }
 
   private bindEvents(): void {
@@ -141,6 +134,8 @@ export class MediaVolumeController {
     this.media.addEventListener('play', this.onPlay);
     this.media.addEventListener('loadedmetadata', this.onLoadedMetadata);
     this.media.addEventListener('seeked', this.onSeeked);
+    this.media.addEventListener('pause', this.onPlaybackIdle);
+    this.media.addEventListener('ended', this.onPlaybackIdle);
   }
 
   private loadProcessor(): void {
@@ -153,33 +148,33 @@ export class MediaVolumeController {
       };
       node.onprocessorerror = (error) => {
         warnFailure('audio-processor', 'Audio processor failed', error);
-        if (!this.destroyed && this.processor === node) {
-          node.port.onmessage = null;
-          try { node.disconnect(); } catch { /* already disconnected */ }
-          this.processor = null;
-          this.processingStatus = 'processor-unavailable';
-          this.invalidateMeasurements();
-          this.connectGraph();
-        }
+        if (this.processor === node) this.restoreOriginal();
       };
       this.processor = node;
       this.setGain(INITIAL_GAIN);
-      if (this.processingStatus === 'processor-unavailable') {
-        this.processingStatus = 'realtime';
-      }
       this.invalidateMeasurements();
       this.connectGraph();
     }).catch((error) => {
       if (this.destroyed) return;
-      if (this.processingStatus === 'realtime') {
-        this.processingStatus = 'processor-unavailable';
-      }
+      this.restoreOriginal();
       warnFailure(
         'audio-processor-load',
-        'AudioWorklet load failed; protected output remains muted',
+        'AudioWorklet load failed; playing original audio',
         error
       );
     });
+  }
+
+  private restoreOriginal(): void {
+    if (this.destroyed) return;
+    if (this.processor) {
+      this.processor.port.onmessage = null;
+      this.processor.onprocessorerror = null;
+      this.processor.disconnect();
+      this.processor = null;
+    }
+    this.invalidateMeasurements();
+    this.connectGraph();
   }
 
   private connectGraph(): void {
@@ -197,10 +192,10 @@ export class MediaVolumeController {
       this.output.connect(this.processor);
       return;
     }
-    // A failed processor must not release a stale boosted signal.
-    this.setGain(0);
-    this.source.connect(this.gain);
-    this.gain.connect(this.context.destination);
+    // While loading or after failure, bypass both gain and bass. Never retain
+    // an unprotected boost or replace the original media with permanent silence.
+    this.setGain(1);
+    this.source.connect(this.context.destination);
   }
 
   private disconnectGraph(): void {
@@ -219,6 +214,8 @@ export class MediaVolumeController {
     if (
       this.destroyed
       || !this.settings.enabled
+      || !this.processor
+      || !this.output.isReady()
       || message.epoch !== this.meterEpoch
       || !message.original.length
     ) return;
@@ -255,7 +252,11 @@ export class MediaVolumeController {
 
   private emitMeter(): void {
     if (!this.settings.enabled) {
-      this.onMeter({ ...EMPTY_METER_STATE, processingStatus: this.processingStatus });
+      this.onMeter({ ...EMPTY_METER_STATE });
+      return;
+    }
+    if (!this.processor || !this.output.isReady()) {
+      this.onMeter({ ...EMPTY_METER_STATE, processingStatus: 'processor-unavailable' });
       return;
     }
     const originalLufs = this.originalMeter.getIntegratedLoudness();
@@ -268,12 +269,12 @@ export class MediaVolumeController {
       originalIntegratedLufs: originalLufs,
       gain: this.gain.gain.value * output.safetyGain,
       sampleCount: Math.floor(this.originalMeter.getIntegrationTime()),
-      processingStatus: this.processor && this.output.isReady() ? this.processingStatus : 'processor-unavailable'
+      processingStatus: 'realtime'
     });
   }
 
   private setGain(value: number): void {
-    const gain = this.settings.enabled && (!this.processor || !this.output.isReady()) ? 0
+    const gain = !this.processor || !this.output.isReady() ? 1
       : clamp(value, this.settings.minGain, this.settings.maxGain);
     const time = this.context.currentTime;
     this.gain.gain.cancelScheduledValues(time);

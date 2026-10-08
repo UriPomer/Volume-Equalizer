@@ -19,7 +19,8 @@
     "url": "https://media.w3.org/2010/05/video/movie_300.mp4",
     "file": "movie-300.mp4",
     "inputGainDb": 6,
-    "includeInEvaluation": false
+    "includeInEvaluation": false,
+    "evaluationReason": "Peak protection limits this programme's output; target reachability is diagnostic. Measurement accuracy and peak protection are mandatory."
   },
   {
     "id": "clear-layout",

@@ -4,7 +4,7 @@ import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-// One isolated browser per E2E run. Never attach to the user's profile.
+// One isolated browser per integration run. Never attach to the user's profile.
 // Startup failures: a slow first launch, a locked port file, a missing executable
 // or an exited process. Use the endpoint advertised by our child process rather
 // than the Windows port-file handoff; startup remains bounded and failures loud.

@@ -62,7 +62,7 @@ const page = `<!doctype html><meta charset="utf-8"><style>body{background:#17202
 <h1>Realtime integrated loudness regression</h1><audio controls></audio>
 <script>
 ${captureBootstrap}
-const stored={fullAudioAnalysis:true,targetRms:Math.pow(10,(-17.5+.691)/20)};
+const stored={fullAudioAnalysis:true};
 window.analysisCalls=[];
 const decode=BaseAudioContext.prototype.decodeAudioData;
 BaseAudioContext.prototype.decodeAudioData=function(...args){window.analysisCalls.push('decode');return Reflect.apply(decode,this,args);};
@@ -199,6 +199,8 @@ try {
   await evaluate(`(()=>{const script=document.createElement('script');script.src='/content.js';document.body.append(script);})()`);
   for (let i = 0; i < 100 && !(await snapshot()); i++) await delay(100);
   assert.equal((await snapshot()).version,'v'+installedVersion,'Panel must show the installed manifest version');
+  report.defaultTargetLufs = await evaluate(`Number(document.getElementById('universal-volume-eq-panel').shadowRoot.querySelector('[data-role="targetLufs"]').value)`);
+  assert.equal(report.defaultTargetLufs, -17.5, 'An unset target must default to -17.5 LUFS');
   await setSlider('targetLufs', -21);
   const startupRate=await evaluate('window.startAudioCapture()');
   const startupTime = (await snapshot()).time;
@@ -372,7 +374,7 @@ try {
   assert.ok(lifecycleReference.truePeak<=1,'Target changes must retain digital clipping protection');
   assert.ok(remainingReference.momentary>-20&&remainingReference.truePeak<=1,'Removing one media must leave the other audible and protected');
   assert.equal(await evaluate('window.captureState.sources.size'),1,'Removing one media must retain the shared output');
-  await evaluate(`document.querySelectorAll('audio').forEach(media=>media.remove())`);
+  await evaluate(`document.querySelectorAll('audio').forEach(media=>{media.pause();media.remove();})`);
   for (let i = 0; i < 50; i++) {
     if (await evaluate(`document.getElementById('universal-volume-eq-panel').style.display==='none'`)) break;
     await delay(100);

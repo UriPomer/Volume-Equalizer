@@ -21,14 +21,15 @@ let settings = { ...DEFAULT_SETTINGS };
 let meterState = { ...EMPTY_METER_STATE };
 let activeMedia: HTMLMediaElement | null = null;
 const controllers = new Map<HTMLMediaElement, MediaVolumeController>();
+const detachedAt = new WeakMap<HTMLMediaElement, number>();
+let cleanupTimer: number | null = null;
 
 installGlobalResumeHandlers();
-loadSettings().then((loaded) => {
-  settings = normalizeSettings(loaded);
-  start();
-  subscribeSettings(applyExternalSettings);
-}).catch((error) => {
+loadSettings().catch((error) => {
   errorFailure('settings-load', '设置加载失败，使用默认设置', error);
+  return { ...DEFAULT_SETTINGS };
+}).then((loaded) => {
+  settings = loaded;
   start();
   subscribeSettings(applyExternalSettings);
 });
@@ -52,12 +53,18 @@ function attachController(media: HTMLMediaElement): void {
       media,
       settings,
       (state) => {
-        if (activeMedia === media || !activeMedia) {
+        if (activeMedia === media || (isPlayingAudibly(media) && !isPlayingAudibly(activeMedia))) {
           activeMedia = media;
           meterState = state;
         }
       },
-      () => { activeMedia = media; }
+      () => { if (isPlayingAudibly(media)) activeMedia = media; },
+      () => {
+        if (!media.isConnected) {
+          detachedAt.set(media, Date.now());
+          cleanupControllers();
+        }
+      }
     );
     attachRetries.delete(media);
     controllers.set(media, controller);
@@ -74,6 +81,10 @@ function attachController(media: HTMLMediaElement): void {
   }
 }
 
+function isPlayingAudibly(media: HTMLMediaElement | null): boolean {
+  return !!media && !media.paused && !media.ended && !media.muted && media.volume > 0;
+}
+
 function scheduleAttachRetry(media: HTMLMediaElement): void {
   const attempts = attachRetries.get(media) ?? 0;
   if (attempts >= MAX_ATTACH_RETRIES) return;
@@ -86,12 +97,27 @@ function scheduleAttachRetry(media: HTMLMediaElement): void {
 }
 
 function cleanupControllers(): void {
+  if (cleanupTimer !== null) window.clearTimeout(cleanupTimer);
+  cleanupTimer = null;
+  let nextCleanup = Infinity;
   for (const [media, controller] of controllers) {
-    if (media.isConnected) continue;
+    if (media.isConnected) { detachedAt.delete(media); continue; }
+    const removedAt = detachedAt.get(media) ?? Date.now();
+    detachedAt.set(media, removedAt);
+    // Moving a video can pause it before the player resumes it. Keep the same
+    // controller/history through that transition and while detached playback
+    // remains active. Idle events release stopped media after a bounded grace.
+    if (!media.paused && !media.ended) continue;
+    const remaining = 1000 - (Date.now() - removedAt);
+    if (remaining > 0) { nextCleanup = Math.min(nextCleanup, remaining); continue; }
     controller.destroy();
     controllers.delete(media);
-    if (activeMedia === media) activeMedia = null;
+    if (activeMedia === media) {
+      activeMedia = null;
+      meterState = { ...EMPTY_METER_STATE };
+    }
   }
+  if (Number.isFinite(nextCleanup)) cleanupTimer = window.setTimeout(cleanupControllers, nextCleanup);
   updatePanelVisibility(controllers.size);
 }
 

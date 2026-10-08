@@ -5,13 +5,18 @@ import { buildSync } from 'esbuild';
 
 export const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 
-export function writeFloatWav(path, pcm, rate, channels) {
+export function floatWavHeader(byteLength, rate, channels) {
   const header = Buffer.alloc(44);
-  header.write('RIFF'); header.writeUInt32LE(36 + pcm.byteLength, 4); header.write('WAVEfmt ', 8);
+  header.write('RIFF'); header.writeUInt32LE(36 + byteLength, 4); header.write('WAVEfmt ', 8);
   header.writeUInt32LE(16, 16); header.writeUInt16LE(3, 20); header.writeUInt16LE(channels, 22);
   header.writeUInt32LE(rate, 24); header.writeUInt32LE(rate * channels * 4, 28);
   header.writeUInt16LE(channels * 4, 32); header.writeUInt16LE(32, 34);
-  header.write('data', 36); header.writeUInt32LE(pcm.byteLength, 40);
+  header.write('data', 36); header.writeUInt32LE(byteLength, 40);
+  return header;
+}
+
+export function writeFloatWav(path, pcm, rate, channels) {
+  const header = floatWavHeader(pcm.byteLength, rate, channels);
   writeFileSync(path, Buffer.concat([header, Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength)]));
 }
 

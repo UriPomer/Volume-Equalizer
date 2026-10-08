@@ -45,6 +45,7 @@ class FakeContext {
     this.destination = new FakeNode();
     this.destination.channelCount = 2;
     this.source = new FakeNode();
+    this.source.context = this;
     this.audioWorklet = { addModule: async () => {} };
   }
   createMediaElementSource() { return this.source; }

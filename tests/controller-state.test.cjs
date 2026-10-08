@@ -1,23 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { FakeMedia, MediaVolumeController, INITIAL_GAIN, settings, setVisibility } = require('./controller-harness.cjs');
-
-test('background ticks do not run realtime gain control', async (t) => {
-  const media = new FakeMedia();
-  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
-  t.after(() => {
-    setVisibility('visible');
-    controller.destroy();
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  controller.gain.gain.value = 0.6;
-  controller.updateGain = () => controller.setGain(1.5);
-  setVisibility('hidden');
-  controller.tick();
-
-  assert.equal(controller.gain.gain.value, 0.6);
-});
+// State-only tests with fake WebAudio. Browser audio is verified separately.
 
 test('source changes without emptied reset gain and histories on play or meter', async () => {
   const media = new FakeMedia();
@@ -116,42 +100,6 @@ test('a new video resets programme gain even when the page is hidden', async (t)
   assert.equal(controller.gain.gain.value, INITIAL_GAIN);
 });
 
-test('visibility changes preserve measurements, epoch and programme gain', async (t) => {
-  const media = new FakeMedia();
-  const controller = new MediaVolumeController(media, settings, () => {}, () => {});
-  t.after(() => {
-    setVisibility('visible');
-    controller.destroy();
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  const processor = (global.lastMeter ?? global.lastWorklet).processor;
-  for (let start = 0; start < 48000; start += 128) {
-    const tone = Float32Array.from({ length: 128 }, (_, i) =>
-      .8 * Math.sin(2 * Math.PI * 1000 * (start + i) / 48000));
-    processor.process([[tone, tone]], [[new Float32Array(128), new Float32Array(128)]]);
-  }
-  const epoch = controller.meterEpoch;
-  const measuredSeconds = controller.originalMeter.getIntegrationTime();
-  const gain = controller.gain.gain.value;
-  setVisibility('hidden');
-  setVisibility('visible');
-  assert.equal(controller.meterEpoch, epoch);
-  assert.equal(controller.originalMeter.getIntegrationTime(), measuredSeconds);
-  assert.equal(controller.gain.gain.value, gain);
-});
-
-test('processor failure mutes protected output rather than retaining a boost', async () => {
-  const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-  controller.gain.gain.value = 1.8;
-  global.lastWorklet.onprocessorerror({ message: 'test failure' });
-  assert.equal(controller.gain.gain.value, 0);
-  controller.updateSettings({ ...settings, maxGain: 3 });
-  assert.equal(controller.gain.gain.value, 0);
-  controller.destroy();
-});
-
 test('target changes reopen programme calibration without replacing the processor', async () => {
   const controller = new MediaVolumeController(new FakeMedia(), settings, () => {}, () => {});
   await new Promise((resolve) => setImmediate(resolve));
@@ -247,6 +195,7 @@ test('destroyed controller detaches processor handlers and never reconnects', as
   await new Promise((resolve) => setImmediate(resolve));
 
   const worklet = global.lastWorklet;
+  media.paused = true;
   controller.destroy();
 
   assert.equal(worklet.port.onmessage, null);

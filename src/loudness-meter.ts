@@ -174,12 +174,6 @@ export class LoudnessMeter {
   }
 }
 
-export function calculateGainForLoudness(currentLufs: number, targetLufs: number): number {
-  return Number.isFinite(currentLufs) && Number.isFinite(targetLufs)
-    ? Math.pow(10, (targetLufs - currentLufs) / 20)
-    : 1;
-}
-
 function average(values: number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }

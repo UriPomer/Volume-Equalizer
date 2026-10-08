@@ -8,6 +8,7 @@ const AudioContextClass = window.AudioContext || (window as any).webkitAudioCont
 
 let audioCtx: AudioContext | null = null;
 const mediaSources = new WeakMap<HTMLMediaElement, MediaElementAudioSourceNode>();
+const releasedSources = new WeakMap<HTMLMediaElement, () => void>();
 const workletModules = new WeakMap<BaseAudioContext, Promise<void>>();
 
 export function loadAudioWorklets(context: BaseAudioContext): Promise<void> {
@@ -33,12 +34,44 @@ export function ensureAudioContext(): AudioContext {
 }
 
 export function ensureMediaSource(media: HTMLMediaElement): MediaElementAudioSourceNode {
+  // Reacquiring an element transfers audio ownership back to its controller.
+  releasedSources.get(media)?.();
   let source = mediaSources.get(media);
   if (!source) {
     source = ensureAudioContext().createMediaElementSource(media);
     mediaSources.set(media, source);
   }
   return source;
+}
+
+/** createMediaElementSource permanently redirects native playback. Releasing
+ * a controller must restore original playback, including a later detached play.
+ * Pause/ended disconnect that fallback; reacquisition removes its listeners. */
+export function releaseMediaSource(media: HTMLMediaElement): void {
+  const source = mediaSources.get(media);
+  if (!source) return;
+  releasedSources.get(media)?.();
+  const stop = () => {
+    try { source.disconnect(source.context.destination); } catch { /* not connected */ }
+  };
+  const play = () => {
+    source.connect(source.context.destination);
+    (source.context as AudioContext).resume().catch(error => {
+      warnFailure('released-media-resume', 'Original audio resume failed', error);
+    });
+  };
+  const cleanup = () => {
+    media.removeEventListener('play', play);
+    media.removeEventListener('pause', stop);
+    media.removeEventListener('ended', stop);
+    stop();
+    releasedSources.delete(media);
+  };
+  releasedSources.set(media, cleanup);
+  media.addEventListener('play', play);
+  media.addEventListener('pause', stop);
+  media.addEventListener('ended', stop);
+  if (!media.paused && !media.ended) play();
 }
 
 /** Match the destination before measuring/limiting, so a later up/downmix

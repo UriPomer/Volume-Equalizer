@@ -51,18 +51,19 @@ for(const fixture of selectedFixtures) {
   const outputReference=measureWithFfmpeg(outputFile);
   delete result.outputPcm;
   const included=fixture.includeInEvaluation!==false;
-  const report={id:fixture.id,included,mode:'realtime',...result,
+  const report={id:fixture.id,included,evaluationReason:fixture.evaluationReason,mode:'realtime',...result,
     sourceSha256:createHash('sha256').update(readFileSync(file)).digest('hex'),
     outputFile,ffmpegOutput:outputReference,
     ffmpegInputIntegratedLufs:ffmpeg.integratedLufs,
     inputMeasurementDiffLu:result.inputIntegratedLufs-ffmpeg.integratedLufs};
   report.measurementPass=Math.abs(report.inputMeasurementDiffLu)<=.5
     &&Math.abs(result.outputIntegratedLufs-outputReference.integratedLufs)<=.5;
+  report.peakProtectionPass=outputReference.truePeakDbtp<=DEFAULT_REFERENCE_SETTINGS.truePeakDbtp+.1;
   report.targetReached=Math.abs(outputReference.integratedLufs+21)<=2;
   report.loudnessPass=report.targetReached;
   report.stabilityPass=report.maximumStableGainStep<=.020001
     &&report.limitedFractionAfterStable<=.01;
-  report.pass=report.measurementPass&&report.loudnessPass&&report.stabilityPass;
+  report.pass=report.measurementPass&&report.peakProtectionPass&&report.loudnessPass&&report.stabilityPass;
   reports.push(report);
   console.log(JSON.stringify({...report,trace:undefined}));
   if(traceEnabled)writeFileSync(join(resultsDir,fixture.id+'-gain-trace.jsonl'),
@@ -73,7 +74,10 @@ const summary={targetLufs:DEFAULT_REFERENCE_SETTINGS.targetLufs,allFixtures:fixt
 const evaluated=summary.reports.filter(r=>r.included);
 summary.crossVideoIntegratedSpreadLu=Math.max(...evaluated.map(r=>r.outputIntegratedLufs))
   -Math.min(...evaluated.map(r=>r.outputIntegratedLufs));
-summary.pass=evaluated.every(r=>r.pass)&&summary.crossVideoIntegratedSpreadLu<=3;
+// Even a peak-limited diagnostic must produce accurately measured, safe PCM.
+// Only target reachability and stable programme gain depend on evaluation type.
+summary.pass=summary.reports.every(r=>r.measurementPass&&r.peakProtectionPass)
+  &&evaluated.every(r=>r.pass)&&summary.crossVideoIntegratedSpreadLu<=3;
 writeFileSync(join(resultsDir,'audio-benchmark.json'),JSON.stringify(summary,null,2)+'\n');
 writeFileSync(join(resultsDir,'audio-benchmark.md'),renderReport(summary));
 console.log('cross-video integrated spread:',summary.crossVideoIntegratedSpreadLu.toFixed(3),'LU; pass:',summary.pass);
