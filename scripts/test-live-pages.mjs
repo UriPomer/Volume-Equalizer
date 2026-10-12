@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { chromium } from 'playwright';
 import { writeFloatWav } from './audio-test-artifacts.mjs';
 
@@ -16,8 +17,15 @@ const artifacts = mkdtempSync(join(process.env.VOLUME_EQ_ARTIFACT_ROOT || tmpdir
 const content = readFileSync('dist/content.js');
 const worklet = readFileSync('dist/limiter-worklet.js');
 let servedHtml = '';
-const server = createServer((req, res) => {
+let firstNavigation = true;
+const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
+  // A cold CI navigation must tolerate a slow document without extending
+  // the deadlines of the live-page behavior assertions.
+  if (firstNavigation && req.headers['sec-fetch-dest'] === 'document') {
+    firstNavigation = false;
+    await delay(4000);
+  }
   res.setHeader('Content-Type', path.endsWith('.js') ? 'text/javascript' : path.endsWith('.wav') ? 'audio/wav' : 'text/html');
   res.end(path === '/content.js' ? content : path === '/limiter-worklet.js' ? worklet : path === '/input.wav' ? readFileSync(fixture) : servedHtml);
 });
@@ -58,7 +66,7 @@ async function open(url, live = false, stored = {}) {
   page.on('pageerror', error => (report.consoleEntries ??= []).push({ url, message: String(error) }));
   servedHtml = html(live, stored, url);
   const local = new URL(url); local.protocol = 'http:'; local.port = String(port);
-  await page.goto(local.href);
+  await page.goto(local.href, { waitUntil: 'domcontentloaded' });
   await page.locator('#universal-volume-eq-panel').waitFor({ state: 'visible' });
   await page.locator('video').evaluate(media => media.play());
   return page;
@@ -91,6 +99,7 @@ try {
   report.browser = browser.version();
   context = await browser.newContext();
   context.setDefaultTimeout(3500);
+  context.setDefaultNavigationTimeout(15000);
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const cases = [
     ['twitch-channel', 'https://www.twitch.tv/example', false, false],
@@ -198,12 +207,17 @@ try {
       assert.equal(await page.evaluate(() => stored.enabled), true, 'Normal-video toggle still saves global preference');
     } finally { await page.close(); }
   });
+  assert.ok(report.cases.length > 0, 'The selected live-page case does not exist');
   report.pass = report.cases.every(row => row.pass);
   if (!report.pass) process.exitCode = 1;
 } catch (error) { report.error = String(error.stack || error); process.exitCode = 1; }
 finally {
-  try { await context?.tracing.stop({ path: join(artifacts, 'trace.zip') }); await browser?.close(); }
+  try { await context?.tracing.stop({ path: join(artifacts, 'trace.zip') }); }
   catch (error) { report.cleanupError = String(error); report.pass = false; process.exitCode = 1; }
+  finally {
+    try { await browser?.close(); }
+    catch (error) { report.browserCleanupError = String(error); report.pass = false; process.exitCode = 1; }
+  }
   server.close();
   writeFileSync(join(artifacts, 'report.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify({ pass: report.pass, cases: report.cases.map(({ name, pass, error }) => ({ name, pass, error })), artifacts }));

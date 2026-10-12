@@ -21,6 +21,9 @@ const artifacts = mkdtempSync(join(process.env.VOLUME_EQ_ARTIFACT_ROOT || tmpdir
 const content = readFileSync(resolve('dist/content.js'));
 const worklet = readFileSync(resolve('dist/limiter-worklet.js'));
 const installedVersion = JSON.parse(readFileSync(resolve('dist/manifest.json'),'utf8')).version;
+const sourceSwitches = process.argv.includes('--source-switches');
+const injectPause = process.argv.includes('--inject-pause');
+assert.ok(!injectPause || sourceSwitches, 'Pause injection requires source-switch verification');
 const rate = 48000;
 const fixture = join(artifacts, 'mixed.wav');
 function writeTone(file, seconds, amplitude, frequency = 1000) {
@@ -52,12 +55,15 @@ writeTone(join(artifacts, 'second.wav'), 20, () => .65, 1301);
 writeTone(join(artifacts, 'startup.wav'), 15, () => .135);
 const reference = measureWithFfmpeg(fixture);
 const commit = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
-const report = { command: 'npm run test:realtime', commit, generatedAt: new Date().toISOString(),
+const report = { command: 'node scripts/test-realtime-browser.mjs' + (sourceSwitches ? ' --source-switches' : '') + (injectPause ? ' --inject-pause' : ''), commit, generatedAt: new Date().toISOString(),
+  mode: sourceSwitches ? 'source-switches' : 'complete-playback', injectPause,
+  testSourceSha256: createHash('sha256').update(readFileSync(new URL(import.meta.url))).digest('hex'),
   contentSha256: createHash('sha256').update(content).digest('hex'),
   workletSha256: createHash('sha256').update(worklet).digest('hex'),
   input: { file: fixture, sha256: createHash('sha256').update(readFileSync(fixture)).digest('hex'),
     reference, targetLufs: -17.5, expectedGain: Math.pow(10, (-17.5 - reference.integratedLufs) / 20) },
-  requests: [], checkpoints: [], trace: [], inputLoads: [], audioGraphEvents: [], consoleEntries: [], pass: false };
+  requests: [], checkpoints: [], trace: [], inputLoads: [], audioGraphEvents: [],
+  nativeMediaEvents: [], consoleEntries: [], pass: false };
 const page = `<!doctype html><meta charset="utf-8"><style>body{background:#17202b;color:white;font:18px system-ui}</style>
 <h1>Realtime integrated loudness regression</h1><audio controls></audio>
 <script>
@@ -67,6 +73,27 @@ window.analysisCalls=[];
 const decode=BaseAudioContext.prototype.decodeAudioData;
 BaseAudioContext.prototype.decodeAudioData=function(...args){window.analysisCalls.push('decode');return Reflect.apply(decode,this,args);};
 window.mediaEvents=[];
+window.mediaCommands=[];
+const playbackState=media=>({wallTime:performance.now(),fixture:window.activeFixture,
+  requestedSource:media.src,currentSource:media.currentSrc,currentTime:media.currentTime,
+  paused:media.paused,ended:media.ended,readyState:media.readyState,networkState:media.networkState,
+  mediaError:media.error?.message,contextState:window.captureState?.context.state});
+for(const method of ['play','pause','load']){
+  const native=HTMLMediaElement.prototype[method];
+  HTMLMediaElement.prototype[method]=function(...args){
+    window.mediaCommands.push({method,...playbackState(this),stack:new Error().stack});
+    const result=Reflect.apply(native,this,args);
+    if(method==='play')result.then(
+      ()=>{window.mediaCommands.push({method:'play-resolved',...playbackState(this)});
+        if(${injectPause}&&window.activeFixture==='periodic.wav'&&!window.pauseInjected){
+          window.pauseInjected=true;const media=this;
+          setTimeout(function injectSourceSwitchPause(){media.pause();},2);
+        }
+      },
+      error=>window.mediaCommands.push({method:'play-rejected',...playbackState(this),error:String(error)}));
+    return result;
+  };
+}
 window.programmeGains=[];
 const createGain=BaseAudioContext.prototype.createGain;
 BaseAudioContext.prototype.createGain=function(...args){
@@ -79,7 +106,7 @@ BaseAudioContext.prototype.createGain=function(...args){
   };
   return node;
 };
-for(const type of ['pause','play','waiting','stalled','error','ended','seeking','seeked'])document.querySelector('audio').addEventListener(type,event=>window.mediaEvents.push({type,time:event.target.currentTime}));
+for(const type of ['pause','play','playing','emptied','loadstart','loadedmetadata','canplay','waiting','stalled','error','ended','seeking','seeked'])document.querySelector('audio').addEventListener(type,event=>window.mediaEvents.push({type,time:event.target.currentTime,...playbackState(event.target)}));
 window.chrome={runtime:{getURL:path=>'/'+path,getManifest:()=>({version:'${installedVersion}'})},storage:{local:{
   get:(defaults,callback)=>callback({...defaults,...stored}),
   set:(settings,callback)=>{Object.assign(stored,settings);callback();}
@@ -124,10 +151,21 @@ async function playFixture(name) {
     const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),v=>v.toString(16).padStart(2,'0')).join('');
     const media=document.querySelector('audio'),previous=media.src;
     window.activeFixture='${name}';
-    media.pause();media.src=URL.createObjectURL(new Blob([bytes],{type:'audio/wav'}));
+    media.pause();
+    const source=URL.createObjectURL(new Blob([bytes],{type:'audio/wav'}));
+    const ready=new Promise((resolve,reject)=>{
+      const cleanup=()=>{clearTimeout(timer);media.removeEventListener('canplay',onReady);media.removeEventListener('error',onError);};
+      const onReady=()=>{if(media.currentSrc!==source||media.readyState<3)return;cleanup();resolve();};
+      const onError=()=>{cleanup();reject(new Error('Fixture media failed: '+media.error?.message));};
+      const timer=setTimeout(()=>{cleanup();reject(new Error('Fixture source readiness timeout: ${name}'));},5000);
+      media.addEventListener('canplay',onReady);media.addEventListener('error',onError);
+      media.src=source;media.load();
+    });
+    await ready;
     if(previous.startsWith('blob:'))URL.revokeObjectURL(previous);
     await media.play();
-    return {file:'${name}',bytes:bytes.byteLength,sha256:hash};
+    if(media.currentSrc!==source||media.paused)throw new Error('Fixture did not start the requested source: ${name}');
+    return {file:'${name}',bytes:bytes.byteLength,sha256:hash,source,readyState:media.readyState};
   })()`);
   report.inputLoads.push(loaded);
   assert.equal(loaded.sha256, createHash('sha256').update(readFileSync(join(artifacts, name))).digest('hex'), 'Browser must receive the complete fixture');
@@ -142,6 +180,9 @@ async function snapshot() {
     return {time:document.querySelector('audio').currentTime,input:parseFloat(text('originalIntegrated')),
       output:parseFloat(text('outputIntegrated')),outputMomentary:parseFloat(text('output')),momentary:parseFloat(text('original')),
       paused:document.querySelector('audio').paused,readyState:document.querySelector('audio').readyState,
+      ended:document.querySelector('audio').ended,currentSource:document.querySelector('audio').currentSrc,
+      requestedSource:document.querySelector('audio').src,networkState:document.querySelector('audio').networkState,
+      contextState:window.captureState?.context.state,
       mediaError:document.querySelector('audio').error?.message,
       gain:parseFloat(text('gain')),programmeGain:window.programmeGainParam?.value,
       version:root.querySelector('[data-role="version"]')?.textContent,
@@ -188,12 +229,17 @@ try {
     browser.on(method, params => report.audioGraphEvents.push({ method, params }));
   }
   browser.on('Log.entryAdded', params => report.consoleEntries.push(params.entry));
+  for(const event of ['playerEventsAdded','playerErrorsRaised','playerMessagesLogged','playerPropertiesChanged']) {
+    browser.on('Media.'+event, params => report.nativeMediaEvents.push({event,params}));
+  }
   ({ send, evaluate } = browser);
   report.browser = await send('Browser.getVersion');
   await send('WebAudio.enable');
   await send('Log.enable');
+  await send('Media.enable');
   await send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 900, deviceScaleFactor: 1, mobile: false });
   await send('Page.navigate', { url: 'http://127.0.0.1:' + server.address().port });
+  await evaluate('document.readyState!=="loading"||new Promise(resolve=>document.addEventListener("DOMContentLoaded",resolve,{once:true}))');
   // A playing video must remain audible when the extension attaches. Earlier
   // fixtures waited until all gain parameters settled before starting playback.
   await playFixture('startup.wav');
@@ -202,6 +248,18 @@ try {
   assert.equal((await snapshot()).version,'v'+installedVersion,'Panel must show the installed manifest version');
   report.defaultTargetLufs = await evaluate(`Number(document.getElementById('universal-volume-eq-panel').shadowRoot.querySelector('[data-role="targetLufs"]').value)`);
   assert.equal(report.defaultTargetLufs, -17.5, 'An unset target must default to -17.5 LUFS');
+  if(sourceSwitches){
+    report.sourceSwitches=[];
+    for(let index=0;index<30;index++){
+      await playFixture(index%2?'periodic.wav':'stability.wav');
+      const state=await observe(.15),loaded=report.inputLoads.at(-1);
+      assert.equal(state.currentSource,loaded.source,'Measurements must belong to the new source');
+      assert.ok(state.readyState>=3&&!state.ended,'The requested source must remain ready and playing');
+      report.sourceSwitches.push({index,file:loaded.file,source:loaded.source,...state});
+    }
+    assert.deepEqual(await evaluate('window.analysisCalls'),[],'Source changes must not decode the full track');
+    report.pass=true;
+  }else{
   await setSlider('targetLufs', -21);
   const startupRate=await evaluate('window.startAudioCapture()');
   const startupTime = (await snapshot()).time;
@@ -397,11 +455,13 @@ try {
     assert.equal(report.requests.filter(url=>url==='/'+name).length,report.inputLoads.filter(row=>row.file===name).length,'Only the test player may load audio; the extension cannot fetch a complete track');
   }
   report.pass = true;
+  }
 } catch (error) {
   report.error = String(error.stack || error);
   process.exitCode = 1;
 } finally {
   if(browser)report.mediaEvents=await evaluate('window.mediaEvents').catch(()=>null);
+  if(browser)report.mediaCommands=await evaluate('window.mediaCommands').catch(()=>null);
   try { await browser?.close(); }
   catch (error) { report.pass = false; report.cleanupError = String(error); process.exitCode = 1; }
   finally { server.close(); }
