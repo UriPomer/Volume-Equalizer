@@ -134,6 +134,10 @@ jobs:
         timeout-minutes: 7
         run: node scripts/test-realtime-browser.mjs
 
+      - name: Live page defaults and manual opt-in E2E
+        timeout-minutes: 3
+        run: node scripts/test-live-pages.mjs
+
       - name: Native processor failure integration
         timeout-minutes: 3
         run: node scripts/test-browser-failures.mjs

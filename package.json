@@ -1,6 +1,6 @@
 {
   "name": "bili-volume-equalizer",
-  "version": "0.9.8",
+  "version": "0.9.9",
   "description": "浏览器视频音量均衡器，默认目标 -17.5 LUFS",
   "scripts": {
     "build": "vite build",
@@ -8,6 +8,7 @@
     "pack": "vite build && node pack.js",
     "test:unit": "node scripts/run-unit-tests.mjs",
     "test:browser": "npm run build && node scripts/test-browser-audio.mjs",
+    "test:live-pages": "npm run build && node scripts/test-live-pages.mjs",
     "test:realtime": "npm run build && node scripts/test-realtime-browser.mjs",
     "test:failures": "npm run build && node scripts/test-browser-failures.mjs",
     "test:continuity": "npm run build && node scripts/test-reported-video.mjs",

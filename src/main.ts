@@ -1,8 +1,9 @@
 import { installGlobalResumeHandlers, isAudioContextSupported } from './audio-context';
-import { DEFAULT_SETTINGS, Settings } from './config';
+import { DEFAULT_SETTINGS, Settings, TARGET_SELECTOR } from './config';
 import { MediaVolumeController } from './controller';
 import { errorFailure, warnFailure } from './logger';
 import { observeMutations, scanForMedia } from './media-scanner';
+import { isLivePage, observePagePolicy, pageIdentity } from './page-policy';
 import {
   loadSettings,
   normalizeSettings,
@@ -18,6 +19,10 @@ if (!isAudioContextSupported()) {
 }
 
 let settings = { ...DEFAULT_SETTINGS };
+let savedSettings = { ...DEFAULT_SETTINGS };
+let currentPage = '';
+let livePage = false;
+let liveEnabled: boolean | null = null;
 let meterState = { ...EMPTY_METER_STATE };
 let activeMedia: HTMLMediaElement | null = null;
 const controllers = new Map<HTMLMediaElement, MediaVolumeController>();
@@ -29,18 +34,20 @@ loadSettings().catch((error) => {
   errorFailure('settings-load', '设置加载失败，使用默认设置', error);
   return { ...DEFAULT_SETTINGS };
 }).then((loaded) => {
-  settings = loaded;
+  savedSettings = loaded;
   start();
   subscribeSettings(applyExternalSettings);
 });
 
 function start(): void {
   const scan = () => {
+    syncPagePolicy();
     scanForMedia(attachController);
     cleanupControllers();
   };
   scan();
   observeMutations(scan);
+  observePagePolicy(scan);
 }
 
 const MAX_ATTACH_RETRIES = 3;
@@ -48,6 +55,11 @@ const attachRetries = new WeakMap<HTMLMediaElement, number>();
 
 function attachController(media: HTMLMediaElement): void {
   if (controllers.has(media)) return;
+  if (!settings.enabled) {
+    ensurePanel(settings, updateSettings, () => meterState);
+    updatePanelVisibility(1);
+    return;
+  }
   try {
     const controller = new MediaVolumeController(
       media,
@@ -118,12 +130,17 @@ function cleanupControllers(): void {
     }
   }
   if (Number.isFinite(nextCleanup)) cleanupTimer = window.setTimeout(cleanupControllers, nextCleanup);
-  updatePanelVisibility(controllers.size);
+  updatePanelVisibility(controllers.size || (document.querySelector(TARGET_SELECTOR) ? 1 : 0));
 }
 
 function updateSettings(next: Settings): Settings {
-  applySettings(normalizeSettings(next));
-  persistSettings(settings).catch((error) => {
+  const enabledChanged = next.enabled !== settings.enabled;
+  syncPagePolicy();
+  const normalized = normalizeSettings(next);
+  if (livePage && enabledChanged) liveEnabled = normalized.enabled;
+  savedSettings = { ...normalized, enabled: livePage || !enabledChanged ? savedSettings.enabled : normalized.enabled };
+  applySettings(effectiveSettings());
+  persistSettings(savedSettings).catch((error) => {
     errorFailure('settings-save', '设置保存失败', error);
   });
   return settings;
@@ -131,8 +148,24 @@ function updateSettings(next: Settings): Settings {
 
 function applyExternalSettings(next: Settings): void {
   const normalized = normalizeSettings(next);
-  if (sameSettings(settings, normalized)) return;
-  applySettings(normalized);
+  if (sameSettings(savedSettings, normalized)) return;
+  savedSettings = normalized;
+  syncPagePolicy();
+  applySettings(effectiveSettings());
+}
+
+function effectiveSettings(): Settings {
+  return { ...savedSettings, enabled: livePage ? liveEnabled ?? false : savedSettings.enabled };
+}
+
+function syncPagePolicy(): void {
+  const identity = pageIdentity();
+  const live = isLivePage();
+  if (identity === currentPage && live === livePage) return;
+  currentPage = identity;
+  livePage = live;
+  liveEnabled = null;
+  applySettings(effectiveSettings());
 }
 
 function applySettings(next: Settings): void {
@@ -140,6 +173,7 @@ function applySettings(next: Settings): void {
   controllers.forEach((controller) => controller.updateSettings(settings));
   if (!settings.enabled) meterState = { ...EMPTY_METER_STATE };
   refreshPanel(settings);
+  if (settings.enabled) scanForMedia(attachController);
 }
 
 function sameSettings(left: Settings, right: Settings): boolean {
