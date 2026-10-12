@@ -236,6 +236,7 @@ try {
   ({ send, evaluate } = browser);
   if(sourceSwitches)stopNativeTrace=await startNativeTrace(browser,artifacts);
   report.browser = await send('Browser.getVersion');
+  report.systemMediaSession = false;
   await send('WebAudio.enable');
   await send('Log.enable');
   await send('Media.enable');

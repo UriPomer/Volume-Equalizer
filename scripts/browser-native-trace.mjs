@@ -27,8 +27,14 @@ export async function startNativeTrace(browser, artifacts) {
         }
       } finally { await browser.send('IO.close', { handle: stream }); }
       const path = join(artifacts, 'native-trace.json');
-      writeFileSync(path, Buffer.concat(chunks));
-      return path;
+      const bytes = Buffer.concat(chunks);
+      writeFileSync(path, bytes);
+      // Chromium's IPCStableHash is SHA256 of the qualified method name:
+      // media::mojom::MediaPlayer::RequestPause -> 2393964309.
+      const browserPauseRequests = JSON.parse(bytes).traceEvents.filter(event =>
+        event.args?.chrome_mojo_event_info?.mojo_interface_tag === 'media.mojom.MediaPlayer'
+        && event.args.chrome_mojo_event_info.ipc_hash === 2393964309);
+      return { path, browserPauseRequests };
     } finally { clearTimeout(timer); }
   };
 }

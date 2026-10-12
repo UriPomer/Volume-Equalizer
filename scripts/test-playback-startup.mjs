@@ -43,6 +43,8 @@ async function run(name, injectPause) {
     assert.equal(exitCode, 0, evidence.error || stderr);
     assert.equal(evidence.pass, true);
     assert.equal(evidence.sourceSwitches.length, 30);
+    assert.ok(evidence.nativeTrace, 'Retain native IPC evidence for every source-switch attempt');
+    assert.deepEqual(evidence.nativeTrace.browserPauseRequests, [], 'The controlled DSP browser must receive no system pause requests');
     assert.ok(evidence.sourceSwitches.every(state => !state.paused && state.currentSource === state.requestedSource && state.time >= .15));
     row.switches = evidence.sourceSwitches.length;
   }

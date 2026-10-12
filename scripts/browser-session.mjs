@@ -33,7 +33,12 @@ export async function openBrowser(artifacts) {
   try {
     browser = await chromium.launch({ channel: 'chromium', chromiumSandbox: true,
       executablePath: process.env.CHROME_PATH, headless: true, timeout: 30000,
-      args: ['--autoplay-policy=no-user-gesture-required', '--disable-background-timer-throttling'] });
+      // The synthetic player rapidly replaces sources in a single tab. Native
+      // MediaSessionService can reject an overlapping focus request and issue
+      // RequestPause. OS focus arbitration is outside this DSP fixture; keep
+      // decoding, playback and the WebAudio graph native, including pause errors.
+      args: ['--autoplay-policy=no-user-gesture-required', '--disable-background-timer-throttling',
+        '--disable-features=MediaSessionService'] });
     context = await browser.newContext();
     await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
     const page = await context.newPage();
