@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { openBrowser } from './browser-session.mjs';
+import { startNativeTrace } from './browser-native-trace.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { measureWithFfmpeg } from './offline-loudness-reference.mjs';
 import { captureBootstrap, captureProcessor } from './browser-audio-capture.mjs';
@@ -140,7 +141,7 @@ const server = createServer(async (req, res) => {
   } else { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(page); }
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-let browser, send, evaluate;
+let browser, send, evaluate, stopNativeTrace;
 async function playFixture(name) {
   // Exercise native media playback with verified bytes, without a custom HTTP
   // range server adding an unrelated streaming failure to the audio test.
@@ -233,6 +234,7 @@ try {
     browser.on('Media.'+event, params => report.nativeMediaEvents.push({event,params}));
   }
   ({ send, evaluate } = browser);
+  if(sourceSwitches)stopNativeTrace=await startNativeTrace(browser,artifacts);
   report.browser = await send('Browser.getVersion');
   await send('WebAudio.enable');
   await send('Log.enable');
@@ -460,8 +462,11 @@ try {
   report.error = String(error.stack || error);
   process.exitCode = 1;
 } finally {
+  // CDP Media batches events; preserve the final failing player before closing.
+  if(browser&&!report.pass)await delay(1200);
   if(browser)report.mediaEvents=await evaluate('window.mediaEvents').catch(()=>null);
   if(browser)report.mediaCommands=await evaluate('window.mediaCommands').catch(()=>null);
+  if(stopNativeTrace)report.nativeTrace=await stopNativeTrace().catch(error=>{report.traceError=String(error);});
   try { await browser?.close(); }
   catch (error) { report.pass = false; report.cleanupError = String(error); process.exitCode = 1; }
   finally { server.close(); }

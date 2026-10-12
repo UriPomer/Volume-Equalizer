@@ -130,13 +130,13 @@ jobs:
         timeout-minutes: 3
         run: node scripts/test-browser-audio.mjs
 
-      - name: Controlled media and panel integration
-        timeout-minutes: 7
-        run: node scripts/test-realtime-browser.mjs
-
       - name: Native source readiness and pause failure E2E
         timeout-minutes: 3
         run: node scripts/test-playback-startup.mjs
+
+      - name: Controlled media and panel integration
+        timeout-minutes: 7
+        run: node scripts/test-realtime-browser.mjs
 
       - name: Live page defaults and manual opt-in E2E
         timeout-minutes: 3
@@ -172,6 +172,7 @@ jobs:
             ${{ runner.temp }}/volume-eq-*/*.jsonl
             ${{ runner.temp }}/volume-eq-*/*.log
             ${{ runner.temp }}/volume-eq-*/volume-eq-*/report.json
+            ${{ runner.temp }}/volume-eq-*/volume-eq-*/native-trace.json
             ${{ runner.temp }}/volume-eq-*/volume-eq-*/*.zip
 
       - name: Upload verified package
