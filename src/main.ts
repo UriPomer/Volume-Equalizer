@@ -3,7 +3,7 @@ import { DEFAULT_SETTINGS, Settings, TARGET_SELECTOR } from './config';
 import { MediaVolumeController } from './controller';
 import { errorFailure, warnFailure } from './logger';
 import { observeMutations, scanForMedia } from './media-scanner';
-import { isLivePage, observePagePolicy, pageIdentity } from './page-policy';
+import { isLivePage, observePagePolicy, pageIdentity, platformSettingKey } from './page-policy';
 import {
   loadSettings,
   normalizeSettings,
@@ -138,9 +138,21 @@ function updateSettings(next: Settings): Settings {
   syncPagePolicy();
   const normalized = normalizeSettings(next);
   if (livePage && enabledChanged) liveEnabled = normalized.enabled;
-  savedSettings = { ...normalized, enabled: livePage || !enabledChanged ? savedSettings.enabled : normalized.enabled };
+  const platformKey = platformSettingKey();
+  const previous = savedSettings;
+  savedSettings = { ...normalized, enabled: savedSettings.enabled };
+  // The page switch follows this platform; live opt-in stays local to the programme.
+  if (!livePage && enabledChanged) {
+    savedSettings[platformKey] = normalized.enabled;
+    if (normalized.enabled) savedSettings.enabled = true;
+  }
+  const patch = Object.fromEntries(
+    (Object.keys(DEFAULT_SETTINGS) as Array<keyof Settings>)
+      .filter(key => previous[key] !== savedSettings[key])
+      .map(key => [key, savedSettings[key]])
+  );
   applySettings(effectiveSettings());
-  persistSettings(savedSettings).catch((error) => {
+  persistSettings(patch).catch((error) => {
     errorFailure('settings-save', '设置保存失败', error);
   });
   return settings;
@@ -155,7 +167,11 @@ function applyExternalSettings(next: Settings): void {
 }
 
 function effectiveSettings(): Settings {
-  return { ...savedSettings, enabled: livePage ? liveEnabled ?? false : savedSettings.enabled };
+  return {
+    ...savedSettings,
+    enabled: savedSettings[platformSettingKey()]
+      && (livePage ? liveEnabled ?? false : savedSettings.enabled)
+  };
 }
 
 function syncPagePolicy(): void {

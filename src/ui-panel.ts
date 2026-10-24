@@ -1,5 +1,6 @@
 import { PANEL_ID, Settings } from './config';
 import { lufsToRms, rmsToLufs } from './lufs-calculator';
+import { isLivePage, platformSettingKey } from './page-policy';
 import { ProcessingStatus, MeterState } from './types';
 
 type SliderRole = 'targetLufs' | 'maxGain' | 'minGain' | 'bassBoost';
@@ -102,6 +103,8 @@ function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings
   const render = () => {
     const settings = currentSettings as Settings;
     enabled.textContent = settings.enabled ? '已开启' : '已关闭';
+    enabled.disabled = isLivePage() && !settings[platformSettingKey()];
+    enabled.title = enabled.disabled ? '请先在扩展设置中启用此平台' : '';
     enabled.classList.toggle('on', settings.enabled);
     query<HTMLElement>(shadow, '.dock i').classList.toggle('off', !settings.enabled);
     for (const input of sliders) {
@@ -193,6 +196,7 @@ section{width:220px;box-sizing:border-box;padding:12px;border-radius:14px 0 0 0;
 header,.param span,.meter div{display:flex;align-items:center;justify-content:space-between}
 header{font-size:13px}button{border:0;border-radius:99px;padding:3px 9px;background:#ffffff18;color:#ffffff90;cursor:pointer;font-size:10px}button.on{background:#0ea5e9;color:white}
 header small{display:block;font-size:10px;color:#ffffff70;margin-top:2px}
+button:disabled{opacity:.5;cursor:not-allowed}
 hr{border:0;height:1px;background:#ffffff12;margin:9px 0}.param{display:block;color:#ffffff90;font-size:11px}
 .param{margin-top:8px}.param span b{color:#e2e8f0;font-size:12px}input{appearance:none;width:100%;height:3px;background:#ffffff20;border-radius:2px;cursor:pointer}input::-webkit-slider-thumb{appearance:none;width:13px;height:13px;border-radius:50%;background:#38bdf8}
 .meter{font-size:11px}.meter small{display:block;color:#ffffff50;font-weight:600;margin-top:6px}.meter div{padding:2px 0}.meter span{color:#ffffff60}.meter b{color:#cbd5e1;font-weight:500;font-variant-numeric:tabular-nums;text-align:right}

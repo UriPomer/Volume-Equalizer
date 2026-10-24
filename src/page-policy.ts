@@ -89,3 +89,9 @@ export function observePagePolicy(scan: () => void): void {
         || record.target.localName === 'ytd-watch-flexy'))) scan();
   }).observe(document.documentElement, { subtree: true, attributes: true, attributeFilter: ['class', 'is-live', 'style', 'hidden', 'content', 'itemid'] });
 }
+
+export function platformSettingKey(host = location.hostname): 'bilibiliEnabled' | 'youtubeEnabled' | 'otherEnabled' {
+  host = host.toLowerCase();
+  if (host === 'bilibili.com' || host.endsWith('.bilibili.com')) return 'bilibiliEnabled';
+  return isYoutube(host) ? 'youtubeEnabled' : 'otherEnabled';
+}

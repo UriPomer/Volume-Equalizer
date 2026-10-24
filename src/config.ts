@@ -11,6 +11,9 @@ export const INITIAL_GAIN = 0.8;
 
 export interface Settings {
   enabled: boolean;
+  bilibiliEnabled: boolean;
+  youtubeEnabled: boolean;
+  otherEnabled: boolean;
   targetRms: number;
   minGain: number;
   maxGain: number;
@@ -20,6 +23,9 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = {
   enabled: true,
+  bilibiliEnabled: true,
+  youtubeEnabled: true,
+  otherEnabled: true,
   targetRms: lufsToRms(-17.5),
   minGain: 0.25,     // 最多衰减约 12 dB；超出可达范围时提示倍率限制
   maxGain: 2.0,      // 最大增益；末端另做削波保护

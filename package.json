@@ -9,6 +9,7 @@
     "test:unit": "node scripts/run-unit-tests.mjs",
     "test:browser": "npm run build && node scripts/test-browser-audio.mjs",
     "test:live-pages": "npm run build && node scripts/test-live-pages.mjs",
+    "test:settings": "npm run build && node scripts/test-platform-settings.mjs",
     "test:realtime": "npm run build && node scripts/test-realtime-browser.mjs",
     "test:failures": "npm run build && node scripts/test-browser-failures.mjs",
     "test:continuity": "npm run build && node scripts/test-reported-video.mjs",

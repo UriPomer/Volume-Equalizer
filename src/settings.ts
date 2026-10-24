@@ -16,6 +16,9 @@ export function normalizeSettings(value: unknown): Settings {
     : {};
   return {
     enabled: booleanValue(input.enabled, DEFAULT_SETTINGS.enabled),
+    bilibiliEnabled: booleanValue(input.bilibiliEnabled, DEFAULT_SETTINGS.bilibiliEnabled),
+    youtubeEnabled: booleanValue(input.youtubeEnabled, DEFAULT_SETTINGS.youtubeEnabled),
+    otherEnabled: booleanValue(input.otherEnabled, DEFAULT_SETTINGS.otherEnabled),
     targetRms: numberValue(
       input.targetRms,
       TARGET_RMS_MIN,
@@ -57,10 +60,16 @@ export function loadSettings(): Promise<Settings> {
 /**
  * 保存设置到 chrome.storage
  */
-export function persistSettings(settings: Settings): Promise<void> {
+export function persistSettings(settings: Partial<Settings>): Promise<void> {
   if (!storageSupported) return Promise.resolve();
+  const normalized = normalizeSettings(settings);
+  const patch = Object.fromEntries(
+    (Object.keys(DEFAULT_SETTINGS) as Array<keyof Settings>)
+      .filter(key => key in settings)
+      .map(key => [key, normalized[key]])
+  );
   return new Promise((resolve, reject) => {
-    chrome.storage.local.set(normalizeSettings(settings), () => {
+    chrome.storage.local.set(patch, () => {
       const error = chrome.runtime.lastError;
       if (error) {
         reject(new Error(error.message));
