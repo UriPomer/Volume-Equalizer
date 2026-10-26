@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -29,9 +29,7 @@ const manifest = JSON.parse(readFileSync(join(extensionDirectory, 'manifest.json
 const [major, ...rest] = manifest.version.split('.').map(Number);
 assert.ok(major === 0 || (major === 1 && rest.every(part => part === 0)), 'Version must not exceed 1.0');
 const nativeDirectory = join(artifacts, 'installed-extension');
-mkdirSync(nativeDirectory);
-writeFileSync(join(nativeDirectory, 'content.js'), content);
-writeFileSync(join(nativeDirectory, 'limiter-worklet.js'), worklet);
+cpSync(extensionDirectory, nativeDirectory, { recursive: true });
 writeFileSync(join(nativeDirectory, 'observe-audio.js'), continuityBootstrap("chrome.runtime.getURL('observe-audio-worklet.js')"));
 writeFileSync(join(nativeDirectory, 'observe-audio-worklet.js'), continuityProcessor);
 manifest.content_scripts[0].js.unshift('observe-audio.js');
@@ -133,6 +131,8 @@ try {
   if (!process.env.VOLUME_EQ_EXTENSION_DIR) assert.equal(report.defaultTarget, '-17.5 LUFS', 'Native default target');
   await media.evaluate(element => { element.volume = 1; element.muted = false; element.playbackRate = 1; });
   await media.evaluate(element => { if (element.paused) return element.play(); });
+  await page.waitForFunction(() => document.getElementById('universal-volume-eq-panel')?.shadowRoot
+    .querySelector('[data-meter="status"]')?.textContent === '实时', null, { timeout: 5000 });
   await page.screenshot({ path: join(artifacts, 'started.png') });
   if (lifecycle) {
     await observe(10);
