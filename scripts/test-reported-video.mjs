@@ -19,6 +19,15 @@ const lifecycle = process.argv.includes('--lifecycle');
 const fixture = process.env.VOLUME_EQ_REFERENCE_AUDIO;
 const localMedia = lifecycle && !!fixture;
 const videoUrl = process.env.VOLUME_EQ_VIDEO_URL || 'https://www.bilibili.com/video/BV1cK411W7QZ/';
+function isReportedPage(currentUrl) {
+  const expected = new URL(videoUrl), current = new URL(currentUrl);
+  if (current.origin !== expected.origin) return false;
+  const videoId = url => /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?video\/(BV[a-z0-9]+)\/?$/i.exec(url.pathname)?.[1];
+  // Bilibili may localize /video/BV… to /en/video/BV… during playback.
+  // Keep requiring the same programme ID, rather than a fixed locale path.
+  const expectedId = /(^|\.)bilibili\.com$/.test(expected.hostname) ? videoId(expected) : null;
+  return expectedId ? videoId(current) === expectedId : current.pathname === expected.pathname;
+}
 const loops = Number(process.env.VOLUME_EQ_PLAYBACK_LOOPS || 1);
 assert.ok(Number.isInteger(loops) && loops >= 1 && loops <= 3, 'One to three complete native playbacks');
 const artifacts = mkdtempSync(join(process.env.VOLUME_EQ_ARTIFACT_ROOT || tmpdir(), 'volume-eq-continuity-'));
@@ -106,7 +115,7 @@ try {
   await page.goto(baseUrl);
   if (!localMedia) {
     await page.getByRole('link', { name: '打开用户报告的视频' }).click();
-    await page.waitForURL(videoUrl + '*');
+    await page.waitForURL(url => isReportedPage(url.href));
     report.navigation = { from: baseUrl, clickedLink: videoUrl, landedUrl: page.url(), title: await page.title() };
   }
   const mediaLocator = page.locator(localMedia ? 'audio' : 'video').first();
@@ -201,7 +210,7 @@ try {
           continue;
         }
         assert.equal(current.paused, false, 'Unexpected pause');
-        assert.ok(current.url.startsWith(videoUrl), 'Remain on the reported video');
+        assert.ok(isReportedPage(current.url), 'Remain on the reported video');
         if (report.trace.length % 150 === 0) console.log(JSON.stringify({ playback: playback + 1, time: current.time, duration: current.duration, gain: current.gain }));
         await delay(200);
       }
