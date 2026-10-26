@@ -11,7 +11,7 @@ import {
   subscribeSettings
 } from './settings';
 import { EMPTY_METER_STATE } from './types';
-import { ensurePanel, refreshPanel, updatePanelVisibility } from './ui-panel';
+import { ensurePanel, PanelState, refreshPanel, updatePanelVisibility } from './ui-panel';
 
 if (!isAudioContextSupported()) {
   warnFailure('audio-context-unsupported', '当前浏览器不支持 AudioContext，扩展已停用');
@@ -20,6 +20,10 @@ if (!isAudioContextSupported()) {
 
 let settings = { ...DEFAULT_SETTINGS };
 let savedSettings = { ...DEFAULT_SETTINGS };
+let pendingSettings: Partial<Settings> = {};
+let settingsRevision = 0;
+let savingSettings = false;
+let saveStatus: PanelState['saveStatus'] = 'saved';
 let currentPage = '';
 let livePage = false;
 let liveEnabled: boolean | null = null;
@@ -56,7 +60,7 @@ const attachRetries = new WeakMap<HTMLMediaElement, number>();
 function attachController(media: HTMLMediaElement): void {
   if (controllers.has(media)) return;
   if (!settings.enabled) {
-    ensurePanel(settings, updateSettings, () => meterState);
+    ensureSettingsPanel();
     updatePanelVisibility(1);
     return;
   }
@@ -80,14 +84,14 @@ function attachController(media: HTMLMediaElement): void {
     );
     attachRetries.delete(media);
     controllers.set(media, controller);
-    ensurePanel(settings, updateSettings, () => meterState);
+    ensureSettingsPanel();
     updatePanelVisibility(controllers.size);
   } catch (error) {
     // 站点可能已用 createMediaElementSource 占用该元素（YouTube/Twitch 等），
     // 此时绑定必然失败：在面板上给出提示，并在该元素下一次 play 时重试。
     warnFailure('media-attach-retry', '媒体绑定失败，将在播放时重试', error);
     meterState = { ...EMPTY_METER_STATE, processingStatus: 'attach-failed' };
-    ensurePanel(settings, updateSettings, () => meterState);
+    ensureSettingsPanel();
     updatePanelVisibility(1);
     scheduleAttachRetry(media);
   }
@@ -138,24 +142,46 @@ function updateSettings(next: Settings): Settings {
   syncPagePolicy();
   const normalized = normalizeSettings(next);
   if (livePage && enabledChanged) liveEnabled = normalized.enabled;
-  const platformKey = platformSettingKey();
-  const previous = savedSettings;
-  savedSettings = { ...normalized, enabled: savedSettings.enabled };
-  // The page switch follows this platform; live opt-in stays local to the programme.
-  if (!livePage && enabledChanged) {
-    savedSettings[platformKey] = normalized.enabled;
-    if (normalized.enabled) savedSettings.enabled = true;
-  }
   const patch = Object.fromEntries(
     (Object.keys(DEFAULT_SETTINGS) as Array<keyof Settings>)
-      .filter(key => previous[key] !== savedSettings[key])
-      .map(key => [key, savedSettings[key]])
+      .filter(key => key !== 'enabled' && normalized[key] !== settings[key])
+      .map(key => [key, normalized[key]])
   );
+  Object.assign(pendingSettings, patch);
+  // The page switch follows this platform; live opt-in stays local to the programme.
+  if (!livePage && enabledChanged) {
+    pendingSettings[platformSettingKey()] = normalized.enabled;
+  }
+  settingsRevision++;
   applySettings(effectiveSettings());
-  persistSettings(patch).catch((error) => {
-    errorFailure('settings-save', '设置保存失败', error);
-  });
+  void flushPendingSettings();
   return settings;
+}
+
+async function flushPendingSettings(): Promise<void> {
+  if (savingSettings || !Object.keys(pendingSettings).length) return;
+  const patch = { ...pendingSettings };
+  const revision = settingsRevision;
+  savingSettings = true;
+  saveStatus = 'saving';
+  refreshPanel(settings, panelState());
+  try {
+    await persistSettings(patch);
+    savedSettings = normalizeSettings({ ...savedSettings, ...patch });
+    // Acknowledging an older write must not discard a newer user action.
+    for (const key of Object.keys(patch) as Array<keyof Settings>) {
+      if (pendingSettings[key] === patch[key]) delete pendingSettings[key];
+    }
+    saveStatus = 'saved';
+  } catch (error) {
+    saveStatus = 'error';
+    errorFailure('settings-save', '设置保存失败', error);
+  } finally {
+    savingSettings = false;
+    applySettings(effectiveSettings());
+    // Retry only for a new user action; a failed write alone never loops.
+    if (settingsRevision !== revision) void flushPendingSettings();
+  }
 }
 
 function applyExternalSettings(next: Settings): void {
@@ -167,11 +193,26 @@ function applyExternalSettings(next: Settings): void {
 }
 
 function effectiveSettings(): Settings {
+  const desired = { ...savedSettings, ...pendingSettings };
   return {
-    ...savedSettings,
-    enabled: savedSettings[platformSettingKey()]
-      && (livePage ? liveEnabled ?? false : savedSettings.enabled)
+    ...desired,
+    enabled: desired.enabled && desired[platformSettingKey()]
+      && (!livePage || (liveEnabled ?? false))
   };
+}
+
+function panelState(): PanelState {
+  const desired = { ...savedSettings, ...pendingSettings };
+  return {
+    disabledReason: !desired.enabled ? '请先在扩展设置中开启总开关'
+      : livePage && !desired[platformSettingKey()] ? '请先在扩展设置中启用此平台' : '',
+    saveStatus,
+    retrySave: () => { void flushPendingSettings(); }
+  };
+}
+
+function ensureSettingsPanel(): void {
+  ensurePanel(settings, updateSettings, () => meterState, panelState());
 }
 
 function syncPagePolicy(): void {
@@ -188,7 +229,7 @@ function applySettings(next: Settings): void {
   settings = next;
   controllers.forEach((controller) => controller.updateSettings(settings));
   if (!settings.enabled) meterState = { ...EMPTY_METER_STATE };
-  refreshPanel(settings);
+  refreshPanel(settings, panelState());
   if (settings.enabled) scanForMedia(attachController);
 }
 

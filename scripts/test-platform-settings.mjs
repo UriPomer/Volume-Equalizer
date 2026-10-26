@@ -9,13 +9,13 @@ import { writeFloatWav } from './audio-test-artifacts.mjs';
 
 // Failure contracts: a setting affects another platform; existing tabs ignore it;
 // reload loses it; disabled pages capture media; page controls overwrite platform
-// choices or DSP settings; live opt-in bypasses a disabled platform.
+// choices or DSP settings; live opt-in bypasses the master/platform switches;
+// failed page writes are lost; actual embedded players are never processed.
 // Uses the unpacked extension, native storage, content scripts and audio worklets.
 // Local HTTP fixtures replace only platform servers and media content.
 const artifacts = mkdtempSync(join(process.env.VOLUME_EQ_ARTIFACT_ROOT || tmpdir(), 'volume-eq-platform-settings-'));
 const extension = resolve('dist');
-const extensionId = createHash('sha256').update(extension).digest('hex').slice(0, 32)
-  .replace(/[0-9a-f]/g, char => String.fromCharCode(97 + parseInt(char, 16)));
+let extensionId;
 const fixture = join(artifacts, 'input.wav');
 writeFloatWav(fixture, Float32Array.from({ length: 48000 * 3 }, (_, i) => .1 * Math.sin(2 * Math.PI * 1000 * i / 48000)), 48000, 1);
 const report = { command: 'npm run test:settings', pass: false, cases: [], hashes: {} };
@@ -24,7 +24,10 @@ for (const file of ['content.js', 'options.js', 'options.html', 'manifest.json']
 }
 report.hashes.test = createHash('sha256').update(readFileSync(new URL(import.meta.url))).digest('hex');
 const server = createServer((req, res) => {
-  if (req.url === '/input.wav') {
+  if (req.url === '/frame-host') {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.end(`<!doctype html><title>Embedded player</title><iframe src="http://www.youtube-nocookie.com:${port}/embed/fixture"></iframe>`);
+  } else if (req.url === '/input.wav') {
     res.setHeader('Content-Type', 'audio/wav');
     res.end(readFileSync(fixture));
   } else {
@@ -45,6 +48,19 @@ async function state(page, enabled) {
     .querySelector('[data-meter="originalIntegrated"]').textContent.includes('LUFS'));
   assert.equal(await page.locator('video').evaluate(video => video.paused), false);
 }
+async function inContentWorld(page, expression) {
+  const session = await context.newCDPSession(page);
+  try {
+    const worlds = [];
+    session.on('Runtime.executionContextCreated', ({ context }) => worlds.push(context));
+    await session.send('Runtime.enable');
+    const world = worlds.find(world => world.origin === `chrome-extension://${extensionId}`);
+    assert.ok(world, 'Content script isolated world must exist');
+    const result = await session.send('Runtime.evaluate', { contextId: world.id, expression, returnByValue: true });
+    assert.equal(result.exceptionDetails, undefined);
+    return result.result.value;
+  } finally { await session.detach(); }
+}
 async function check(name, run) {
   await run();
   report.cases.push({ name, pass: true });
@@ -59,6 +75,18 @@ try {
   });
   context.setDefaultTimeout(10000);
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+  const discovery = await context.newPage();
+  await discovery.goto(`http://example.org:${port}/discover`);
+  await panel(discovery).waitFor();
+  const discoverySession = await context.newCDPSession(discovery);
+  const worlds = [];
+  discoverySession.on('Runtime.executionContextCreated', ({ context }) => worlds.push(context));
+  await discoverySession.send('Runtime.enable');
+  const extensionWorld = worlds.find(world => world.origin.startsWith('chrome-extension://'));
+  assert.ok(extensionWorld, 'Native extension isolated world must exist');
+  extensionId = new URL(extensionWorld.origin).host;
+  await discoverySession.detach();
+  await discovery.close();
   const options = await context.newPage();
   const errors = [];
   options.on('pageerror', error => errors.push(String(error)));
@@ -207,6 +235,143 @@ try {
     assert.equal((await storage()).otherEnabled, true);
     await state(other, true);
     await options.screenshot({ path: join(artifacts, 'settings-popup.png'), fullPage: true });
+  });
+  await check('master-off-stops-live-opt-in', async () => {
+    try {
+      await youtube.evaluate(() => {
+        const player = document.createElement('div');
+        player.className = 'html5-video-player ytp-live';
+        document.body.append(player);
+      });
+      await state(youtube, false);
+      await panel(youtube).locator('.dock').hover();
+      await enabledButton(youtube).click();
+      await state(youtube, true);
+      await toggle('enabled', false);
+      await state(bili, false);
+      await state(youtube, false);
+      assert.equal(await enabledButton(youtube).isDisabled(), true);
+      await youtube.screenshot({ path: join(artifacts, 'master-disabled-live.png') });
+    } finally {
+      await youtube.evaluate(() => document.querySelector('.html5-video-player')?.remove());
+      await toggle('enabled', true);
+    }
+  });
+  await check('failed-page-write-survives-next-change', async () => {
+    const session = await context.newCDPSession(bili);
+    try {
+      const worlds = [];
+      session.on('Runtime.executionContextCreated', ({ context }) => worlds.push(context));
+      await session.send('Runtime.enable');
+      const world = worlds.find(world => world.origin === `chrome-extension://${extensionId}`);
+      assert.ok(world, 'Content script isolated world must exist');
+      const injected = await session.send('Runtime.evaluate', { contextId: world.id, expression: `
+        (() => {
+          const original = chrome.storage.local.set.bind(chrome.storage.local);
+          chrome.storage.local.set = (...args) => {
+            chrome.storage.local.set = original;
+            throw new Error('Injected page storage write failure');
+          };
+        })();
+      ` });
+      assert.equal(injected.exceptionDetails, undefined);
+      await panel(bili).locator('.dock').hover();
+      await enabledButton(bili).click();
+      await state(bili, false);
+      assert.equal((await storage()).bilibiliEnabled, true);
+      await panel(bili).locator('[data-role="bassBoost"]').evaluate(input => {
+        input.value = '3'; input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await options.waitForFunction(async () => {
+        const saved = await chrome.storage.local.get(['bilibiliEnabled', 'bassBoost']);
+        return saved.bilibiliEnabled === false && saved.bassBoost === 3;
+      });
+      await state(bili, false);
+      await bili.reload();
+      await panel(bili).waitFor();
+      await bili.locator('video').evaluate(video => video.play());
+      await state(bili, false);
+    } finally {
+      await session.detach();
+      await toggle('bilibiliEnabled', true);
+    }
+  });
+  await check('failed-page-write-can-be-retried-explicitly', async () => {
+    await inContentWorld(bili, `(() => {
+      const original = chrome.storage.local.set.bind(chrome.storage.local);
+      chrome.storage.local.set = (...args) => {
+        chrome.storage.local.set = original;
+        throw new Error('Injected page storage write failure');
+      };
+    })()`);
+    try {
+      await panel(bili).locator('.dock').hover();
+      await enabledButton(bili).click();
+      await state(bili, false);
+      const retry = panel(bili).locator('[data-action="retry-save"]');
+      await retry.waitFor({ state: 'visible' });
+      assert.equal((await storage()).bilibiliEnabled, true);
+      await retry.click();
+      await options.waitForFunction(async () => (await chrome.storage.local.get('bilibiliEnabled')).bilibiliEnabled === false);
+      await retry.waitFor({ state: 'hidden' });
+      await state(bili, false);
+    } finally { await toggle('bilibiliEnabled', true); }
+  });
+  await check('in-flight-save-preserves-newer-actions-and-external-settings', async () => {
+    await inContentWorld(bili, `(() => {
+      const original = chrome.storage.local.set.bind(chrome.storage.local);
+      globalThis.pageWriteCalls = [];
+      globalThis.restoreSettingsWriter = () => { chrome.storage.local.set = original; };
+      chrome.storage.local.set = (...args) => {
+        pageWriteCalls.push({...args[0]});
+        if (pageWriteCalls.length === 1) globalThis.releaseSettingsWrite = () => original(...args);
+        else original(...args);
+      };
+    })()`);
+    try {
+      await panel(bili).locator('.dock').hover();
+      await enabledButton(bili).click();
+      await state(bili, false);
+      await enabledButton(bili).click();
+      await state(bili, true);
+      await toggle('otherEnabled', false);
+      await inContentWorld(bili, 'releaseSettingsWrite()');
+      await bili.waitForFunction(() => document.getElementById('universal-volume-eq-panel').shadowRoot.querySelector('[data-role="save-status"]').textContent === '');
+      const writes = await inContentWorld(bili, 'pageWriteCalls');
+      assert.equal(writes.length, 2, 'Newer action needs a second serialized write');
+      assert.equal(writes[0].bilibiliEnabled, false);
+      assert.equal(writes[1].bilibiliEnabled, true);
+      assert.equal((await storage()).bilibiliEnabled, true);
+      assert.equal((await storage()).otherEnabled, false);
+      await state(bili, true);
+    } finally {
+      await inContentWorld(bili, 'restoreSettingsWriter()');
+      await toggle('otherEnabled', true);
+    }
+  });
+  await check('cross-origin-iframe-follows-player-platform', async () => {
+    const page = await context.newPage();
+    try {
+      await page.goto(`http://example.org:${port}/frame-host`);
+      const frame = page.frames().find(frame => frame.url().includes('youtube-nocookie.com'));
+      assert.ok(frame);
+      await frame.locator('video').evaluate(video => video.play());
+      await state(frame, true);
+      await toggle('otherEnabled', false);
+      await state(frame, true);
+      await toggle('youtubeEnabled', false);
+      await state(frame, false);
+      await toggle('youtubeEnabled', true);
+      await state(frame, true);
+      await toggle('enabled', false);
+      await state(frame, false);
+      await page.screenshot({ path: join(artifacts, 'embedded-player.png') });
+    } finally {
+      await page.close();
+      await toggle('enabled', true);
+      await toggle('youtubeEnabled', true);
+      await toggle('otherEnabled', true);
+    }
   });
   report.storage = await storage();
   report.errors = errors;

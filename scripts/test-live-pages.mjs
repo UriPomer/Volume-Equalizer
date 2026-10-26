@@ -193,18 +193,23 @@ try {
       await event('yt-navigate-finish', 'recording', false); await check(page, true, row);
     } finally { await page.close(); }
   });
-  await test('global-disabled-live-opt-in-stays-local', async row => {
+  await test('global-disabled-blocks-live-and-recorded-opt-in', async row => {
     const page = await open('https://www.youtube.com/watch?v=stream', true, { enabled: false });
     try {
-      await check(page, false, row); await toggle(page); await check(page, true, row);
-      assert.equal(await page.evaluate(() => stored.enabled), false, 'Live opt-in must not change global disabled preference');
+      await check(page, false, row);
+      assert.equal(await button(page).isDisabled(), true, 'Master off must block live opt-in');
+      await page.evaluate(() => externalSettings({ enabled: true }));
+      await toggle(page); await check(page, true, row);
+      await page.evaluate(() => externalSettings({ enabled: false }));
+      await check(page, false, row);
       await page.reload();
       await page.locator('video').evaluate(media => media.play());
       await check(page, false, row);
-      assert.equal(row.state.mediaSources, 0, 'Reload resets live opt-in');
+      assert.equal(row.state.mediaSources, 0, 'Master off must not capture audio on reload');
       await navigate(page, '/watch?v=recording', false); await check(page, false, row);
-      await toggle(page); await check(page, true, row);
-      assert.equal(await page.evaluate(() => stored.enabled), true, 'Normal-video toggle still saves global preference');
+      assert.equal(await button(page).isDisabled(), true, 'Master off must also block recorded-video opt-in');
+      await page.evaluate(() => externalSettings({ enabled: true }));
+      await check(page, true, row);
     } finally { await page.close(); }
   });
   assert.ok(report.cases.length > 0, 'The selected live-page case does not exist');

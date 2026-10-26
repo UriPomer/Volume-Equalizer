@@ -1,10 +1,15 @@
 import { PANEL_ID, Settings } from './config';
 import { lufsToRms, rmsToLufs } from './lufs-calculator';
-import { isLivePage, platformSettingKey } from './page-policy';
 import { ProcessingStatus, MeterState } from './types';
 
 type SliderRole = 'targetLufs' | 'maxGain' | 'minGain' | 'bassBoost';
 type ChangeSettings = (settings: Settings) => Settings;
+
+export interface PanelState {
+  disabledReason: string;
+  saveStatus: 'saved' | 'saving' | 'error';
+  retrySave: () => void;
+}
 
 const STATUS_TEXT: Record<ProcessingStatus, string> = {
   realtime: '实时',
@@ -15,22 +20,25 @@ const STATUS_TEXT: Record<ProcessingStatus, string> = {
 let host: HTMLElement | null = null;
 let meterTimer: number | null = null;
 let currentSettings: Settings | null = null;
+let currentPanelState: PanelState;
 let renderPanel: (() => void) | null = null;
 
 /**
  * 外部（其他标签页/设置加载）修改设置后刷新面板 UI，
  * 避免开关与滑条停留在旧值直到用户手动交互。
  */
-export function refreshPanel(next: Settings): void {
+export function refreshPanel(next: Settings, state: PanelState): void {
   if (!host?.isConnected || !renderPanel) return;
   currentSettings = next;
+  currentPanelState = state;
   renderPanel();
 }
 
 export function ensurePanel(
   settings: Settings,
   changeSettings: ChangeSettings,
-  getMeter: () => MeterState
+  getMeter: () => MeterState,
+  state: PanelState
 ): HTMLElement {
   if (host?.isConnected) return host;
   if (meterTimer !== null) window.clearInterval(meterTimer);
@@ -40,6 +48,7 @@ export function ensurePanel(
   document.documentElement.appendChild(host);
 
   const shadow = host.attachShadow({ mode: 'open' });
+  currentPanelState = state;
   shadow.innerHTML = `<style>${PANEL_CSS}</style>${panelHtml(settings)}`;
   setText(shadow, '[data-role="version"]', `v${chrome.runtime.getManifest().version}`);
   bindPanel(shadow, settings, changeSettings);
@@ -74,6 +83,7 @@ function panelHtml(settings: Settings): string {
         ${meterRow('调节状态', 'phase')}
         ${meterRow('削波保护', 'safety')}
       </div>
+      <footer><span data-role="save-status" role="status" aria-live="polite"></span><button data-action="retry-save" hidden>重试保存</button></footer>
     </section>
   </div>`;
 }
@@ -103,8 +113,12 @@ function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings
   const render = () => {
     const settings = currentSettings as Settings;
     enabled.textContent = settings.enabled ? '已开启' : '已关闭';
-    enabled.disabled = isLivePage() && !settings[platformSettingKey()];
-    enabled.title = enabled.disabled ? '请先在扩展设置中启用此平台' : '';
+    enabled.disabled = !!currentPanelState.disabledReason;
+    enabled.title = currentPanelState.disabledReason;
+    const saveStatus = currentPanelState.saveStatus;
+    setText(shadow, '[data-role="save-status"]', saveStatus === 'error'
+      ? '设置未保存，当前页暂时生效' : saveStatus === 'saving' ? '正在保存…' : '');
+    query<HTMLButtonElement>(shadow, '[data-action="retry-save"]').hidden = saveStatus !== 'error';
     enabled.classList.toggle('on', settings.enabled);
     query<HTMLElement>(shadow, '.dock i').classList.toggle('off', !settings.enabled);
     for (const input of sliders) {
@@ -120,6 +134,7 @@ function bindPanel(shadow: ShadowRoot, initial: Settings, change: ChangeSettings
     currentSettings = change({ ...base, enabled: !base.enabled });
     render();
   };
+  query<HTMLButtonElement>(shadow, '[data-action="retry-save"]').onclick = () => currentPanelState.retrySave();
   for (const input of sliders) {
     input.oninput = () => {
       const role = input.dataset.role as SliderRole;
@@ -197,6 +212,7 @@ header,.param span,.meter div{display:flex;align-items:center;justify-content:sp
 header{font-size:13px}button{border:0;border-radius:99px;padding:3px 9px;background:#ffffff18;color:#ffffff90;cursor:pointer;font-size:10px}button.on{background:#0ea5e9;color:white}
 header small{display:block;font-size:10px;color:#ffffff70;margin-top:2px}
 button:disabled{opacity:.5;cursor:not-allowed}
+footer{font-size:10px;color:#fbbf24;display:flex;align-items:center;justify-content:space-between;gap:4px}footer:has(span:empty){display:none}
 hr{border:0;height:1px;background:#ffffff12;margin:9px 0}.param{display:block;color:#ffffff90;font-size:11px}
 .param{margin-top:8px}.param span b{color:#e2e8f0;font-size:12px}input{appearance:none;width:100%;height:3px;background:#ffffff20;border-radius:2px;cursor:pointer}input::-webkit-slider-thumb{appearance:none;width:13px;height:13px;border-radius:50%;background:#38bdf8}
 .meter{font-size:11px}.meter small{display:block;color:#ffffff50;font-weight:600;margin-top:6px}.meter div{padding:2px 0}.meter span{color:#ffffff60}.meter b{color:#cbd5e1;font-weight:500;font-variant-numeric:tabular-nums;text-align:right}

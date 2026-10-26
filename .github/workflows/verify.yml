@@ -103,7 +103,7 @@ jobs:
           $unpacked = Join-Path $env:RUNNER_TEMP 'verified-package'
           Expand-Archive -LiteralPath $zip -DestinationPath $unpacked
           $files = @(Get-ChildItem -LiteralPath $unpacked -File -Recurse)
-          $expected = @('content.js', 'limiter-worklet.js', 'manifest.json')
+          $expected = @('content.js', 'limiter-worklet.js', 'manifest.json', 'options.html', 'options.css', 'options.js')
           if ($files.Count -ne $expected.Count) { throw 'Unexpected packaged files' }
           $payload = @{}
           foreach ($file in $expected) {
@@ -141,6 +141,10 @@ jobs:
       - name: Live page defaults and manual opt-in E2E
         timeout-minutes: 3
         run: node scripts/test-live-pages.mjs
+
+      - name: Platform settings and embedded player E2E
+        timeout-minutes: 3
+        run: node scripts/test-platform-settings.mjs
 
       - name: Native processor failure integration
         timeout-minutes: 3
