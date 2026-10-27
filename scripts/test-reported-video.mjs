@@ -204,7 +204,7 @@ try {
           await page.screenshot({ path: join(artifacts, 'site-login-pause-' + report.sitePauses.length + '.png') });
           report.sitePauses.push({ reason: 'visible-login-dialog', ...current });
           await closeLogin.click(); await closeLogin.waitFor({ state: 'hidden' });
-          if ((await state()).paused) await page.getByRole('button', { name: '播放/暂停', exact: true }).click();
+          if ((await state()).paused) await media.evaluate(element => element.play());
           await page.waitForFunction(() => !document.querySelector('[data-volume-eq-primary]').paused, null, { timeout: 5000 });
           lastProgress = Date.now();
           continue;
@@ -217,7 +217,7 @@ try {
       assert.ok(report.playbacks.at(-1).time >= report.playbacks.at(-1).duration - .5, 'Complete the entire native programme');
       if (playback + 1 < loops) {
         await media.evaluate(element => { element.currentTime = 0; });
-        await page.getByRole('button', { name: '播放/暂停', exact: true }).click();
+        await media.evaluate(element => element.play());
         await page.waitForFunction(() => !document.querySelector('video').paused);
       }
     }

@@ -156,6 +156,10 @@ jobs:
         env:
           VOLUME_EQ_REFERENCE_AUDIO: ${{ github.workspace }}/tests/fixtures/videos/clear-layout-design.mp4
 
+      - name: Localized player login recovery E2E
+        timeout-minutes: 2
+        run: node scripts/test-reported-player-controls.mjs
+
       - name: Bilibili player E2E
         timeout-minutes: 20
         run: node scripts/test-reported-video.mjs
